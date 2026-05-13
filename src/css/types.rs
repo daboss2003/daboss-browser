@@ -226,6 +226,11 @@ pub struct ComputedStyle {
     /// `auto` measures intrinsic content widths per column; `fixed` uses
     /// `<col>` widths and first-row widths. Not inherited.
     pub table_layout: TableLayout,
+    /// CSS `content` property. Only meaningful on `::before` / `::after`
+    /// pseudo-element styles — for real elements it stays `None`. A
+    /// non-`None` value triggers generation of a pseudo-element box during
+    /// layout. Not inherited.
+    pub content: Option<String>,
     /// Resolved custom properties (CSS variables). Inherited like color.
     pub custom_properties: HashMap<String, Value>,
 }
@@ -254,6 +259,7 @@ impl ComputedStyle {
             white_space: WhiteSpace::Normal,
             border_spacing: (2.0, 2.0), // CSS initial value
             table_layout: TableLayout::Auto,
+            content: None,
             custom_properties: HashMap::new(),
         }
     }

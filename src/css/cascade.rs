@@ -48,9 +48,20 @@ pub fn compute_specificity(sel: &Selector) -> Specificity {
 }
 
 pub fn selector_matches(sel: &Selector, dom: &Dom, node: NodeId) -> bool {
-    if sel.pseudo_element.is_some() {
-        // Pseudo-element rules don't apply to real DOM nodes; phase 4 will
-        // synthesize generated-content boxes that these rules style.
+    selector_matches_pseudo(sel, dom, node, None)
+}
+
+/// `pseudo` selects which selectors match: `None` means "real-element" rules
+/// (rejects any selector that targets a pseudo-element); `Some("before")` /
+/// `Some("after")` matches only rules whose final compound carries that
+/// pseudo-element.
+pub fn selector_matches_pseudo(
+    sel: &Selector,
+    dom: &Dom,
+    node: NodeId,
+    pseudo: Option<&str>,
+) -> bool {
+    if sel.pseudo_element.as_deref() != pseudo {
         return false;
     }
     if sel.compounds.is_empty() {
@@ -186,19 +197,45 @@ fn match_pseudo_class(name: &str, dom: &Dom, node: NodeId) -> bool {
 
 pub struct StyleTree {
     pub styles: Vec<ComputedStyle>,
+    /// `before[i] = Some(style)` iff element node `i` has a non-empty `::before`
+    /// pseudo. The style inherits from the element's own style and is the
+    /// computed style the pseudo-element box will use during layout/paint.
+    pub before: Vec<Option<ComputedStyle>>,
+    pub after: Vec<Option<ComputedStyle>>,
 }
 
 impl StyleTree {
     pub fn compute(dom: &Dom, sheets: &[&Stylesheet]) -> Self {
         let count = highest_node_id(dom).index() + 1;
         let mut styles = vec![ComputedStyle::initial(); count];
-        compute_recursive(dom, dom.document(), sheets, None, &mut styles);
-        Self { styles }
+        let mut before = vec![None; count];
+        let mut after = vec![None; count];
+        compute_recursive(
+            dom,
+            dom.document(),
+            sheets,
+            None,
+            &mut styles,
+            &mut before,
+            &mut after,
+        );
+        Self {
+            styles,
+            before,
+            after,
+        }
     }
 
-    #[allow(dead_code)] // used by tests now, by layout in phase 4
     pub fn get(&self, id: NodeId) -> &ComputedStyle {
         &self.styles[id.index()]
+    }
+
+    pub fn before_style(&self, id: NodeId) -> Option<&ComputedStyle> {
+        self.before.get(id.index()).and_then(|s| s.as_ref())
+    }
+
+    pub fn after_style(&self, id: NodeId) -> Option<&ComputedStyle> {
+        self.after.get(id.index()).and_then(|s| s.as_ref())
     }
 }
 
@@ -224,14 +261,86 @@ fn compute_recursive(
     sheets: &[&Stylesheet],
     parent_style: Option<&ComputedStyle>,
     out: &mut [ComputedStyle],
+    before: &mut [Option<ComputedStyle>],
+    after: &mut [Option<ComputedStyle>],
 ) {
     let style = compute_one(dom, node, sheets, parent_style);
+    if matches!(&dom.node(node).kind, NodeKind::Element { .. }) {
+        before[node.index()] = compute_pseudo_style(dom, node, sheets, &style, "before");
+        after[node.index()] = compute_pseudo_style(dom, node, sheets, &style, "after");
+    }
     out[node.index()] = style;
     let style_for_children = out[node.index()].clone();
     let kids: Vec<NodeId> = dom.children(node).collect();
     for child in kids {
-        compute_recursive(dom, child, sheets, Some(&style_for_children), out);
+        compute_recursive(
+            dom,
+            child,
+            sheets,
+            Some(&style_for_children),
+            out,
+            before,
+            after,
+        );
     }
+}
+
+fn compute_pseudo_style(
+    dom: &Dom,
+    node: NodeId,
+    sheets: &[&Stylesheet],
+    element_style: &ComputedStyle,
+    pseudo_name: &str,
+) -> Option<ComputedStyle> {
+    // Pseudo-elements inherit non-resetting properties from their host.
+    let mut style = ComputedStyle::inherit_from(element_style);
+    style.content = None; // reset; rules will set it
+
+    let mut matched: Vec<(Specificity, usize, &Rule)> = Vec::new();
+    let mut order = 0usize;
+    for sheet in sheets {
+        for rule in &sheet.rules {
+            order += 1;
+            for sel in &rule.selectors {
+                if selector_matches_pseudo(sel, dom, node, Some(pseudo_name)) {
+                    matched.push((compute_specificity(sel), order, rule));
+                    break;
+                }
+            }
+        }
+    }
+    if matched.is_empty() {
+        return None;
+    }
+    matched.sort_by_key(|(spec, ord, _)| (*spec, *ord));
+
+    // Two-pass apply (like the main cascade): custom properties first, then
+    // normal declarations resolving against the local var map.
+    use std::collections::HashMap;
+    let mut props: HashMap<String, Value> = style.custom_properties.clone();
+    for (_, _, rule) in &matched {
+        for decl in &rule.declarations {
+            if decl.property.starts_with("--") {
+                let resolved = resolve_value(&decl.value, &props, 0);
+                props.insert(decl.property.clone(), resolved);
+            }
+        }
+    }
+    style.custom_properties = props;
+    for (_, _, rule) in &matched {
+        for decl in &rule.declarations {
+            if decl.property.starts_with("--") {
+                continue;
+            }
+            apply(decl, &mut style, Some(element_style));
+        }
+    }
+
+    // No `content` → no generated content → no pseudo box at all.
+    if style.content.is_none() {
+        return None;
+    }
+    Some(style)
 }
 
 fn compute_one(
@@ -556,7 +665,31 @@ fn apply_declaration(
         // engine doesn't implement collapse mode and rendering is identical
         // either way until phase 5 paints borders.
         "border-collapse" => {}
+        "content" => {
+            style.content = content_from(value);
+        }
         _ => {}
+    }
+}
+
+fn content_from(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Keyword(k) if k == "none" || k == "normal" => None,
+        Value::List(items) => {
+            let mut acc = String::new();
+            for it in items {
+                if let Value::String(s) = it {
+                    acc.push_str(s);
+                }
+            }
+            if acc.is_empty() {
+                None
+            } else {
+                Some(acc)
+            }
+        }
+        _ => None,
     }
 }
 

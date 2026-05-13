@@ -12,6 +12,8 @@ mod replaced;
 mod table;
 mod text;
 
+use std::collections::HashMap;
+
 use crate::css::{BoxSides, StyleTree};
 use crate::dom::{Dom, NodeId, NodeKind};
 use text::TextLayout;
@@ -49,11 +51,29 @@ pub struct LayoutBox {
     pub margin: BoxSides,
 }
 
+#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq)]
+pub enum PseudoKind {
+    Before,
+    After,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // text retained for paint to render generated content
+pub struct PseudoBox {
+    pub host: NodeId,
+    pub kind: PseudoKind,
+    pub rect: Rect,
+    pub text: String,
+}
+
 #[derive(Debug)]
 #[allow(dead_code)] // viewport consumed by paint scrolling / scale in phase 5
 pub struct BoxTree {
     pub boxes: Vec<Option<LayoutBox>>, // indexed by NodeId.index()
     pub viewport: Rect,
+    /// Generated-content boxes for `::before` / `::after`. Keyed by the
+    /// originating element and which pseudo (Before / After).
+    pub pseudo_boxes: HashMap<(NodeId, PseudoKind), PseudoBox>,
 }
 
 impl BoxTree {
@@ -84,7 +104,7 @@ impl BoxTree {
             NodeKind::Text(s) => {
                 let trimmed = s.trim();
                 if trimmed.is_empty() {
-                    return; // skip whitespace-only nodes in print
+                    return;
                 }
                 format!("\"{}\"", truncate(trimmed, 60))
             }
@@ -92,10 +112,34 @@ impl BoxTree {
             NodeKind::Doctype(s) => format!("<!DOCTYPE {s}>"),
         };
         println!("{indent}{label}{rect_str}");
+
+        // ::before pseudo-element prints inside its host's section, before
+        // the host's children.
+        self.print_pseudo(node, PseudoKind::Before, depth + 1);
         let kids: Vec<NodeId> = dom.children(node).collect();
         for c in kids {
             self.print_node(dom, c, depth + 1);
         }
+        self.print_pseudo(node, PseudoKind::After, depth + 1);
+    }
+
+    fn print_pseudo(&self, host: NodeId, kind: PseudoKind, depth: usize) {
+        let Some(p) = self.pseudo_boxes.get(&(host, kind)) else {
+            return;
+        };
+        let indent = "  ".repeat(depth);
+        let label = match kind {
+            PseudoKind::Before => "::before",
+            PseudoKind::After => "::after",
+        };
+        println!(
+            "{indent}{label} \"{}\"  [{}, {}, {}x{}]",
+            truncate(&p.text, 60),
+            p.rect.x as i32,
+            p.rect.y as i32,
+            p.rect.width as i32,
+            p.rect.height as i32
+        );
     }
 }
 
@@ -120,6 +164,7 @@ pub fn layout(
     let mut tree = BoxTree {
         boxes: vec![None; styles.styles.len()],
         viewport,
+        pseudo_boxes: HashMap::new(),
     };
     let mut text = TextLayout::new();
     block::layout(dom, styles, &mut text, images, dom.document(), viewport, &mut tree);

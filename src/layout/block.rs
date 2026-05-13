@@ -21,7 +21,7 @@ use std::ops::Range;
 
 use super::replaced::ImageCache;
 use super::text::{collapse_whitespace, InlineContent, InlineSpan, TextLayout};
-use super::{BoxKind, BoxTree, LayoutBox, Rect};
+use super::{BoxKind, BoxTree, LayoutBox, PseudoBox, PseudoKind, Rect};
 use crate::css::{BoxSides, ComputedStyle, Dimension, Display, StyleTree};
 use crate::dom::{Dom, NodeId, NodeKind};
 
@@ -124,6 +124,20 @@ fn layout_block(
     let groups = group_children(dom, styles, &kids);
 
     let mut child_y = content_y;
+
+    // ::before pseudo (toy: laid out as its own row above real children).
+    if let Some(before_style) = styles.before_style(node) {
+        if let Some(text_content) = &before_style.content {
+            let cb = Rect {
+                x: content_x,
+                y: child_y,
+                width: content_width,
+                height: 0.0,
+            };
+            child_y += layout_pseudo(node, PseudoKind::Before, text_content, before_style, text, cb, tree);
+        }
+    }
+
     for group in groups {
         let cb = Rect {
             x: content_x,
@@ -139,6 +153,20 @@ fn layout_block(
         };
         child_y += h;
     }
+
+    // ::after pseudo (toy: own row below real children).
+    if let Some(after_style) = styles.after_style(node) {
+        if let Some(text_content) = &after_style.content {
+            let cb = Rect {
+                x: content_x,
+                y: child_y,
+                width: content_width,
+                height: 0.0,
+            };
+            child_y += layout_pseudo(node, PseudoKind::After, text_content, after_style, text, cb, tree);
+        }
+    }
+
     let computed_content_height = child_y - content_y;
 
     let content_height = match (style.height, intrinsic) {
@@ -331,6 +359,42 @@ fn collect_inline(dom: &Dom, styles: &StyleTree, node: NodeId, content: &mut Inl
         }
         _ => {}
     }
+}
+
+fn layout_pseudo(
+    host: NodeId,
+    kind: PseudoKind,
+    content: &str,
+    style: &ComputedStyle,
+    text_layout: &mut TextLayout,
+    cb: Rect,
+    tree: &mut BoxTree,
+) -> f32 {
+    // Toy: render generated content as a single-line inline-block at the
+    // host's content edge. Phase 5+ can flow it into the host's IFC instead.
+    let collapsed = collapse_whitespace(content);
+    if collapsed.is_empty() {
+        return 0.0;
+    }
+    let line_height = style.font_size * style.line_height;
+    let natural_w = text_layout.measure_natural_width(&collapsed, style);
+    let width = natural_w.min(cb.width.max(0.0));
+    let rect = Rect {
+        x: cb.x,
+        y: cb.y,
+        width,
+        height: line_height,
+    };
+    tree.pseudo_boxes.insert(
+        (host, kind),
+        PseudoBox {
+            host,
+            kind,
+            rect,
+            text: collapsed,
+        },
+    );
+    line_height
 }
 
 fn union(a: Rect, b: Rect) -> Rect {
@@ -540,6 +604,78 @@ mod tests {
         // No intrinsic; falls back to Auto width with the container shrunk
         // to inline-block (replaced) semantics — content_width 0.
         assert_eq!(b.rect.height, 0.0);
+    }
+
+    #[test]
+    fn before_pseudo_creates_box() {
+        let (dom, tree) = run(
+            "<style>body { margin: 0; } \
+             p { margin: 0; padding: 0; } \
+             p::before { content: 'Note: '; }</style>\
+             <p>hello</p>",
+            1000.0,
+        );
+        let p = find(&dom, dom.document(), "p").unwrap();
+        let pseudo = tree
+            .pseudo_boxes
+            .get(&(p, super::PseudoKind::Before))
+            .expect("::before should have a box");
+        assert_eq!(pseudo.text, "Note: ");
+        // The pseudo sits at the host's content edge.
+        let p_box = tree.get(p).unwrap();
+        assert!((pseudo.rect.x - p_box.rect.x).abs() < 1.0);
+        assert!((pseudo.rect.y - p_box.rect.y).abs() < 1.0);
+    }
+
+    #[test]
+    fn after_pseudo_creates_box_below() {
+        let (dom, tree) = run(
+            "<style>body { margin: 0; } \
+             p { margin: 0; padding: 0; } \
+             p::after { content: '!'; }</style>\
+             <p>hello</p>",
+            1000.0,
+        );
+        let p = find(&dom, dom.document(), "p").unwrap();
+        let pseudo = tree
+            .pseudo_boxes
+            .get(&(p, super::PseudoKind::After))
+            .expect("::after should have a box");
+        assert_eq!(pseudo.text, "!");
+        // The pseudo sits below the host's text content.
+        let p_box = tree.get(p).unwrap();
+        assert!(pseudo.rect.y > p_box.rect.y);
+    }
+
+    #[test]
+    fn pseudo_without_content_property_makes_no_box() {
+        let (dom, tree) = run(
+            "<style>body { margin: 0; } \
+             p::before { color: red; } /* no content -> no box */</style>\
+             <p>hello</p>",
+            1000.0,
+        );
+        let p = find(&dom, dom.document(), "p").unwrap();
+        assert!(tree.pseudo_boxes.get(&(p, super::PseudoKind::Before)).is_none());
+    }
+
+    #[test]
+    fn pseudo_inherits_color_from_host() {
+        // Real coverage of the cascade path: pseudo style starts from the
+        // host's style so it inherits color. Check via the StyleTree directly.
+        use crate::css::Color;
+        let html = "<style>p { color: rgb(255,0,0); } \
+             p::before { content: 'X'; }</style>\
+             <p>hi</p>";
+        let dom = html::parse(html);
+        let sheets = match css::discover_stylesheets(&dom).into_iter().next() {
+            Some(css::StylesheetRef::Embedded(s)) => vec![s],
+            _ => vec![],
+        };
+        let style_tree = css::style_dom(&dom, &sheets);
+        let p = find(&dom, dom.document(), "p").unwrap();
+        let pseudo = style_tree.before_style(p).expect("pseudo style");
+        assert_eq!(pseudo.color, Color::rgb(255, 0, 0));
     }
 
     #[test]

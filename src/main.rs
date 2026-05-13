@@ -11,18 +11,24 @@ use std::num::NonZeroU32;
 use std::process::ExitCode;
 use std::rc::Rc;
 
+use cosmic_text::{
+    Attrs, Buffer, Color as CtColor, Family, FontSystem, Metrics, Shaping, SwashCache, Wrap,
+};
 use softbuffer::{Context, Surface};
 use tiny_skia::Pixmap;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 const MAX_EXTERNAL_STYLESHEETS: usize = 30;
 const MAX_IMAGES: usize = 50;
 const PAINT_HEIGHT_CEILING: u32 = 65_535;
+/// Height (px) of the browser chrome strip at the top of the window —
+/// holds the URL bar.
+const CHROME_HEIGHT: u32 = 36;
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -145,8 +151,19 @@ struct Page {
     styles: css::StyleTree,
     box_tree: layout::BoxTree,
     images: layout::ImageCache,
+    /// All stylesheets that contributed to the cascade — UA stylesheet is
+    /// rebuilt by `css::style_dom`, so we just keep the page-supplied set.
+    sheets: Vec<css::Stylesheet>,
     /// Full-page rendered pixmap.
     pixmap: Pixmap,
+    /// Currently hovered node (if any).
+    hover: Option<dom::NodeId>,
+}
+
+struct Chrome {
+    /// Text currently in the URL bar (editable when focused).
+    text: String,
+    focused: bool,
 }
 
 struct Browser {
@@ -160,6 +177,16 @@ struct Browser {
     viewport_size: (u32, u32),
     scroll_y: f32,
     cursor: (f32, f32),
+
+    /// Tracks Shift/Control/Alt/Super for chord shortcuts (Cmd+R, Cmd+L, etc.).
+    modifiers: ModifiersState,
+
+    chrome: Chrome,
+
+    /// Long-lived font system used for chrome text only (so we don't
+    /// re-scan system fonts every frame).
+    chrome_font_system: FontSystem,
+    chrome_swash: SwashCache,
 
     page: Option<Page>,
 
@@ -176,17 +203,29 @@ impl Browser {
     fn new(initial_url: Option<String>) -> Self {
         let allow_loopback = std::env::var("DABOSS_ALLOW_LOOPBACK").is_ok();
         Self {
-            pending_url: initial_url,
+            pending_url: initial_url.clone(),
             client: net::Client::new().with_allow_loopback(allow_loopback),
             window: None,
             surface: None,
             viewport_size: (1024, 768),
             scroll_y: 0.0,
             cursor: (0.0, 0.0),
+            modifiers: ModifiersState::empty(),
+            chrome: Chrome {
+                text: initial_url.unwrap_or_default(),
+                focused: false,
+            },
+            chrome_font_system: FontSystem::new(),
+            chrome_swash: SwashCache::new(),
             page: None,
             history: Vec::new(),
             history_cursor: None,
         }
+    }
+
+    /// Height (px) available to the page after subtracting the chrome.
+    fn page_viewport_height(&self) -> u32 {
+        self.viewport_size.1.saturating_sub(CHROME_HEIGHT).max(1)
     }
 
     fn navigate(&mut self, url_str: &str, record_history: bool) {
@@ -244,11 +283,11 @@ impl Browser {
             x: 0.0,
             y: 0.0,
             width: self.viewport_size.0 as f32,
-            height: self.viewport_size.1 as f32,
+            height: self.page_viewport_height() as f32,
         };
         let box_tree = layout::layout(&dom, &style_tree, &images, viewport);
 
-        let mut max_bottom = self.viewport_size.1;
+        let mut max_bottom = self.page_viewport_height();
         for opt in &box_tree.boxes {
             if let Some(b) = opt {
                 let bottom = (b.rect.y + b.rect.height).ceil() as u32;
@@ -287,13 +326,20 @@ impl Browser {
             }
         }
 
+        // Sync the URL bar text so users see where they actually landed
+        // (after redirects, etc.).
+        self.chrome.text = parsed.to_string();
+        self.chrome.focused = false;
+
         self.page = Some(Page {
             url: parsed,
             dom,
             styles: style_tree,
             box_tree,
             images,
+            sheets,
             pixmap,
+            hover: None,
         });
         self.scroll_y = 0.0;
 
@@ -311,17 +357,19 @@ impl Browser {
     /// Re-run layout + paint on the existing page without re-fetching. Used
     /// when the window is resized so we adapt to the new viewport width.
     fn re_layout(&mut self) {
+        let page_h = self.page_viewport_height();
+        let page_w = self.viewport_size.0;
         let Some(page) = self.page.as_mut() else {
             return;
         };
         let viewport = layout::Rect {
             x: 0.0,
             y: 0.0,
-            width: self.viewport_size.0 as f32,
-            height: self.viewport_size.1 as f32,
+            width: page_w as f32,
+            height: page_h as f32,
         };
         let box_tree = layout::layout(&page.dom, &page.styles, &page.images, viewport);
-        let mut max_bottom = self.viewport_size.1;
+        let mut max_bottom = page_h;
         for opt in &box_tree.boxes {
             if let Some(b) = opt {
                 let bottom = (b.rect.y + b.rect.height).ceil() as u32;
@@ -336,7 +384,7 @@ impl Browser {
             &page.styles,
             &box_tree,
             &page.images,
-            self.viewport_size.0,
+            page_w,
             paint_h,
         ) {
             page.box_tree = box_tree;
@@ -378,11 +426,31 @@ impl Browser {
     }
 
     fn click_at(&mut self, x: f32, y: f32) {
+        // Clicks land in either the chrome or the page area depending on y.
+        if y < CHROME_HEIGHT as f32 {
+            self.chrome.focused = true;
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+            return;
+        }
+        // Translate page-local y.
+        let page_y = y - CHROME_HEIGHT as f32;
+        // Defocus the URL bar when clicking on the page.
+        if self.chrome.focused {
+            self.chrome.focused = false;
+            // Restore the URL bar to the current page URL if the user
+            // navigated away without committing.
+            if let Some(p) = &self.page {
+                self.chrome.text = p.url.to_string();
+            }
+        }
+
         let target = {
             let Some(page) = &self.page else {
                 return;
             };
-            let abs_y = y + self.scroll_y;
+            let abs_y = page_y + self.scroll_y;
             let hit = match layout::hit_test(&page.dom, &page.box_tree, x, abs_y) {
                 Some(n) => n,
                 None => return,
@@ -409,6 +477,193 @@ impl Browser {
         }
     }
 
+    /// Hit-test the page under the cursor; if hover changed, re-cascade
+    /// with the new `:hover` chain and re-paint.
+    fn update_hover(&mut self) {
+        let (x, y) = self.cursor;
+        // Inside the chrome strip — page hover is "no node".
+        let new_hover = if y < CHROME_HEIGHT as f32 {
+            None
+        } else if let Some(page) = &self.page {
+            let abs_y = y - CHROME_HEIGHT as f32 + self.scroll_y;
+            layout::hit_test(&page.dom, &page.box_tree, x, abs_y)
+        } else {
+            None
+        };
+
+        // Skip work unless the hovered node actually changed.
+        let changed = self
+            .page
+            .as_ref()
+            .map(|p| p.hover != new_hover)
+            .unwrap_or(false);
+        if !changed {
+            return;
+        }
+
+        let page_w = self.viewport_size.0;
+        let page_h = self.page_viewport_height();
+        let Some(page) = self.page.as_mut() else {
+            return;
+        };
+        page.hover = new_hover;
+
+        // Build the hover chain (hovered node + ancestors).
+        let mut chain: Vec<dom::NodeId> = Vec::new();
+        let mut cur = new_hover;
+        while let Some(n) = cur {
+            chain.push(n);
+            cur = page.dom.node(n).parent;
+        }
+
+        // Re-cascade with the new state. Layout is unchanged (we assume
+        // :hover doesn't affect box sizes for the toy). Re-paint to refresh
+        // colors / backgrounds that depend on hover.
+        page.styles = css::style_dom_with(&page.dom, &page.sheets, &chain);
+        let max_bottom = page.pixmap.height();
+        if let Some(pixmap) = paint::paint(
+            &page.dom,
+            &page.styles,
+            &page.box_tree,
+            &page.images,
+            page_w,
+            max_bottom,
+        ) {
+            page.pixmap = pixmap;
+        }
+        let _ = page_h; // unused; kept for future scroll-clamp re-eval
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    fn handle_key(&mut self, logical_key: Key, text: Option<winit::keyboard::SmolStr>) {
+        // Super / Cmd chords always take priority — they're browser commands.
+        let cmd = self.modifiers.super_key() || self.modifiers.control_key();
+        if cmd {
+            match logical_key.as_ref() {
+                Key::Character("r") | Key::Character("R") => {
+                    self.reload();
+                    return;
+                }
+                Key::Character("l") | Key::Character("L") => {
+                    self.chrome.focused = true;
+                    self.chrome.text.clear(); // select-all + clear, the common Cmd+L UX
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    return;
+                }
+                Key::Named(NamedKey::ArrowLeft) => {
+                    self.history_back();
+                    return;
+                }
+                Key::Named(NamedKey::ArrowRight) => {
+                    self.history_forward();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        if self.chrome.focused {
+            self.handle_chrome_key(logical_key, text);
+        } else {
+            self.handle_page_key(logical_key);
+        }
+    }
+
+    fn handle_chrome_key(&mut self, logical_key: Key, text: Option<winit::keyboard::SmolStr>) {
+        match logical_key.as_ref() {
+            Key::Named(NamedKey::Enter) => {
+                let url = self.chrome.text.clone();
+                self.chrome.focused = false;
+                // If the user typed a URL without scheme, default to https://
+                let target = if url.contains("://") {
+                    url
+                } else if !url.is_empty() {
+                    format!("https://{}", url)
+                } else {
+                    return;
+                };
+                self.navigate(&target, true);
+            }
+            Key::Named(NamedKey::Escape) => {
+                self.chrome.focused = false;
+                if let Some(p) = &self.page {
+                    self.chrome.text = p.url.to_string();
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.chrome.text.pop();
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            _ => {
+                // Typeable character?
+                if let Some(s) = text {
+                    let s: &str = s.as_ref();
+                    // Filter out control chars (newlines, tabs) that some keys emit.
+                    if !s.is_empty() && !s.chars().any(|c| c.is_control()) {
+                        self.chrome.text.push_str(s);
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_page_key(&mut self, logical_key: Key) {
+        match logical_key.as_ref() {
+            Key::Character("r") | Key::Character("R") => self.reload(),
+            Key::Named(NamedKey::ArrowLeft) => self.history_back(),
+            Key::Named(NamedKey::ArrowRight) => self.history_forward(),
+            Key::Named(NamedKey::PageDown) | Key::Named(NamedKey::Space) => {
+                self.scroll_y =
+                    (self.scroll_y + self.page_viewport_height() as f32 * 0.9).max(0.0);
+                if let Some(page) = &self.page {
+                    let max_scroll = (page.pixmap.height() as f32
+                        - self.page_viewport_height() as f32)
+                        .max(0.0);
+                    self.scroll_y = self.scroll_y.min(max_scroll);
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            Key::Named(NamedKey::PageUp) => {
+                self.scroll_y =
+                    (self.scroll_y - self.page_viewport_height() as f32 * 0.9).max(0.0);
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            Key::Named(NamedKey::Home) => {
+                self.scroll_y = 0.0;
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            Key::Named(NamedKey::End) => {
+                if let Some(page) = &self.page {
+                    self.scroll_y = (page.pixmap.height() as f32
+                        - self.page_viewport_height() as f32)
+                        .max(0.0);
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn redraw(&mut self) {
         let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut()) else {
             return;
@@ -424,16 +679,19 @@ impl Browser {
         let vw = w.get() as usize;
         let vh = h.get() as usize;
 
-        // Default: white background.
+        // White page fill.
         for px in buffer.iter_mut() {
             *px = 0x00FF_FFFF;
         }
 
+        // Blit the page pixmap *below* the chrome strip.
         if let Some(page) = &self.page {
             let pmap_w = page.pixmap.width() as usize;
             let pmap_h = page.pixmap.height() as usize;
             let scroll = self.scroll_y as usize;
-            let visible_rows = vh.min(pmap_h.saturating_sub(scroll));
+            let page_top = CHROME_HEIGHT as usize;
+            let page_rows = vh.saturating_sub(page_top);
+            let visible_rows = page_rows.min(pmap_h.saturating_sub(scroll));
             let copy_cols = vw.min(pmap_w);
             let pmap_data = page.pixmap.data();
             for row in 0..visible_rows {
@@ -442,7 +700,7 @@ impl Browser {
                     break;
                 }
                 let src_off = src_row * pmap_w * 4;
-                let dst_off = row * vw;
+                let dst_off = (page_top + row) * vw;
                 for col in 0..copy_cols {
                     let s = src_off + col * 4;
                     let r = pmap_data[s];
@@ -454,7 +712,123 @@ impl Browser {
             }
         }
 
+        // Chrome strip on top.
+        paint_chrome(
+            &mut self.chrome_font_system,
+            &mut self.chrome_swash,
+            &mut buffer,
+            vw as u32,
+            vh as u32,
+            &self.chrome,
+        );
+
         buffer.present().expect("present");
+    }
+}
+
+// ---------------- Chrome painting ----------------
+
+/// Paints the URL bar directly into the softbuffer's u32 surface buffer.
+/// Background is a light gray strip with a darker bottom border; text uses
+/// cosmic-text shaping + swash glyph rendering, alpha-blended onto the
+/// surface pixel by pixel.
+fn paint_chrome(
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    buffer: &mut [u32],
+    width: u32,
+    _height: u32,
+    chrome: &Chrome,
+) {
+    let bar_h = CHROME_HEIGHT.min(_height);
+    let bg_color = if chrome.focused {
+        0x00FFFFFF // white when editing
+    } else {
+        0x00ECEEF1 // soft gray otherwise
+    };
+    let border_color = 0x00C0C4CC;
+    // Background
+    for y in 0..bar_h.saturating_sub(1) {
+        let row = (y * width) as usize;
+        for x in 0..width {
+            buffer[row + x as usize] = bg_color;
+        }
+    }
+    // 1px bottom border
+    if bar_h > 0 {
+        let row = ((bar_h - 1) * width) as usize;
+        for x in 0..width {
+            buffer[row + x as usize] = border_color;
+        }
+    }
+
+    // Text rendering inside the bar.
+    let pad_x: f32 = 10.0;
+    let baseline_y: f32 = 8.0;
+    let display_text = if chrome.text.is_empty() {
+        "about:blank"
+    } else {
+        chrome.text.as_str()
+    };
+    let metrics = Metrics::new(14.0, 18.0);
+    let mut tb = Buffer::new(font_system, metrics);
+    tb.set_size(font_system, Some(width as f32 - pad_x * 2.0), None);
+    tb.set_wrap(font_system, Wrap::None);
+    let attrs = Attrs::new().family(Family::SansSerif);
+    tb.set_text(font_system, display_text, attrs, Shaping::Advanced);
+    tb.shape_until_scroll(font_system, false);
+
+    let text_color = CtColor::rgb(30, 30, 35);
+    let mut last_glyph_right: i32 = pad_x as i32;
+    for run in tb.layout_runs() {
+        for glyph in run.glyphs.iter() {
+            let physical = glyph.physical((pad_x, baseline_y + run.line_y), 1.0);
+            let cache_key = physical.cache_key;
+            let glyph_x = physical.x;
+            let glyph_y = physical.y;
+            last_glyph_right = glyph_x + glyph.w as i32;
+            let pmap_w = width as i32;
+            let pmap_h = bar_h as i32;
+            swash_cache.with_pixels(font_system, cache_key, text_color, |x_off, y_off, color| {
+                let px = glyph_x + x_off;
+                let py = glyph_y + y_off;
+                if px < 0 || py < 0 || px >= pmap_w || py >= pmap_h {
+                    return;
+                }
+                let idx = py as usize * pmap_w as usize + px as usize;
+                let src_a = color.a();
+                if src_a == 0 {
+                    return;
+                }
+                let inv_a = 255u32 - src_a as u32;
+                let dst = buffer[idx];
+                let dr = (dst >> 16) & 0xFF;
+                let dg = (dst >> 8) & 0xFF;
+                let db = dst & 0xFF;
+                let sr = color.r() as u32 * src_a as u32 / 255;
+                let sg = color.g() as u32 * src_a as u32 / 255;
+                let sb = color.b() as u32 * src_a as u32 / 255;
+                let nr = sr + dr * inv_a / 255;
+                let ng = sg + dg * inv_a / 255;
+                let nb = sb + db * inv_a / 255;
+                buffer[idx] = (nr << 16) | (ng << 8) | nb;
+            });
+        }
+    }
+
+    // Caret if focused: a thin black bar just past the last glyph.
+    if chrome.focused {
+        let caret_x = (last_glyph_right + 2).max(pad_x as i32);
+        let caret_y0 = 6;
+        let caret_y1 = (bar_h as i32).saturating_sub(7);
+        if caret_x >= 0 && caret_x < width as i32 {
+            for y in caret_y0..caret_y1 {
+                let idx = (y * width as i32 + caret_x) as usize;
+                if let Some(p) = buffer.get_mut(idx) {
+                    *p = 0x00000000;
+                }
+            }
+        }
     }
 }
 
@@ -491,6 +865,10 @@ impl ApplicationHandler for Browser {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as f32, position.y as f32);
+                self.update_hover();
+            }
+            WindowEvent::ModifiersChanged(m) => {
+                self.modifiers = m.state();
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -507,8 +885,9 @@ impl ApplicationHandler for Browser {
                 };
                 self.scroll_y = (self.scroll_y - dy).max(0.0);
                 if let Some(page) = &self.page {
-                    let max_scroll =
-                        (page.pixmap.height() as f32 - self.viewport_size.1 as f32).max(0.0);
+                    let max_scroll = (page.pixmap.height() as f32
+                        - self.page_viewport_height() as f32)
+                        .max(0.0);
                     self.scroll_y = self.scroll_y.min(max_scroll);
                 }
                 if let Some(w) = &self.window {
@@ -520,51 +899,11 @@ impl ApplicationHandler for Browser {
                     KeyEvent {
                         state: ElementState::Pressed,
                         logical_key,
+                        text,
                         ..
                     },
                 ..
-            } => match logical_key.as_ref() {
-                Key::Character("r") | Key::Character("R") => self.reload(),
-                Key::Named(NamedKey::ArrowLeft) => self.history_back(),
-                Key::Named(NamedKey::ArrowRight) => self.history_forward(),
-                Key::Named(NamedKey::PageDown) | Key::Named(NamedKey::Space) => {
-                    self.scroll_y =
-                        (self.scroll_y + self.viewport_size.1 as f32 * 0.9).max(0.0);
-                    if let Some(page) = &self.page {
-                        let max_scroll = (page.pixmap.height() as f32
-                            - self.viewport_size.1 as f32)
-                            .max(0.0);
-                        self.scroll_y = self.scroll_y.min(max_scroll);
-                    }
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
-                }
-                Key::Named(NamedKey::PageUp) => {
-                    self.scroll_y =
-                        (self.scroll_y - self.viewport_size.1 as f32 * 0.9).max(0.0);
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
-                }
-                Key::Named(NamedKey::Home) => {
-                    self.scroll_y = 0.0;
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
-                }
-                Key::Named(NamedKey::End) => {
-                    if let Some(page) = &self.page {
-                        self.scroll_y = (page.pixmap.height() as f32
-                            - self.viewport_size.1 as f32)
-                            .max(0.0);
-                    }
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
-                }
-                _ => {}
-            },
+            } => self.handle_key(logical_key, text),
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
         }

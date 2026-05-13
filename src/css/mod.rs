@@ -66,13 +66,22 @@ fn collect(dom: &Dom, node: NodeId, out: &mut Vec<StylesheetRef>) {
 /// Compute a style for every node in the DOM. The UA stylesheet is always
 /// evaluated first so author rules win on equal specificity.
 pub fn style_dom(dom: &Dom, page_stylesheets: &[Stylesheet]) -> StyleTree {
+    style_dom_with(dom, page_stylesheets, &[])
+}
+
+/// Same as `style_dom` but with an explicit `:hover` chain.
+pub fn style_dom_with(
+    dom: &Dom,
+    page_stylesheets: &[Stylesheet],
+    hover_chain: &[NodeId],
+) -> StyleTree {
     let ua = ua_stylesheet();
     let mut sheets: Vec<&Stylesheet> = Vec::with_capacity(1 + page_stylesheets.len());
     sheets.push(&ua);
     for s in page_stylesheets {
         sheets.push(s);
     }
-    StyleTree::compute(dom, &sheets)
+    StyleTree::compute_with(dom, &sheets, hover_chain)
 }
 
 fn ua_stylesheet() -> Stylesheet {

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod css;
 mod dom;
 mod html;
 mod net;
@@ -59,6 +60,15 @@ fn run_fetch(url: &str) -> Result<(), net::Error> {
 
     let body = String::from_utf8_lossy(&response.body);
     let dom = html::parse(&body);
+
+    let sheets = css::extract_embedded_stylesheets(&dom);
+    let style_tree = css::style_dom(&dom, &sheets);
+    eprintln!(
+        "[phase 3] computed styles for {} nodes from {} embedded stylesheet(s)",
+        style_tree.styles.len(),
+        sheets.len()
+    );
+
     dom.print();
     Ok(())
 }

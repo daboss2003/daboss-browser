@@ -28,7 +28,7 @@ fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+                .unwrap_or_else(|_| "info,cosmic_text=error".into()),
         )
         .init();
 
@@ -142,9 +142,9 @@ fn run_browser(initial_url: Option<String>) {
 struct Page {
     url: url::Url,
     dom: dom::Dom,
-    #[allow(dead_code)] // consumed by :hover / :focus re-cascade in phase 6b
     styles: css::StyleTree,
     box_tree: layout::BoxTree,
+    images: layout::ImageCache,
     /// Full-page rendered pixmap.
     pixmap: Pixmap,
 }
@@ -292,6 +292,7 @@ impl Browser {
             dom,
             styles: style_tree,
             box_tree,
+            images,
             pixmap,
         });
         self.scroll_y = 0.0;
@@ -304,6 +305,45 @@ impl Browser {
     fn reload(&mut self) {
         if let Some(url) = self.page.as_ref().map(|p| p.url.to_string()) {
             self.navigate(&url, false);
+        }
+    }
+
+    /// Re-run layout + paint on the existing page without re-fetching. Used
+    /// when the window is resized so we adapt to the new viewport width.
+    fn re_layout(&mut self) {
+        let Some(page) = self.page.as_mut() else {
+            return;
+        };
+        let viewport = layout::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: self.viewport_size.0 as f32,
+            height: self.viewport_size.1 as f32,
+        };
+        let box_tree = layout::layout(&page.dom, &page.styles, &page.images, viewport);
+        let mut max_bottom = self.viewport_size.1;
+        for opt in &box_tree.boxes {
+            if let Some(b) = opt {
+                let bottom = (b.rect.y + b.rect.height).ceil() as u32;
+                if bottom > max_bottom {
+                    max_bottom = bottom;
+                }
+            }
+        }
+        let paint_h = max_bottom.min(PAINT_HEIGHT_CEILING);
+        if let Some(pixmap) = paint::paint(
+            &page.dom,
+            &page.styles,
+            &box_tree,
+            &page.images,
+            self.viewport_size.0,
+            paint_h,
+        ) {
+            page.box_tree = box_tree;
+            page.pixmap = pixmap;
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
         }
     }
 
@@ -446,10 +486,8 @@ impl ApplicationHandler for Browser {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
                 self.viewport_size = (size.width.max(1), size.height.max(1));
-                // Re-layout + re-paint at the new size.
-                if let Some(url) = self.page.as_ref().map(|p| p.url.to_string()) {
-                    self.navigate(&url, false);
-                }
+                // Re-run layout + paint on the existing page (no refetch).
+                self.re_layout();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as f32, position.y as f32);

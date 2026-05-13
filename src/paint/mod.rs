@@ -29,8 +29,7 @@ use tiny_skia::{
 };
 
 use crate::css::{
-    BackgroundImage, BorderStyle, BoxShadow, Color, ComputedStyle, FontStyle, StyleTree,
-    TextDecoration,
+    BackgroundImage, BorderStyle, Color, ComputedStyle, FontStyle, StyleTree, TextDecoration,
 };
 use crate::dom::{Dom, NodeId, NodeKind};
 use crate::layout::{BoxTree, ImageCache, ImageInfo, ImageSlot, LayoutBox, PseudoKind, Rect};

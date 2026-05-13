@@ -399,7 +399,7 @@ impl Painter {
         buffer.set_size(font_system, Some(rect.width.max(1.0)), None);
         buffer.set_wrap(font_system, Wrap::Word);
         let attrs = Attrs::new()
-            .family(Family::Serif)
+            .family(family_from_style(style))
             .weight(Weight(style.font_weight))
             .style(match style.font_style {
                 FontStyle::Italic => CtStyle::Italic,
@@ -475,6 +475,24 @@ impl Painter {
 
 fn color_to_sk(c: Color) -> SkColor {
     SkColor::from_rgba8(c.r, c.g, c.b, c.a)
+}
+
+/// Map the first CSS `font-family` to a `cosmic_text::Family`. Generic
+/// keywords (`serif`, `sans-serif`, `monospace`, ...) map to the matching
+/// generic; everything else is treated as a literal font name (borrowed
+/// from the style, hence the lifetime tied to `style`).
+fn family_from_style(style: &ComputedStyle) -> Family<'_> {
+    if let Some(first) = style.font_family.first() {
+        return match first.to_ascii_lowercase().as_str() {
+            "serif" => Family::Serif,
+            "sans-serif" | "sansserif" | "system-ui" => Family::SansSerif,
+            "monospace" => Family::Monospace,
+            "cursive" => Family::Cursive,
+            "fantasy" => Family::Fantasy,
+            _ => Family::Name(first),
+        };
+    }
+    Family::Serif
 }
 
 // Silence unused-imports warnings for items referenced only inside the

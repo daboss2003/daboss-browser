@@ -4,7 +4,7 @@ mod cascade;
 mod parser;
 mod types;
 
-pub use cascade::StyleTree;
+pub use cascade::{InteractionState, StyleTree};
 pub use parser::parse;
 #[allow(unused_imports)]
 pub use types::{
@@ -66,14 +66,14 @@ fn collect(dom: &Dom, node: NodeId, out: &mut Vec<StylesheetRef>) {
 /// Compute a style for every node in the DOM. The UA stylesheet is always
 /// evaluated first so author rules win on equal specificity.
 pub fn style_dom(dom: &Dom, page_stylesheets: &[Stylesheet]) -> StyleTree {
-    style_dom_with(dom, page_stylesheets, &[])
+    style_dom_with(dom, page_stylesheets, &InteractionState::EMPTY)
 }
 
-/// Same as `style_dom` but with an explicit `:hover` chain.
+/// Same as `style_dom` but with explicit `:hover` / `:focus` chains.
 pub fn style_dom_with(
     dom: &Dom,
     page_stylesheets: &[Stylesheet],
-    hover_chain: &[NodeId],
+    interaction: &InteractionState,
 ) -> StyleTree {
     let ua = ua_stylesheet();
     let mut sheets: Vec<&Stylesheet> = Vec::with_capacity(1 + page_stylesheets.len());
@@ -81,7 +81,7 @@ pub fn style_dom_with(
     for s in page_stylesheets {
         sheets.push(s);
     }
-    StyleTree::compute_with(dom, &sheets, hover_chain)
+    StyleTree::compute_with(dom, &sheets, interaction)
 }
 
 fn ua_stylesheet() -> Stylesheet {

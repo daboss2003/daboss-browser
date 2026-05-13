@@ -49,7 +49,7 @@ pub fn compute_specificity(sel: &Selector) -> Specificity {
 
 #[allow(dead_code)] // backward-compatible helper used by selected tests
 pub fn selector_matches(sel: &Selector, dom: &Dom, node: NodeId) -> bool {
-    selector_matches_pseudo(sel, dom, node, None, &[])
+    selector_matches_pseudo(sel, dom, node, None, &InteractionState::EMPTY)
 }
 
 /// `pseudo` selects which selectors match: `None` means "real-element" rules
@@ -62,7 +62,7 @@ pub fn selector_matches_pseudo(
     dom: &Dom,
     node: NodeId,
     pseudo: Option<&str>,
-    hover_chain: &[NodeId],
+    interaction: &InteractionState,
 ) -> bool {
     if sel.pseudo_element.as_deref() != pseudo {
         return false;
@@ -71,7 +71,7 @@ pub fn selector_matches_pseudo(
         return false;
     }
     let last = sel.compounds.len() - 1;
-    if !matches_simple(&sel.compounds[last], dom, node, hover_chain) {
+    if !matches_simple(&sel.compounds[last], dom, node, interaction) {
         return false;
     }
     let mut current = node;
@@ -79,14 +79,14 @@ pub fn selector_matches_pseudo(
         let combinator = sel.combinators[i];
         let target = &sel.compounds[i];
         let found = match combinator {
-            Combinator::Descendant => walk_up(dom, current, |id| matches_simple(target, dom, id, hover_chain)),
-            Combinator::Child => dom.node(current).parent.filter(|p| matches_simple(target, dom, *p, hover_chain)),
+            Combinator::Descendant => walk_up(dom, current, |id| matches_simple(target, dom, id, interaction)),
+            Combinator::Child => dom.node(current).parent.filter(|p| matches_simple(target, dom, *p, interaction)),
             Combinator::AdjacentSibling => dom
                 .node(current)
                 .prev_sibling
-                .filter(|s| matches_simple(target, dom, *s, hover_chain)),
+                .filter(|s| matches_simple(target, dom, *s, interaction)),
             Combinator::GeneralSibling => {
-                walk_prev(dom, current, |id| matches_simple(target, dom, id, hover_chain))
+                walk_prev(dom, current, |id| matches_simple(target, dom, id, interaction))
             }
         };
         match found {
@@ -123,7 +123,7 @@ fn matches_simple(
     sel: &SimpleSelector,
     dom: &Dom,
     node: NodeId,
-    hover_chain: &[NodeId],
+    interaction: &InteractionState,
 ) -> bool {
     let (tag, attrs) = match &dom.node(node).kind {
         NodeKind::Element { tag, attrs } => (tag.as_str(), attrs.as_slice()),
@@ -157,7 +157,7 @@ fn matches_simple(
         }
     }
     for pc in &sel.pseudo_classes {
-        if !match_pseudo_class(pc, dom, node, hover_chain) {
+        if !match_pseudo_class(pc, dom, node, interaction) {
             return false;
         }
     }
@@ -187,17 +187,38 @@ fn match_attribute(sel: &AttributeSelector, attrs: &[(String, String)]) -> bool 
     }
 }
 
-fn match_pseudo_class(name: &str, dom: &Dom, node: NodeId, hover_chain: &[NodeId]) -> bool {
+fn match_pseudo_class(
+    name: &str,
+    dom: &Dom,
+    node: NodeId,
+    interaction: &InteractionState,
+) -> bool {
     match name {
         "root" => dom.node(node).parent == Some(dom.document()),
         "first-child" => dom.node(node).prev_sibling.is_none(),
         "last-child" => dom.node(node).next_sibling.is_none(),
-        "hover" => hover_chain.contains(&node),
-        // :focus, :active, :checked, :visited, :link, :not(...), :nth-*, etc.
-        // None of these match until we have more interaction state (focus =
-        // Phase 6d) or pseudo-class arguments parsed (TBD).
+        "hover" => interaction.hover_chain.contains(&node),
+        "focus" | "focus-visible" | "focus-within" => {
+            interaction.focus_chain.contains(&node)
+        }
+        // :active, :checked, :visited, :link, :not(...), :nth-*, etc.
+        // Still not modelled.
         _ => false,
     }
+}
+
+/// Per-frame interaction state used by the cascade for stateful
+/// pseudo-classes. Both chains are "the matched node + its ancestors".
+pub struct InteractionState<'a> {
+    pub hover_chain: &'a [NodeId],
+    pub focus_chain: &'a [NodeId],
+}
+
+impl InteractionState<'_> {
+    pub const EMPTY: InteractionState<'static> = InteractionState {
+        hover_chain: &[],
+        focus_chain: &[],
+    };
 }
 
 // ---------------- Style tree ----------------
@@ -214,13 +235,17 @@ pub struct StyleTree {
 impl StyleTree {
     #[allow(dead_code)] // backward-compatible wrapper kept for tests
     pub fn compute(dom: &Dom, sheets: &[&Stylesheet]) -> Self {
-        Self::compute_with(dom, sheets, &[])
+        Self::compute_with(dom, sheets, &InteractionState::EMPTY)
     }
 
-    /// Same as `compute` but with an `:hover` chain — every node in
-    /// `hover_chain` (the hovered node + its ancestors) is treated as
-    /// matching the `:hover` pseudo-class. Pass `&[]` for no hover.
-    pub fn compute_with(dom: &Dom, sheets: &[&Stylesheet], hover_chain: &[NodeId]) -> Self {
+    /// Cascade against the given stylesheets, applying `:hover` / `:focus`
+    /// to nodes listed in `interaction.hover_chain` / `interaction.focus_chain`
+    /// respectively. Pass `&InteractionState::EMPTY` for the static case.
+    pub fn compute_with(
+        dom: &Dom,
+        sheets: &[&Stylesheet],
+        interaction: &InteractionState,
+    ) -> Self {
         let count = highest_node_id(dom).index() + 1;
         let mut styles = vec![ComputedStyle::initial(); count];
         let mut before = vec![None; count];
@@ -233,7 +258,7 @@ impl StyleTree {
             &mut styles,
             &mut before,
             &mut after,
-            hover_chain,
+            interaction,
         );
         Self {
             styles,
@@ -280,13 +305,13 @@ fn compute_recursive(
     out: &mut [ComputedStyle],
     before: &mut [Option<ComputedStyle>],
     after: &mut [Option<ComputedStyle>],
-    hover_chain: &[NodeId],
+    interaction: &InteractionState,
 ) {
-    let style = compute_one(dom, node, sheets, parent_style, hover_chain);
+    let style = compute_one(dom, node, sheets, parent_style, interaction);
     if matches!(&dom.node(node).kind, NodeKind::Element { .. }) {
         before[node.index()] =
-            compute_pseudo_style(dom, node, sheets, &style, "before", hover_chain);
-        after[node.index()] = compute_pseudo_style(dom, node, sheets, &style, "after", hover_chain);
+            compute_pseudo_style(dom, node, sheets, &style, "before", interaction);
+        after[node.index()] = compute_pseudo_style(dom, node, sheets, &style, "after", interaction);
     }
     out[node.index()] = style;
     let style_for_children = out[node.index()].clone();
@@ -300,7 +325,7 @@ fn compute_recursive(
             out,
             before,
             after,
-            hover_chain,
+            interaction,
         );
     }
 }
@@ -311,7 +336,7 @@ fn compute_pseudo_style(
     sheets: &[&Stylesheet],
     element_style: &ComputedStyle,
     pseudo_name: &str,
-    hover_chain: &[NodeId],
+    interaction: &InteractionState,
 ) -> Option<ComputedStyle> {
     // Pseudo-elements inherit non-resetting properties from their host.
     let mut style = ComputedStyle::inherit_from(element_style);
@@ -323,7 +348,7 @@ fn compute_pseudo_style(
         for rule in &sheet.rules {
             order += 1;
             for sel in &rule.selectors {
-                if selector_matches_pseudo(sel, dom, node, Some(pseudo_name), hover_chain) {
+                if selector_matches_pseudo(sel, dom, node, Some(pseudo_name), interaction) {
                     matched.push((compute_specificity(sel), order, rule));
                     break;
                 }
@@ -369,7 +394,7 @@ fn compute_one(
     node: NodeId,
     sheets: &[&Stylesheet],
     parent_style: Option<&ComputedStyle>,
-    hover_chain: &[NodeId],
+    interaction: &InteractionState,
 ) -> ComputedStyle {
     let mut style = match parent_style {
         Some(p) => ComputedStyle::inherit_from(p),
@@ -388,7 +413,7 @@ fn compute_one(
         for rule in &sheet.rules {
             order += 1;
             for sel in &rule.selectors {
-                if selector_matches_pseudo(sel, dom, node, None, hover_chain) {
+                if selector_matches_pseudo(sel, dom, node, None, interaction) {
                     matched.push((compute_specificity(sel), order, rule));
                     break;
                 }

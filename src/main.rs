@@ -158,6 +158,10 @@ struct Page {
     pixmap: Pixmap,
     /// Currently hovered node (if any).
     hover: Option<dom::NodeId>,
+    /// Currently focused node (if any).
+    focus: Option<dom::NodeId>,
+    /// Per-`<input>` typed value. Keyed by the input's NodeId.
+    inputs: std::collections::HashMap<dom::NodeId, String>,
 }
 
 struct Chrome {
@@ -331,6 +335,11 @@ impl Browser {
         self.chrome.text = parsed.to_string();
         self.chrome.focused = false;
 
+        // Seed input values from each <input>'s `value` attribute.
+        let mut inputs: std::collections::HashMap<dom::NodeId, String> =
+            std::collections::HashMap::new();
+        seed_input_values(&dom, dom.document(), &mut inputs);
+
         self.page = Some(Page {
             url: parsed,
             dom,
@@ -340,6 +349,8 @@ impl Browser {
             sheets,
             pixmap,
             hover: None,
+            focus: None,
+            inputs,
         });
         self.scroll_y = 0.0;
 
@@ -426,7 +437,6 @@ impl Browser {
     }
 
     fn click_at(&mut self, x: f32, y: f32) {
-        // Clicks land in either the chrome or the page area depending on y.
         if y < CHROME_HEIGHT as f32 {
             self.chrome.focused = true;
             if let Some(w) = &self.window {
@@ -434,19 +444,24 @@ impl Browser {
             }
             return;
         }
-        // Translate page-local y.
         let page_y = y - CHROME_HEIGHT as f32;
-        // Defocus the URL bar when clicking on the page.
         if self.chrome.focused {
             self.chrome.focused = false;
-            // Restore the URL bar to the current page URL if the user
-            // navigated away without committing.
             if let Some(p) = &self.page {
                 self.chrome.text = p.url.to_string();
             }
         }
 
-        let target = {
+        // Walk up the hit-tested node looking for: <a href> (navigate),
+        // submit-type input/button (submit form), or focusable element
+        // (input/textarea/select/button → focus).
+        enum Action {
+            None,
+            Navigate(url::Url),
+            Submit(dom::NodeId),
+            Focus(dom::NodeId),
+        }
+        let action = {
             let Some(page) = &self.page else {
                 return;
             };
@@ -455,33 +470,84 @@ impl Browser {
                 Some(n) => n,
                 None => return,
             };
-            // Walk up to find the nearest <a href>.
-            let mut current = Some(hit);
-            let mut href: Option<String> = None;
-            while let Some(n) = current {
+
+            let mut cur = Some(hit);
+            let mut chosen = Action::None;
+            while let Some(n) = cur {
                 if let dom::NodeKind::Element { tag, attrs } = &page.dom.node(n).kind {
-                    if tag == "a" {
-                        if let Some((_, h)) = attrs.iter().find(|(k, _)| k == "href") {
-                            href = Some(h.clone());
+                    match tag.as_str() {
+                        "a" => {
+                            if let Some((_, h)) = attrs.iter().find(|(k, _)| k == "href") {
+                                if let Ok(abs) = page.url.join(h) {
+                                    chosen = Action::Navigate(abs);
+                                    break;
+                                }
+                            }
+                        }
+                        "button" => {
+                            let ty = attr_value(attrs, "type").unwrap_or("submit");
+                            if ty == "submit" {
+                                chosen = Action::Submit(n);
+                            } else {
+                                chosen = Action::Focus(n);
+                            }
                             break;
                         }
+                        "input" => {
+                            let ty = attr_value(attrs, "type").unwrap_or("text");
+                            match ty {
+                                "submit" | "image" => chosen = Action::Submit(n),
+                                _ => chosen = Action::Focus(n),
+                            }
+                            break;
+                        }
+                        "textarea" | "select" => {
+                            chosen = Action::Focus(n);
+                            break;
+                        }
+                        _ => {}
                     }
                 }
-                current = page.dom.node(n).parent;
+                cur = page.dom.node(n).parent;
             }
-            href.and_then(|h| page.url.join(&h).ok())
+            chosen
         };
 
-        if let Some(target) = target {
-            self.navigate(&target.to_string(), true);
+        match action {
+            Action::None => {
+                // Click on plain page content — unfocus any input.
+                if let Some(p) = self.page.as_mut() {
+                    if p.focus.is_some() {
+                        p.focus = None;
+                        self.recascade_and_paint();
+                    }
+                }
+            }
+            Action::Navigate(target) => self.navigate(&target.to_string(), true),
+            Action::Submit(submitter) => self.submit_form_from(submitter),
+            Action::Focus(node) => self.set_focus(Some(node)),
         }
+    }
+
+    fn set_focus(&mut self, node: Option<dom::NodeId>) {
+        let changed = self
+            .page
+            .as_ref()
+            .map(|p| p.focus != node)
+            .unwrap_or(false);
+        if !changed {
+            return;
+        }
+        if let Some(p) = self.page.as_mut() {
+            p.focus = node;
+        }
+        self.recascade_and_paint();
     }
 
     /// Hit-test the page under the cursor; if hover changed, re-cascade
     /// with the new `:hover` chain and re-paint.
     fn update_hover(&mut self) {
         let (x, y) = self.cursor;
-        // Inside the chrome strip — page hover is "no node".
         let new_hover = if y < CHROME_HEIGHT as f32 {
             None
         } else if let Some(page) = &self.page {
@@ -491,7 +557,6 @@ impl Browser {
             None
         };
 
-        // Skip work unless the hovered node actually changed.
         let changed = self
             .page
             .as_ref()
@@ -501,25 +566,24 @@ impl Browser {
             return;
         }
 
+        if let Some(page) = self.page.as_mut() {
+            page.hover = new_hover;
+        }
+        self.recascade_and_paint();
+    }
+
+    fn recascade_and_paint(&mut self) {
         let page_w = self.viewport_size.0;
-        let page_h = self.page_viewport_height();
         let Some(page) = self.page.as_mut() else {
             return;
         };
-        page.hover = new_hover;
-
-        // Build the hover chain (hovered node + ancestors).
-        let mut chain: Vec<dom::NodeId> = Vec::new();
-        let mut cur = new_hover;
-        while let Some(n) = cur {
-            chain.push(n);
-            cur = page.dom.node(n).parent;
-        }
-
-        // Re-cascade with the new state. Layout is unchanged (we assume
-        // :hover doesn't affect box sizes for the toy). Re-paint to refresh
-        // colors / backgrounds that depend on hover.
-        page.styles = css::style_dom_with(&page.dom, &page.sheets, &chain);
+        let hover_chain = chain_of(&page.dom, page.hover);
+        let focus_chain = chain_of(&page.dom, page.focus);
+        let interaction = css::InteractionState {
+            hover_chain: &hover_chain,
+            focus_chain: &focus_chain,
+        };
+        page.styles = css::style_dom_with(&page.dom, &page.sheets, &interaction);
         let max_bottom = page.pixmap.height();
         if let Some(pixmap) = paint::paint(
             &page.dom,
@@ -531,7 +595,6 @@ impl Browser {
         ) {
             page.pixmap = pixmap;
         }
-        let _ = page_h; // unused; kept for future scroll-clamp re-eval
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -568,8 +631,56 @@ impl Browser {
 
         if self.chrome.focused {
             self.handle_chrome_key(logical_key, text);
+        } else if self
+            .page
+            .as_ref()
+            .map(|p| p.focus.is_some())
+            .unwrap_or(false)
+        {
+            self.handle_input_key(logical_key, text);
         } else {
             self.handle_page_key(logical_key);
+        }
+    }
+
+    fn handle_input_key(&mut self, logical_key: Key, text: Option<winit::keyboard::SmolStr>) {
+        let focus_node = match self.page.as_ref().and_then(|p| p.focus) {
+            Some(n) => n,
+            None => return,
+        };
+        match logical_key.as_ref() {
+            Key::Named(NamedKey::Escape) => {
+                self.set_focus(None);
+                return;
+            }
+            Key::Named(NamedKey::Enter) => {
+                // Enter inside a text input submits the enclosing form.
+                self.submit_form_from(focus_node);
+                return;
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if let Some(page) = self.page.as_mut() {
+                    if let Some(val) = page.inputs.get_mut(&focus_node) {
+                        val.pop();
+                    }
+                }
+            }
+            _ => {
+                if let Some(s) = text {
+                    let s: &str = s.as_ref();
+                    if !s.is_empty() && !s.chars().any(|c| c.is_control()) {
+                        if let Some(page) = self.page.as_mut() {
+                            page.inputs
+                                .entry(focus_node)
+                                .or_default()
+                                .push_str(s);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
         }
     }
 
@@ -712,6 +823,20 @@ impl Browser {
             }
         }
 
+        // Input overlays — typed values painted on top of the page pixmap.
+        if let Some(page) = &self.page {
+            paint_input_overlays(
+                &mut self.chrome_font_system,
+                &mut self.chrome_swash,
+                &mut buffer,
+                vw as u32,
+                vh as u32,
+                page,
+                self.scroll_y,
+                CHROME_HEIGHT,
+            );
+        }
+
         // Chrome strip on top.
         paint_chrome(
             &mut self.chrome_font_system,
@@ -723,6 +848,344 @@ impl Browser {
         );
 
         buffer.present().expect("present");
+    }
+}
+
+// ---------------- DOM helpers ----------------
+
+fn chain_of(dom: &dom::Dom, node: Option<dom::NodeId>) -> Vec<dom::NodeId> {
+    let mut out = Vec::new();
+    let mut cur = node;
+    while let Some(n) = cur {
+        out.push(n);
+        cur = dom.node(n).parent;
+    }
+    out
+}
+
+fn attr_value<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    attrs
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
+/// Seed `<input value="...">` defaults into the per-input value map so the
+/// user sees the page's preset text before typing anything.
+fn seed_input_values(
+    dom: &dom::Dom,
+    node: dom::NodeId,
+    out: &mut std::collections::HashMap<dom::NodeId, String>,
+) {
+    if let dom::NodeKind::Element { tag, attrs } = &dom.node(node).kind {
+        if tag == "input" || tag == "textarea" {
+            let v = attr_value(attrs, "value").unwrap_or("").to_string();
+            out.insert(node, v);
+        }
+    }
+    let kids: Vec<dom::NodeId> = dom.children(node).collect();
+    for c in kids {
+        seed_input_values(dom, c, out);
+    }
+}
+
+// ---------------- Form submission ----------------
+
+impl Browser {
+    /// Submit the form ancestor of `submitter` (the clicked button or input).
+    fn submit_form_from(&mut self, submitter: dom::NodeId) {
+        let Some(page) = &self.page else {
+            return;
+        };
+        // Find the enclosing <form>.
+        let mut form_node = None;
+        let mut cur = Some(submitter);
+        while let Some(n) = cur {
+            if let dom::NodeKind::Element { tag, .. } = &page.dom.node(n).kind {
+                if tag == "form" {
+                    form_node = Some(n);
+                    break;
+                }
+            }
+            cur = page.dom.node(n).parent;
+        }
+        let Some(form) = form_node else {
+            return;
+        };
+
+        // Read form attributes.
+        let (action, method) = if let dom::NodeKind::Element { attrs, .. } = &page.dom.node(form).kind {
+            (
+                attr_value(attrs, "action").unwrap_or("").to_string(),
+                attr_value(attrs, "method")
+                    .map(|s| s.to_ascii_lowercase())
+                    .unwrap_or_else(|| "get".to_string()),
+            )
+        } else {
+            return;
+        };
+
+        // Collect fields. Walk all <input>/<textarea>/<select> descendants
+        // of the form. Use the typed value if present, otherwise the seeded
+        // attribute value.
+        let mut fields: Vec<(String, String)> = Vec::new();
+        collect_form_fields(&page.dom, &page.inputs, form, &mut fields);
+
+        // urlencode.
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        for (k, v) in &fields {
+            serializer.append_pair(k, v);
+        }
+        let encoded = serializer.finish();
+
+        // Resolve action URL.
+        let action_url = if action.is_empty() {
+            page.url.clone()
+        } else {
+            match page.url.join(&action) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("[form] bad action {action:?}: {e}");
+                    return;
+                }
+            }
+        };
+        let allow_loopback = std::env::var("DABOSS_ALLOW_LOOPBACK").is_ok();
+        let _ = allow_loopback;
+
+        eprintln!("[form] {method} {action_url} body={} bytes", encoded.len());
+        if method == "post" {
+            // POST → body is the encoded form, content-type is the urlencoded mime.
+            match self
+                .client
+                .post(&action_url.to_string(), encoded.into_bytes(), "application/x-www-form-urlencoded")
+            {
+                Ok(_resp) => {
+                    // For simplicity, re-route through navigate() to render
+                    // the response by re-fetching with GET. Real browsers
+                    // render the POST response directly; the toy keeps the
+                    // pipeline simpler at the cost of one extra fetch.
+                    self.navigate(&action_url.to_string(), true);
+                }
+                Err(e) => eprintln!("[form] POST failed: {e}"),
+            }
+        } else {
+            // GET → append ?query to action and navigate.
+            let mut target = action_url.clone();
+            target.set_query(if encoded.is_empty() { None } else { Some(&encoded) });
+            self.navigate(&target.to_string(), true);
+        }
+    }
+}
+
+fn collect_form_fields(
+    dom: &dom::Dom,
+    inputs: &std::collections::HashMap<dom::NodeId, String>,
+    node: dom::NodeId,
+    out: &mut Vec<(String, String)>,
+) {
+    if let dom::NodeKind::Element { tag, attrs } = &dom.node(node).kind {
+        match tag.as_str() {
+            "input" | "textarea" => {
+                let name = attr_value(attrs, "name");
+                if let Some(name) = name {
+                    // Skip non-submitting input types.
+                    let ty = attr_value(attrs, "type").unwrap_or("text");
+                    let submitting = !matches!(
+                        ty,
+                        "submit" | "button" | "image" | "reset" | "file" | "checkbox" | "radio"
+                    );
+                    if submitting {
+                        let val = inputs.get(&node).cloned().unwrap_or_default();
+                        out.push((name.to_string(), val));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let kids: Vec<dom::NodeId> = dom.children(node).collect();
+    for c in kids {
+        collect_form_fields(dom, inputs, c, out);
+    }
+}
+
+// ---------------- Input overlays ----------------
+
+/// Walk the DOM for `<input>` / `<textarea>` elements, render their typed
+/// value (if any) into their layout box, and draw a blinking-ish caret
+/// when the input is focused. Painted directly onto the softbuffer u32
+/// surface so we don't have to invalidate the page pixmap on every keystroke.
+fn paint_input_overlays(
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    buffer: &mut [u32],
+    vw: u32,
+    vh: u32,
+    page: &Page,
+    scroll_y: f32,
+    top_offset: u32,
+) {
+    paint_input_overlays_walk(
+        font_system,
+        swash_cache,
+        buffer,
+        vw,
+        vh,
+        page,
+        scroll_y,
+        top_offset,
+        page.dom.document(),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_input_overlays_walk(
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    buffer: &mut [u32],
+    vw: u32,
+    vh: u32,
+    page: &Page,
+    scroll_y: f32,
+    top_offset: u32,
+    node: dom::NodeId,
+) {
+    if let dom::NodeKind::Element { tag, .. } = &page.dom.node(node).kind {
+        if tag == "input" || tag == "textarea" {
+            let value = page.inputs.get(&node).map(String::as_str).unwrap_or("");
+            let is_focused = page.focus == Some(node);
+            if let Some(b) = page.box_tree.get(node) {
+                draw_input_text(
+                    font_system,
+                    swash_cache,
+                    buffer,
+                    vw,
+                    vh,
+                    b.rect,
+                    value,
+                    is_focused,
+                    scroll_y,
+                    top_offset,
+                );
+            }
+        }
+    }
+    let kids: Vec<dom::NodeId> = page.dom.children(node).collect();
+    for c in kids {
+        paint_input_overlays_walk(
+            font_system,
+            swash_cache,
+            buffer,
+            vw,
+            vh,
+            page,
+            scroll_y,
+            top_offset,
+            c,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_input_text(
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    buffer: &mut [u32],
+    vw: u32,
+    vh: u32,
+    rect: layout::Rect,
+    value: &str,
+    focused: bool,
+    scroll_y: f32,
+    top_offset: u32,
+) {
+    // Translate page coordinates to surface coordinates.
+    let surface_x = rect.x;
+    let surface_y = rect.y - scroll_y + top_offset as f32;
+    // Skip entirely off-screen inputs.
+    if surface_y + rect.height < top_offset as f32 || surface_y >= vh as f32 {
+        return;
+    }
+
+    let pad_x: f32 = 4.0;
+    let pad_y: f32 = 2.0;
+    if !value.is_empty() {
+        let metrics = Metrics::new(14.0, 18.0);
+        let mut tb = Buffer::new(font_system, metrics);
+        tb.set_size(font_system, Some((rect.width - pad_x * 2.0).max(1.0)), None);
+        tb.set_wrap(font_system, Wrap::None);
+        let attrs = Attrs::new().family(Family::SansSerif);
+        tb.set_text(font_system, value, attrs, Shaping::Advanced);
+        tb.shape_until_scroll(font_system, false);
+
+        let text_color = CtColor::rgb(20, 20, 25);
+        let pmap_w = vw as i32;
+        let pmap_h = vh as i32;
+        let bar_top = top_offset as i32;
+        let mut last_right = (surface_x + pad_x) as i32;
+
+        for run in tb.layout_runs() {
+            for glyph in run.glyphs.iter() {
+                let physical = glyph.physical((surface_x + pad_x, surface_y + pad_y + run.line_y), 1.0);
+                let cache_key = physical.cache_key;
+                let glyph_x = physical.x;
+                let glyph_y = physical.y;
+                last_right = glyph_x + glyph.w as i32;
+                swash_cache.with_pixels(font_system, cache_key, text_color, |x_off, y_off, color| {
+                    let px = glyph_x + x_off;
+                    let py = glyph_y + y_off;
+                    if px < 0 || py < bar_top || px >= pmap_w || py >= pmap_h {
+                        return;
+                    }
+                    let idx = py as usize * pmap_w as usize + px as usize;
+                    let src_a = color.a();
+                    if src_a == 0 {
+                        return;
+                    }
+                    let inv_a = 255u32 - src_a as u32;
+                    let dst = buffer[idx];
+                    let dr = (dst >> 16) & 0xFF;
+                    let dg = (dst >> 8) & 0xFF;
+                    let db = dst & 0xFF;
+                    let sr = color.r() as u32 * src_a as u32 / 255;
+                    let sg = color.g() as u32 * src_a as u32 / 255;
+                    let sb = color.b() as u32 * src_a as u32 / 255;
+                    let nr = sr + dr * inv_a / 255;
+                    let ng = sg + dg * inv_a / 255;
+                    let nb = sb + db * inv_a / 255;
+                    buffer[idx] = (nr << 16) | (ng << 8) | nb;
+                });
+            }
+        }
+
+        if focused {
+            // Caret just past the last glyph.
+            let caret_x = (last_right + 1).max((surface_x + pad_x) as i32);
+            let caret_y0 = (surface_y + 4.0) as i32;
+            let caret_y1 = (surface_y + rect.height - 4.0) as i32;
+            for y in caret_y0..caret_y1 {
+                if y >= top_offset as i32 && y < vh as i32 && caret_x >= 0 && caret_x < vw as i32 {
+                    let idx = (y as usize * vw as usize + caret_x as usize) as usize;
+                    if let Some(p) = buffer.get_mut(idx) {
+                        *p = 0x00202028;
+                    }
+                }
+            }
+        }
+    } else if focused {
+        // Empty focused input — show a caret at the start.
+        let caret_x = (surface_x + pad_x) as i32;
+        let caret_y0 = (surface_y + 4.0) as i32;
+        let caret_y1 = (surface_y + rect.height - 4.0) as i32;
+        for y in caret_y0..caret_y1 {
+            if y >= top_offset as i32 && y < vh as i32 && caret_x >= 0 && caret_x < vw as i32 {
+                let idx = (y as usize * vw as usize + caret_x as usize) as usize;
+                if let Some(p) = buffer.get_mut(idx) {
+                    *p = 0x00202028;
+                }
+            }
+        }
     }
 }
 

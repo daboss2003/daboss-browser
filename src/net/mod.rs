@@ -46,10 +46,22 @@ impl Client {
 
     pub fn get(&self, url: &str) -> Result<Response> {
         let url = Url::parse(url).map_err(|e| Error::InvalidUrl(e.to_string()))?;
-        self.get_url(url, 0)
+        self.do_request(url, Method::Get, 0)
     }
 
-    fn get_url(&self, url: Url, depth: u32) -> Result<Response> {
+    pub fn post(&self, url: &str, body: Vec<u8>, content_type: &str) -> Result<Response> {
+        let url = Url::parse(url).map_err(|e| Error::InvalidUrl(e.to_string()))?;
+        self.do_request(
+            url,
+            Method::Post {
+                body,
+                content_type: content_type.to_string(),
+            },
+            0,
+        )
+    }
+
+    fn do_request(&self, url: Url, method: Method, depth: u32) -> Result<Response> {
         if depth >= self.max_redirects {
             return Err(Error::TooManyRedirects(self.max_redirects));
         }
@@ -83,7 +95,12 @@ impl Client {
         )?;
 
         let path = build_path(&url);
-        let request = Request::get(&host, &path);
+        let request = match &method {
+            Method::Get => Request::get(&host, &path),
+            Method::Post { body, content_type } => {
+                Request::post(&host, &path, body.clone(), content_type)
+            }
+        };
         request.write_to(&mut conn)?;
 
         let response = Response::read_from(conn, self.max_response_bytes)?;
@@ -94,12 +111,27 @@ impl Client {
                     .join(location)
                     .map_err(|e| Error::InvalidUrl(format!("bad redirect location: {e}")))?;
                 tracing::info!(from = %url, to = %next, status = response.status, "redirect");
-                return self.get_url(next, depth + 1);
+                // Per HTTP spec: 303 always switches to GET; 301/302 are
+                // conventionally treated the same way by browsers for POST
+                // submissions. 307/308 preserve the method.
+                let follow_method = match (response.status, &method) {
+                    (303, _) | (301 | 302, Method::Post { .. }) => Method::Get,
+                    _ => method,
+                };
+                return self.do_request(next, follow_method, depth + 1);
             }
         }
 
         Ok(response)
     }
+}
+
+enum Method {
+    Get,
+    Post {
+        body: Vec<u8>,
+        content_type: String,
+    },
 }
 
 fn build_path(url: &Url) -> String {

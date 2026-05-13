@@ -82,7 +82,7 @@ impl TextLayout {
             .collect();
         text_spans.sort_by_key(|s| s.range.start);
 
-        let mut rich: Vec<(&str, Attrs<'static>)> = Vec::new();
+        let mut rich: Vec<(&str, Attrs<'_>)> = Vec::new();
         let mut cursor = 0usize;
         for span in &text_spans {
             if span.range.start > cursor {
@@ -129,14 +129,32 @@ impl TextLayout {
     }
 }
 
-fn attrs_from_style(style: &ComputedStyle) -> Attrs<'static> {
+fn attrs_from_style(style: &ComputedStyle) -> Attrs<'_> {
     Attrs::new()
-        .family(Family::Serif)
+        .family(family_from_style(style))
         .weight(Weight(style.font_weight))
         .style(match style.font_style {
             FontStyle::Italic => Style::Italic,
             FontStyle::Normal => Style::Normal,
         })
+}
+
+/// Map the first CSS `font-family` value to cosmic-text's `Family`.
+/// Generic keywords map to the corresponding generic; everything else is
+/// treated as a literal font name (borrowed from the style, so the returned
+/// `Family` has the same lifetime as the style).
+pub fn family_from_style(style: &ComputedStyle) -> Family<'_> {
+    if let Some(first) = style.font_family.first() {
+        return match first.to_ascii_lowercase().as_str() {
+            "serif" => Family::Serif,
+            "sans-serif" | "sansserif" | "system-ui" => Family::SansSerif,
+            "monospace" => Family::Monospace,
+            "cursive" => Family::Cursive,
+            "fantasy" => Family::Fantasy,
+            _ => Family::Name(first),
+        };
+    }
+    Family::Serif
 }
 
 #[derive(Debug, Default)]

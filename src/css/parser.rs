@@ -795,11 +795,13 @@ impl<'a> Parser<'a> {
             }
             if self.input[self.pos..].starts_with("/*") {
                 self.pos += 2;
-                while !self.input[self.pos..].starts_with("*/") && !self.eof() {
-                    self.pos += 1;
-                }
-                if self.input[self.pos..].starts_with("*/") {
-                    self.pos += 2;
+                // Jump straight to the comment terminator — incrementing by
+                // one byte at a time can land us inside a multi-byte UTF-8
+                // character (em-dash, smart quotes, etc.) and panic on the
+                // next slice. `find` searches by bytes safely.
+                match self.input[self.pos..].find("*/") {
+                    Some(end) => self.pos += end + 2,
+                    None => self.pos = self.input.len(),
                 }
                 continue;
             }

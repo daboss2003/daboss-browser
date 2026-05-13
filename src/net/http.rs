@@ -8,6 +8,7 @@ pub struct Request {
     pub path: String,
     pub host: String,
     pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
 }
 
 impl Request {
@@ -16,14 +17,21 @@ impl Request {
             method: "GET".into(),
             path: path.into(),
             host: host.into(),
-            headers: vec![
-                ("User-Agent".into(), "daboss/0.1".into()),
-                ("Accept".into(), "*/*".into()),
-                // identity: refuse compression so we don't have to decode gzip/br yet.
-                ("Accept-Encoding".into(), "identity".into()),
-                // Drop the connection after one request — keeps the parser simple.
-                ("Connection".into(), "close".into()),
-            ],
+            headers: default_headers(),
+            body: Vec::new(),
+        }
+    }
+
+    pub fn post(host: &str, path: &str, body: Vec<u8>, content_type: &str) -> Self {
+        let mut headers = default_headers();
+        headers.push(("Content-Type".into(), content_type.into()));
+        headers.push(("Content-Length".into(), body.len().to_string()));
+        Self {
+            method: "POST".into(),
+            path: path.into(),
+            host: host.into(),
+            headers,
+            body,
         }
     }
 
@@ -34,9 +42,23 @@ impl Request {
             write!(w, "{name}: {value}\r\n")?;
         }
         w.write_all(b"\r\n")?;
+        if !self.body.is_empty() {
+            w.write_all(&self.body)?;
+        }
         w.flush()?;
         Ok(())
     }
+}
+
+fn default_headers() -> Vec<(String, String)> {
+    vec![
+        ("User-Agent".into(), "daboss/0.1".into()),
+        ("Accept".into(), "*/*".into()),
+        // identity: refuse compression so we don't have to decode gzip/br yet.
+        ("Accept-Encoding".into(), "identity".into()),
+        // Drop the connection after one request — keeps the parser simple.
+        ("Connection".into(), "close".into()),
+    ]
 }
 
 #[derive(Debug)]

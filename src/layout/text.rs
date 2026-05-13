@@ -33,11 +33,11 @@ impl TextLayout {
     /// "max content" intrinsic width. Used by table layout to size columns
     /// against the natural widths of their cells.
     pub fn measure_natural_width(&mut self, text: &str, style: &ComputedStyle) -> f32 {
-        if text.is_empty() {
+        if text.is_empty() || style.font_size <= 0.0 || style.line_height <= 0.0 {
             return 0.0;
         }
-        let line_height = style.font_size * style.line_height;
-        let metrics = Metrics::new(style.font_size, line_height);
+        let line_height = (style.font_size * style.line_height).max(1.0);
+        let metrics = Metrics::new(style.font_size.max(1.0), line_height);
         let mut buffer = Buffer::new(&mut self.system, metrics);
         // Effectively unbounded width: cosmic-text won't wrap.
         buffer.set_size(&mut self.system, Some(f32::MAX / 2.0), None);
@@ -63,11 +63,15 @@ impl TextLayout {
         parent_style: &ComputedStyle,
         styles: &StyleTree,
     ) -> ShapedText {
-        if content.text.is_empty() || max_width <= 0.0 {
+        if content.text.is_empty()
+            || max_width <= 0.0
+            || parent_style.font_size <= 0.0
+            || parent_style.line_height <= 0.0
+        {
             return ShapedText::default();
         }
-        let line_height = parent_style.font_size * parent_style.line_height;
-        let metrics = Metrics::new(parent_style.font_size, line_height);
+        let line_height = (parent_style.font_size * parent_style.line_height).max(1.0);
+        let metrics = Metrics::new(parent_style.font_size.max(1.0), line_height);
         let mut buffer = Buffer::new(&mut self.system, metrics);
         buffer.set_size(&mut self.system, Some(max_width), None);
         buffer.set_wrap(&mut self.system, Wrap::Word);

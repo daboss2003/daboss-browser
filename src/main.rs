@@ -25,6 +25,7 @@ use winit::window::{Window, WindowId};
 
 const MAX_EXTERNAL_STYLESHEETS: usize = 30;
 const MAX_IMAGES: usize = 50;
+const MAX_IFRAMES: usize = 5;
 const PAINT_HEIGHT_CEILING: u32 = 65_535;
 /// Height (px) of the browser chrome strip at the top of the window —
 /// holds the URL bar.
@@ -120,7 +121,9 @@ fn run_png_export(url_str: &str) -> Result<(), net::Error> {
     }
     let paint_height = max_bottom.min(PAINT_HEIGHT_CEILING);
 
-    if let Some(pixmap) = paint::paint(
+    let iframes = render_iframes(&dom, &box_tree, &client, &base_url);
+
+    if let Some(mut pixmap) = paint::paint(
         &dom,
         &style_tree,
         &box_tree,
@@ -128,10 +131,15 @@ fn run_png_export(url_str: &str) -> Result<(), net::Error> {
         viewport.width as u32,
         paint_height,
     ) {
+        composite_iframes(&mut pixmap, &box_tree, &iframes);
         if let Ok(png) = pixmap.encode_png() {
             let path = "/tmp/daboss-out.png";
             let _ = std::fs::write(path, png);
-            eprintln!("[png] wrote {path} ({}x{paint_height})", viewport.width as u32);
+            eprintln!(
+                "[png] wrote {path} ({}x{paint_height}, {} iframe(s))",
+                viewport.width as u32,
+                iframes.len()
+            );
         }
     }
     Ok(())
@@ -162,6 +170,21 @@ struct Page {
     focus: Option<dom::NodeId>,
     /// Per-`<input>` typed value. Keyed by the input's NodeId.
     inputs: std::collections::HashMap<dom::NodeId, String>,
+    /// Rendered iframe contents, keyed by the iframe's NodeId in this page.
+    iframes: std::collections::HashMap<dom::NodeId, IframeContent>,
+}
+
+/// A nested document loaded inside an `<iframe>`. We render it like a real
+/// page (own DOM, styles, layout, paint) into a small pixmap sized to the
+/// iframe's content box, then composite into the parent.
+struct IframeContent {
+    #[allow(dead_code)] // url retained for future click-to-navigate inside iframe
+    url: url::Url,
+    pixmap: Pixmap,
+    /// True if the iframe element carried a `sandbox` attribute. Toy
+    /// behaviour: skip form submissions originating from inside it.
+    #[allow(dead_code)]
+    sandbox: bool,
 }
 
 struct Chrome {
@@ -308,7 +331,12 @@ impl Browser {
         }
         let paint_h = max_bottom.min(PAINT_HEIGHT_CEILING);
 
-        let pixmap = match paint::paint(
+        // Iframes are fetched + rendered after parent layout (so we know
+        // each iframe's box size) but before parent paint (so we composite
+        // them into the parent pixmap as the last step).
+        let iframes = render_iframes(&dom, &box_tree, &self.client, &parsed);
+
+        let mut pixmap = match paint::paint(
             &dom,
             &style_tree,
             &box_tree,
@@ -322,6 +350,7 @@ impl Browser {
                 return;
             }
         };
+        composite_iframes(&mut pixmap, &box_tree, &iframes);
 
         if record_history {
             if let Some(prev) = &self.page {
@@ -351,6 +380,7 @@ impl Browser {
             hover: None,
             focus: None,
             inputs,
+            iframes,
         });
         self.scroll_y = 0.0;
 
@@ -390,7 +420,13 @@ impl Browser {
             }
         }
         let paint_h = max_bottom.min(PAINT_HEIGHT_CEILING);
-        if let Some(pixmap) = paint::paint(
+
+        // Re-render iframes at the new viewport — their inner sizes follow
+        // the new parent box.
+        let new_iframes =
+            render_iframes(&page.dom, &box_tree, &self.client, &page.url);
+
+        if let Some(mut pixmap) = paint::paint(
             &page.dom,
             &page.styles,
             &box_tree,
@@ -398,8 +434,10 @@ impl Browser {
             page_w,
             paint_h,
         ) {
+            composite_iframes(&mut pixmap, &box_tree, &new_iframes);
             page.box_tree = box_tree;
             page.pixmap = pixmap;
+            page.iframes = new_iframes;
         }
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -585,7 +623,7 @@ impl Browser {
         };
         page.styles = css::style_dom_with(&page.dom, &page.sheets, &interaction);
         let max_bottom = page.pixmap.height();
-        if let Some(pixmap) = paint::paint(
+        if let Some(mut pixmap) = paint::paint(
             &page.dom,
             &page.styles,
             &page.box_tree,
@@ -593,6 +631,7 @@ impl Browser {
             page_w,
             max_bottom,
         ) {
+            composite_iframes(&mut pixmap, &page.box_tree, &page.iframes);
             page.pixmap = pixmap;
         }
         if let Some(w) = &self.window {
@@ -1013,6 +1052,169 @@ fn collect_form_fields(
     let kids: Vec<dom::NodeId> = dom.children(node).collect();
     for c in kids {
         collect_form_fields(dom, inputs, c, out);
+    }
+}
+
+// ---------------- Iframe rendering ----------------
+
+/// Walk the parent DOM for `<iframe>` elements. For each one with a
+/// resolvable `src`, fetch + parse + style + layout + paint the nested
+/// document into a pixmap sized to the iframe's own layout box.
+///
+/// Caps at `MAX_IFRAMES` per page and never recurses into iframes-inside-
+/// iframes (the nested mini-pipeline runs against a fresh empty cache).
+fn render_iframes(
+    parent_dom: &dom::Dom,
+    parent_box_tree: &layout::BoxTree,
+    client: &net::Client,
+    base_url: &url::Url,
+) -> std::collections::HashMap<dom::NodeId, IframeContent> {
+    let mut out = std::collections::HashMap::new();
+    let mut count = 0usize;
+    walk_iframes(
+        parent_dom,
+        parent_box_tree,
+        client,
+        base_url,
+        parent_dom.document(),
+        &mut out,
+        &mut count,
+    );
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_iframes(
+    parent_dom: &dom::Dom,
+    parent_box_tree: &layout::BoxTree,
+    client: &net::Client,
+    base_url: &url::Url,
+    node: dom::NodeId,
+    out: &mut std::collections::HashMap<dom::NodeId, IframeContent>,
+    count: &mut usize,
+) {
+    if *count >= MAX_IFRAMES {
+        return;
+    }
+    if let dom::NodeKind::Element { tag, attrs } = &parent_dom.node(node).kind {
+        if tag == "iframe" {
+            *count += 1;
+            let src = attrs
+                .iter()
+                .find(|(k, _)| k == "src")
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("");
+            let sandbox = attrs.iter().any(|(k, _)| k == "sandbox");
+            if !src.is_empty() {
+                if let Some(b) = parent_box_tree.get(node) {
+                    let w = b.rect.width.max(1.0) as u32;
+                    let h = b.rect.height.max(1.0) as u32;
+                    if let Some(content) =
+                        load_iframe_document(client, base_url, src, w, h, sandbox)
+                    {
+                        out.insert(node, content);
+                    }
+                }
+            }
+        }
+    }
+    let kids: Vec<dom::NodeId> = parent_dom.children(node).collect();
+    for c in kids {
+        walk_iframes(parent_dom, parent_box_tree, client, base_url, c, out, count);
+    }
+}
+
+fn load_iframe_document(
+    client: &net::Client,
+    base_url: &url::Url,
+    src: &str,
+    width: u32,
+    height: u32,
+    sandbox: bool,
+) -> Option<IframeContent> {
+    let abs = base_url.join(src).ok()?;
+    let url_str = abs.to_string();
+    let response = match client.get(&url_str) {
+        Ok(r) if (200..400).contains(&r.status) => r,
+        Ok(r) => {
+            eprintln!("[iframe] {url_str}: HTTP {}", r.status);
+            return None;
+        }
+        Err(e) => {
+            eprintln!("[iframe] {url_str}: {e}");
+            return None;
+        }
+    };
+    let body = String::from_utf8_lossy(&response.body).into_owned();
+    let dom = html::parse(&body);
+
+    // External stylesheets (fetched through the same client; same caps).
+    let mut sheets: Vec<css::Stylesheet> = Vec::new();
+    let mut ext_count = 0usize;
+    for r in css::discover_stylesheets(&dom) {
+        match r {
+            css::StylesheetRef::Embedded(s) => sheets.push(s),
+            css::StylesheetRef::External(href) => {
+                if ext_count >= MAX_EXTERNAL_STYLESHEETS {
+                    continue;
+                }
+                ext_count += 1;
+                if let Ok(child_abs) = abs.join(&href) {
+                    if let Ok(resp) = client.get(&child_abs.to_string()) {
+                        if (200..300).contains(&resp.status) {
+                            sheets.push(css::parse(&String::from_utf8_lossy(&resp.body)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let style_tree = css::style_dom(&dom, &sheets);
+
+    let mut images = layout::ImageCache::new();
+    prefetch_images(&dom, client, &abs, &mut images);
+    prefetch_background_images(&dom, &style_tree, client, &abs, &mut images);
+
+    let viewport = layout::Rect {
+        x: 0.0,
+        y: 0.0,
+        width: width as f32,
+        height: height as f32,
+    };
+    let box_tree = layout::layout(&dom, &style_tree, &images, viewport);
+
+    // For iframes, paint into a pixmap of the iframe's exact box size —
+    // any overflow is clipped (CSS spec: iframe default is `overflow: hidden`).
+    let pixmap = paint::paint(&dom, &style_tree, &box_tree, &images, width, height)?;
+    eprintln!("[iframe] rendered {url_str} → {width}x{height}");
+    Some(IframeContent {
+        url: abs,
+        pixmap,
+        sandbox,
+    })
+}
+
+/// Composite each iframe's pixmap into the parent pixmap at its layout
+/// box position. Done after the parent paint so iframe content overdraws
+/// the parent's default white fill for that region.
+fn composite_iframes(
+    parent_pixmap: &mut Pixmap,
+    parent_box_tree: &layout::BoxTree,
+    iframes: &std::collections::HashMap<dom::NodeId, IframeContent>,
+) {
+    for (node, iframe) in iframes {
+        let Some(b) = parent_box_tree.get(*node) else {
+            continue;
+        };
+        let transform = tiny_skia::Transform::from_translate(b.rect.x, b.rect.y);
+        parent_pixmap.draw_pixmap(
+            0,
+            0,
+            iframe.pixmap.as_ref(),
+            &tiny_skia::PixmapPaint::default(),
+            transform,
+            None,
+        );
     }
 }
 

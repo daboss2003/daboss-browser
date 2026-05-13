@@ -391,8 +391,13 @@ impl Painter {
         if trimmed.is_empty() {
             return;
         }
-        let line_height = style.font_size * style.line_height;
-        let metrics = Metrics::new(style.font_size, line_height);
+        // cosmic-text asserts both values are positive; some pages set
+        // `font-size: 0` to hide elements. Skip painting in that case.
+        if style.font_size <= 0.0 || style.line_height <= 0.0 {
+            return;
+        }
+        let line_height = (style.font_size * style.line_height).max(1.0);
+        let metrics = Metrics::new(style.font_size.max(1.0), line_height);
 
         let pmap_w = self.pixmap.width() as i32;
         let pmap_h = self.pixmap.height() as i32;

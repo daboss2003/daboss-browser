@@ -1,0 +1,15 @@
+services:
+  dev:
+    build: .
+    image: daboss-dev:latest
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - cargo-cache:/home/daboss/.cargo
+      - target-cache:/workspace/target
+    tty: true
+    stdin_open: true
+
+volumes:
+  cargo-cache:
+  target-cache:

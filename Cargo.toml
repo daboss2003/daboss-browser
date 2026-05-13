@@ -1,0 +1,18 @@
+[package]
+name = "daboss"
+version = "0.1.0"
+edition = "2021"
+description = "A toy browser, for learning how browsers actually work."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+winit = "0.30"
+softbuffer = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

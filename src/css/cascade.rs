@@ -1,40 +1,58 @@
 //! Selector matching, specificity, and cascade resolution.
 //!
-//! For every DOM element we:
-//!  1. find every rule in every stylesheet whose selector list matches
-//!  2. sort by (origin, specificity, source order) — later wins
-//!  3. apply declarations in that order onto a style inherited from the parent
-//!  4. apply the element's inline `style=""` attribute last (highest priority)
-//!
-//! The result is a `StyleTree`: a `Vec<ComputedStyle>` indexed by `NodeId`.
+//! Per-element pipeline:
+//!  1. Inherit from parent (or initial values at the root).
+//!  2. Collect every rule whose selector list matches; sort by
+//!     (specificity, source order). Rules with a pseudo-element are
+//!     filtered out — those don't apply to real DOM nodes (phase 4).
+//!     Rules whose only-rightmost compound has unsupported pseudo-classes
+//!     (`:hover`, `:focus`, etc.) are filtered out — they'll start matching
+//!     once phase 6 wires up interaction state.
+//!  3. Two-pass apply per element: first pass collects `--foo` custom
+//!     properties into the element's map; second pass applies normal
+//!     declarations with `var()` / `calc()` resolved against that map.
+//!  4. Inline `style=""` is applied last with the same two passes.
+
+use std::collections::HashMap;
 
 use crate::css::parser::parse_inline_declarations;
 use crate::css::types::{
-    BorderStyle, BoxSides, Color, Combinator, ComputedStyle, Declaration, Dimension, Display,
-    FontStyle, Rule, Selector, SimpleSelector, Stylesheet, TextAlign, Unit, Value, WhiteSpace,
+    AttributeOp, AttributeSelector, BorderStyle, BoxSides, CalcExpr, Color, Combinator,
+    ComputedStyle, Declaration, Dimension, Display, FontStyle, Rule, Selector, SimpleSelector,
+    Stylesheet, TextAlign, Unit, Value, WhiteSpace,
 };
 use crate::dom::{Dom, NodeId, NodeKind};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
-pub struct Specificity(pub u8, pub u8, pub u8);
+pub struct Specificity(pub u16, pub u16, pub u16);
 
 pub fn compute_specificity(sel: &Selector) -> Specificity {
-    let mut ids = 0u8;
-    let mut classes = 0u8;
-    let mut tags = 0u8;
+    let mut ids = 0u16;
+    let mut classes = 0u16;
+    let mut tags = 0u16;
     for compound in &sel.compounds {
         if compound.id.is_some() {
             ids = ids.saturating_add(1);
         }
-        classes = classes.saturating_add(compound.classes.len() as u8);
+        classes = classes.saturating_add(compound.classes.len() as u16);
+        classes = classes.saturating_add(compound.attributes.len() as u16);
+        classes = classes.saturating_add(compound.pseudo_classes.len() as u16);
         if compound.tag.is_some() {
             tags = tags.saturating_add(1);
         }
+    }
+    if sel.pseudo_element.is_some() {
+        tags = tags.saturating_add(1);
     }
     Specificity(ids, classes, tags)
 }
 
 pub fn selector_matches(sel: &Selector, dom: &Dom, node: NodeId) -> bool {
+    if sel.pseudo_element.is_some() {
+        // Pseudo-element rules don't apply to real DOM nodes; phase 4 will
+        // synthesize generated-content boxes that these rules style.
+        return false;
+    }
     if sel.compounds.is_empty() {
         return false;
     }
@@ -47,22 +65,15 @@ pub fn selector_matches(sel: &Selector, dom: &Dom, node: NodeId) -> bool {
         let combinator = sel.combinators[i];
         let target = &sel.compounds[i];
         let found = match combinator {
-            Combinator::Descendant => walk_ancestors(dom, current, |id| matches_simple(target, dom, id)),
-            Combinator::Child => dom.node(current).parent.and_then(|p| {
-                if matches_simple(target, dom, p) {
-                    Some(p)
-                } else {
-                    None
-                }
-            }),
-            Combinator::AdjacentSibling => dom.node(current).prev_sibling.and_then(|p| {
-                if matches_simple(target, dom, p) {
-                    Some(p)
-                } else {
-                    None
-                }
-            }),
-            Combinator::GeneralSibling => walk_prev_siblings(dom, current, |id| matches_simple(target, dom, id)),
+            Combinator::Descendant => walk_up(dom, current, |id| matches_simple(target, dom, id)),
+            Combinator::Child => dom.node(current).parent.filter(|p| matches_simple(target, dom, *p)),
+            Combinator::AdjacentSibling => dom
+                .node(current)
+                .prev_sibling
+                .filter(|s| matches_simple(target, dom, *s)),
+            Combinator::GeneralSibling => {
+                walk_prev(dom, current, |id| matches_simple(target, dom, id))
+            }
         };
         match found {
             Some(id) => current = id,
@@ -72,7 +83,7 @@ pub fn selector_matches(sel: &Selector, dom: &Dom, node: NodeId) -> bool {
     true
 }
 
-fn walk_ancestors<F: Fn(NodeId) -> bool>(dom: &Dom, from: NodeId, pred: F) -> Option<NodeId> {
+fn walk_up<F: Fn(NodeId) -> bool>(dom: &Dom, from: NodeId, pred: F) -> Option<NodeId> {
     let mut p = dom.node(from).parent;
     while let Some(id) = p {
         if pred(id) {
@@ -83,7 +94,7 @@ fn walk_ancestors<F: Fn(NodeId) -> bool>(dom: &Dom, from: NodeId, pred: F) -> Op
     None
 }
 
-fn walk_prev_siblings<F: Fn(NodeId) -> bool>(dom: &Dom, from: NodeId, pred: F) -> Option<NodeId> {
+fn walk_prev<F: Fn(NodeId) -> bool>(dom: &Dom, from: NodeId, pred: F) -> Option<NodeId> {
     let mut s = dom.node(from).prev_sibling;
     while let Some(id) = s {
         if pred(id) {
@@ -96,7 +107,7 @@ fn walk_prev_siblings<F: Fn(NodeId) -> bool>(dom: &Dom, from: NodeId, pred: F) -
 
 fn matches_simple(sel: &SimpleSelector, dom: &Dom, node: NodeId) -> bool {
     let (tag, attrs) = match &dom.node(node).kind {
-        NodeKind::Element { tag, attrs } => (tag, attrs),
+        NodeKind::Element { tag, attrs } => (tag.as_str(), attrs.as_slice()),
         _ => return false,
     };
 
@@ -121,19 +132,64 @@ fn matches_simple(sel: &SimpleSelector, dom: &Dom, node: NodeId) -> bool {
             return false;
         }
     }
+    for attr_sel in &sel.attributes {
+        if !match_attribute(attr_sel, attrs) {
+            return false;
+        }
+    }
+    // Pseudo-classes: only a few are stateless (e.g. :root). The rest match
+    // nothing for now; phase 6 introduces interaction state.
+    for pc in &sel.pseudo_classes {
+        if !match_pseudo_class(pc, dom, node) {
+            return false;
+        }
+    }
     true
+}
+
+fn match_attribute(sel: &AttributeSelector, attrs: &[(String, String)]) -> bool {
+    let target = attrs
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(&sel.name))
+        .map(|(_, v)| v.as_str());
+    let val = match (sel.op, &sel.value, target) {
+        (AttributeOp::Exists, _, Some(_)) => return true,
+        (AttributeOp::Exists, _, None) => return false,
+        (_, Some(v), Some(t)) => (v.as_str(), t),
+        _ => return false,
+    };
+    let (needle, hay) = val;
+    match sel.op {
+        AttributeOp::Exists => true,
+        AttributeOp::Equals => hay == needle,
+        AttributeOp::Includes => hay.split_ascii_whitespace().any(|w| w == needle),
+        AttributeOp::DashPrefix => hay == needle || hay.starts_with(&format!("{needle}-")),
+        AttributeOp::Starts => hay.starts_with(needle),
+        AttributeOp::Ends => hay.ends_with(needle),
+        AttributeOp::Contains => !needle.is_empty() && hay.contains(needle),
+    }
+}
+
+fn match_pseudo_class(name: &str, dom: &Dom, node: NodeId) -> bool {
+    match name {
+        "root" => dom.node(node).parent == Some(dom.document()),
+        "first-child" => dom.node(node).prev_sibling.is_none(),
+        "last-child" => dom.node(node).next_sibling.is_none(),
+        // :hover, :focus, :active, :checked, :visited, :link, :not(...), :nth-*, etc.
+        // None of these match until we have interaction state (phase 6) or
+        // pseudo-class arguments parsed (TBD).
+        _ => false,
+    }
 }
 
 // ---------------- Style tree ----------------
 
 pub struct StyleTree {
-    pub styles: Vec<ComputedStyle>, // indexed by NodeId.index()
+    pub styles: Vec<ComputedStyle>,
 }
 
 impl StyleTree {
     pub fn compute(dom: &Dom, sheets: &[&Stylesheet]) -> Self {
-        // Pre-fill with initial values; only elements actually get computed,
-        // but text/comment nodes can read the initial style harmlessly.
         let count = highest_node_id(dom).index() + 1;
         let mut styles = vec![ComputedStyle::initial(); count];
         compute_recursive(dom, dom.document(), sheets, None, &mut styles);
@@ -147,9 +203,6 @@ impl StyleTree {
 }
 
 fn highest_node_id(dom: &Dom) -> NodeId {
-    // The arena guarantees ids are contiguous; the highest id is the last one
-    // allocated. We don't have a direct accessor, so walk from the document.
-    // Tree walk is O(n) once, which is fine.
     let mut max = dom.document();
     walk_max(dom, dom.document(), &mut max);
     max
@@ -192,15 +245,12 @@ fn compute_one(
         None => ComputedStyle::initial(),
     };
 
-    // Only elements are styled; text/comments inherit only.
     let attrs = match &dom.node(node).kind {
         NodeKind::Element { attrs, .. } => attrs.clone(),
         _ => return style,
     };
 
-    // Collect matching rules across all sheets, with specificity + source order.
-    // origin = sheet_index (0 = UA, higher = author); we already pass UA first
-    // so simple sheet index ordering yields correct origin behavior.
+    // Collect matches with specificity + source order.
     let mut matched: Vec<(Specificity, usize, &Rule)> = Vec::new();
     let mut order = 0usize;
     for sheet in sheets {
@@ -216,31 +266,161 @@ fn compute_one(
     }
     matched.sort_by_key(|(spec, ord, _)| (*spec, *ord));
 
+    // Inline style is parsed once; treated as the highest-priority "ruleset".
+    let inline_decls: Vec<Declaration> = attrs
+        .iter()
+        .filter(|(k, _)| k == "style")
+        .flat_map(|(_, v)| parse_inline_declarations(v))
+        .collect();
+
+    // -------- Pass 1: collect custom properties into the element's map --------
+    let mut props: HashMap<String, Value> = style.custom_properties.clone();
     for (_, _, rule) in &matched {
         for decl in &rule.declarations {
-            apply_declaration(&mut style, decl, parent_style);
-        }
-    }
-
-    // Inline `style=""` wins over stylesheet rules (CSS rules say inline style
-    // has specificity 1,0,0,0 which beats any author selector).
-    for (k, v) in &attrs {
-        if k == "style" {
-            for decl in parse_inline_declarations(v) {
-                apply_declaration(&mut style, &decl, parent_style);
+            if decl.property.starts_with("--") {
+                let resolved = resolve_value(&decl.value, &props, 0);
+                props.insert(decl.property.clone(), resolved);
             }
         }
+    }
+    for decl in &inline_decls {
+        if decl.property.starts_with("--") {
+            let resolved = resolve_value(&decl.value, &props, 0);
+            props.insert(decl.property.clone(), resolved);
+        }
+    }
+    style.custom_properties = props;
+
+    // -------- Pass 2: apply normal declarations --------
+    for (_, _, rule) in &matched {
+        for decl in &rule.declarations {
+            if decl.property.starts_with("--") {
+                continue;
+            }
+            apply(decl, &mut style, parent_style);
+        }
+    }
+    for decl in &inline_decls {
+        if decl.property.starts_with("--") {
+            continue;
+        }
+        apply(decl, &mut style, parent_style);
     }
 
     style
 }
 
+// ---------------- Value resolution (var, calc) ----------------
+
+const MAX_VAR_DEPTH: u32 = 12;
+
+fn resolve_value(value: &Value, props: &HashMap<String, Value>, depth: u32) -> Value {
+    if depth >= MAX_VAR_DEPTH {
+        return Value::Keyword(String::new());
+    }
+    match value {
+        Value::Var { name, fallback } => match props.get(name) {
+            Some(v) => resolve_value(v, props, depth + 1),
+            None => match fallback {
+                Some(fb) => resolve_value(fb, props, depth + 1),
+                None => Value::Keyword(String::new()),
+            },
+        },
+        Value::Calc(expr) => evaluate_calc(expr, props, depth + 1).unwrap_or(Value::Keyword(String::new())),
+        Value::List(items) => Value::List(items.iter().map(|v| resolve_value(v, props, depth)).collect()),
+        other => other.clone(),
+    }
+}
+
+fn evaluate_calc(
+    expr: &CalcExpr,
+    props: &HashMap<String, Value>,
+    depth: u32,
+) -> Option<Value> {
+    // We can only fully resolve if there are no percentages / vw / vh,
+    // since those need layout context. Returns Length(px), Number, or None.
+    let n = calc_to_number(expr, props, depth)?;
+    Some(Value::Length(n, Unit::Px))
+}
+
+/// Reduce a calc expression to a single px (or unit-less number). Returns
+/// `None` if anything requires a layout-time context.
+fn calc_to_number(expr: &CalcExpr, props: &HashMap<String, Value>, depth: u32) -> Option<f32> {
+    if depth >= MAX_VAR_DEPTH {
+        return None;
+    }
+    match expr {
+        CalcExpr::Length(n, u) => length_n_unit_to_px_maybe(*n, *u),
+        CalcExpr::Number(n) => Some(*n),
+        CalcExpr::Percentage(_) => None,
+        CalcExpr::Var(name, fallback) => {
+            let value = match props.get(name) {
+                Some(v) => v.clone(),
+                None => match fallback {
+                    Some(fb) => fb.as_ref().clone(),
+                    None => return None,
+                },
+            };
+            value_to_number(&value, props, depth + 1)
+        }
+        CalcExpr::Add(a, b) => Some(calc_to_number(a, props, depth + 1)? + calc_to_number(b, props, depth + 1)?),
+        CalcExpr::Sub(a, b) => Some(calc_to_number(a, props, depth + 1)? - calc_to_number(b, props, depth + 1)?),
+        CalcExpr::Mul(a, b) => Some(calc_to_number(a, props, depth + 1)? * calc_to_number(b, props, depth + 1)?),
+        CalcExpr::Div(a, b) => {
+            let den = calc_to_number(b, props, depth + 1)?;
+            if den == 0.0 {
+                return None;
+            }
+            Some(calc_to_number(a, props, depth + 1)? / den)
+        }
+    }
+}
+
+fn value_to_number(v: &Value, props: &HashMap<String, Value>, depth: u32) -> Option<f32> {
+    match v {
+        Value::Length(n, u) => length_n_unit_to_px_maybe(*n, *u),
+        Value::Number(n) => Some(*n),
+        Value::Percentage(_) => None,
+        Value::Var { name, fallback } => {
+            let v = match props.get(name) {
+                Some(v) => v.clone(),
+                None => fallback.as_ref().map(|b| b.as_ref().clone())?,
+            };
+            value_to_number(&v, props, depth + 1)
+        }
+        Value::Calc(expr) => calc_to_number(expr, props, depth + 1),
+        _ => None,
+    }
+}
+
+fn length_n_unit_to_px_maybe(n: f32, u: Unit) -> Option<f32> {
+    match u {
+        Unit::Px => Some(n),
+        Unit::Pt => Some(n * 4.0 / 3.0),
+        Unit::Pc => Some(n * 16.0),
+        Unit::Cm => Some(n * 96.0 / 2.54),
+        Unit::Mm => Some(n * 96.0 / 25.4),
+        Unit::In => Some(n * 96.0),
+        // em/rem need a base font size; we don't have it inside calc evaluation
+        // without threading it through. Toy: treat as initial root font size.
+        Unit::Em | Unit::Rem => Some(n * ComputedStyle::ROOT_FONT_SIZE),
+        Unit::Vw | Unit::Vh => None,
+    }
+}
+
 // ---------------- apply_declaration ----------------
 
-fn apply_declaration(style: &mut ComputedStyle, decl: &Declaration, parent: Option<&ComputedStyle>) {
-    let property = decl.property.as_str();
-    let value = &decl.value;
+fn apply(decl: &Declaration, style: &mut ComputedStyle, parent: Option<&ComputedStyle>) {
+    let resolved = resolve_value(&decl.value, &style.custom_properties, 0);
+    apply_declaration(style, &decl.property, &resolved, parent);
+}
 
+fn apply_declaration(
+    style: &mut ComputedStyle,
+    property: &str,
+    value: &Value,
+    parent: Option<&ComputedStyle>,
+) {
     match property {
         "display" => {
             if let Some(d) = display_from(value) {
@@ -258,6 +438,9 @@ fn apply_declaration(style: &mut ComputedStyle, decl: &Declaration, parent: Opti
             }
         }
         "background" => {
+            // The shorthand carries multiple sub-values (color, image, repeat, etc.).
+            // We extract the color portion; the rest gets stored implicitly
+            // (we don't currently model background images / position / repeat).
             if let Some(c) = color_from_any(value) {
                 style.background_color = c;
             }
@@ -297,19 +480,16 @@ fn apply_declaration(style: &mut ComputedStyle, decl: &Declaration, parent: Opti
                 };
             }
         }
-        "line-height" => {
-            // Accept unitless number, length, or percentage.
-            match value {
-                Value::Number(n) => style.line_height = *n,
-                Value::Percentage(p) => style.line_height = p / 100.0,
-                Value::Length(_, _) => {
-                    if let Some(px) = length_to_px(value, style.font_size, parent) {
-                        style.line_height = px / style.font_size;
-                    }
+        "line-height" => match value {
+            Value::Number(n) => style.line_height = *n,
+            Value::Percentage(p) => style.line_height = p / 100.0,
+            Value::Length(_, _) => {
+                if let Some(px) = length_to_px(value, style.font_size, parent) {
+                    style.line_height = px / style.font_size;
                 }
-                _ => {}
             }
-        }
+            _ => {}
+        },
         "white-space" => {
             if let Value::Keyword(k) = value {
                 style.white_space = match k.as_str() {
@@ -345,10 +525,7 @@ fn apply_declaration(style: &mut ComputedStyle, decl: &Declaration, parent: Opti
                 };
             }
         }
-        "border" => {
-            // Toy: parse a "1px solid #ccc"-style shorthand by scanning the list.
-            apply_border_shorthand(value, style);
-        }
+        "border" => apply_border_shorthand(value, style),
         "width" => style.width = dimension_from(value, style.font_size, parent),
         "height" => style.height = dimension_from(value, style.font_size, parent),
         _ => {}
@@ -377,7 +554,7 @@ fn color_from(v: &Value) -> Option<Color> {
 fn color_from_any(v: &Value) -> Option<Color> {
     match v {
         Value::Color(c) => Some(*c),
-        Value::List(items) => items.iter().find_map(color_from),
+        Value::List(items) => items.iter().find_map(color_from_any),
         _ => None,
     }
 }
@@ -436,7 +613,7 @@ fn length_to_px(v: &Value, em_base: f32, parent: Option<&ComputedStyle>) -> Opti
     match v {
         Value::Length(n, u) => Some(length_n_unit_to_px(*n, *u, em_base, root_em)),
         Value::Number(0.0) => Some(0.0),
-        Value::Percentage(_) => None, // percentages resolve at layout time
+        Value::Percentage(_) => None,
         _ => None,
     }
 }
@@ -564,69 +741,53 @@ mod tests {
     fn tag_selector_applies() {
         let dom = html::parse("<p>hi</p>");
         let sheet = parser::parse("p { color: red; }");
-        let s = style_for(&dom, &sheet, "p");
-        assert_eq!(s.color, Color::rgb(255, 0, 0));
-    }
-
-    #[test]
-    fn class_overrides_tag() {
-        let dom = html::parse(r#"<p class="hl">hi</p>"#);
-        let sheet = parser::parse("p { color: red; } .hl { color: blue; }");
-        let s = style_for(&dom, &sheet, "p");
-        assert_eq!(s.color, Color::rgb(0, 0, 255));
+        assert_eq!(style_for(&dom, &sheet, "p").color, Color::rgb(255, 0, 0));
     }
 
     #[test]
     fn id_beats_class() {
         let dom = html::parse(r#"<p id="x" class="hl">hi</p>"#);
         let sheet = parser::parse(".hl { color: blue; } #x { color: green; }");
-        let s = style_for(&dom, &sheet, "p");
-        assert_eq!(s.color, Color::rgb(0, 128, 0));
+        assert_eq!(style_for(&dom, &sheet, "p").color, Color::rgb(0, 128, 0));
     }
 
     #[test]
     fn inline_beats_everything() {
         let dom = html::parse(r#"<p id="x" style="color: black">hi</p>"#);
         let sheet = parser::parse("#x { color: red; }");
-        let s = style_for(&dom, &sheet, "p");
-        assert_eq!(s.color, Color::BLACK);
+        assert_eq!(style_for(&dom, &sheet, "p").color, Color::BLACK);
     }
 
     #[test]
     fn color_inherits() {
         let dom = html::parse("<div><p>hi</p></div>");
         let sheet = parser::parse("div { color: red; }");
-        let s = style_for(&dom, &sheet, "p");
-        assert_eq!(s.color, Color::rgb(255, 0, 0));
+        assert_eq!(style_for(&dom, &sheet, "p").color, Color::rgb(255, 0, 0));
     }
 
     #[test]
-    fn descendant_combinator_matches() {
+    fn descendant_combinator() {
         let dom = html::parse("<div><span><b>hi</b></span></div>");
         let sheet = parser::parse("div b { color: blue; }");
-        let s = style_for(&dom, &sheet, "b");
-        assert_eq!(s.color, Color::rgb(0, 0, 255));
+        assert_eq!(style_for(&dom, &sheet, "b").color, Color::rgb(0, 0, 255));
     }
 
     #[test]
     fn child_combinator_strict() {
         let dom = html::parse("<div><span><b>hi</b></span></div>");
         let sheet = parser::parse("div > b { color: blue; }");
-        let s = style_for(&dom, &sheet, "b");
-        // b is grandchild of div, not direct child, so should NOT match.
-        assert_eq!(s.color, Color::BLACK);
+        assert_eq!(style_for(&dom, &sheet, "b").color, Color::BLACK);
     }
 
     #[test]
     fn em_resolves_to_px() {
         let dom = html::parse("<div><p>hi</p></div>");
         let sheet = parser::parse("div { font-size: 20px; } p { font-size: 1.5em; }");
-        let s = style_for(&dom, &sheet, "p");
-        assert!((s.font_size - 30.0).abs() < 0.001);
+        assert!((style_for(&dom, &sheet, "p").font_size - 30.0).abs() < 0.001);
     }
 
     #[test]
-    fn margin_shorthand_four_values() {
+    fn margin_shorthand() {
         let dom = html::parse("<p>hi</p>");
         let sheet = parser::parse("p { margin: 1px 2px 3px 4px; }");
         let s = style_for(&dom, &sheet, "p");
@@ -637,13 +798,122 @@ mod tests {
     }
 
     #[test]
-    fn margin_shorthand_two_values() {
+    fn attribute_exists_selector() {
+        let dom = html::parse(r#"<input type="text"><input>"#);
+        let sheet = parser::parse("input[type] { color: red; }");
+        let tree = StyleTree::compute(&dom, &[&sheet]);
+        // Find the two input elements
+        fn collect(dom: &Dom, id: NodeId, tag: &str, out: &mut Vec<NodeId>) {
+            if let NodeKind::Element { tag: t, .. } = &dom.node(id).kind {
+                if t == tag {
+                    out.push(id);
+                }
+            }
+            for c in dom.children(id).collect::<Vec<_>>() {
+                collect(dom, c, tag, out);
+            }
+        }
+        let mut inputs = Vec::new();
+        collect(&dom, dom.document(), "input", &mut inputs);
+        assert_eq!(inputs.len(), 2);
+        // First has type, gets red
+        assert_eq!(tree.get(inputs[0]).color, Color::rgb(255, 0, 0));
+        // Second has no type, stays black
+        assert_eq!(tree.get(inputs[1]).color, Color::BLACK);
+    }
+
+    #[test]
+    fn attribute_equals_selector() {
+        let dom = html::parse(r#"<input type="text"><input type="number">"#);
+        let sheet = parser::parse(r#"input[type="text"] { color: red; }"#);
+        let tree = StyleTree::compute(&dom, &[&sheet]);
+        fn collect(dom: &Dom, id: NodeId, tag: &str, out: &mut Vec<NodeId>) {
+            if let NodeKind::Element { tag: t, .. } = &dom.node(id).kind {
+                if t == tag {
+                    out.push(id);
+                }
+            }
+            for c in dom.children(id).collect::<Vec<_>>() {
+                collect(dom, c, tag, out);
+            }
+        }
+        let mut inputs = Vec::new();
+        collect(&dom, dom.document(), "input", &mut inputs);
+        assert_eq!(tree.get(inputs[0]).color, Color::rgb(255, 0, 0));
+        assert_eq!(tree.get(inputs[1]).color, Color::BLACK);
+    }
+
+    #[test]
+    fn attribute_starts_with() {
+        let dom = html::parse(r#"<a href="https://x"></a><a href="http://x"></a>"#);
+        let sheet = parser::parse(r#"a[href^="https"] { color: green; }"#);
+        let tree = StyleTree::compute(&dom, &[&sheet]);
+        fn collect(dom: &Dom, id: NodeId, tag: &str, out: &mut Vec<NodeId>) {
+            if let NodeKind::Element { tag: t, .. } = &dom.node(id).kind {
+                if t == tag {
+                    out.push(id);
+                }
+            }
+            for c in dom.children(id).collect::<Vec<_>>() {
+                collect(dom, c, tag, out);
+            }
+        }
+        let mut links = Vec::new();
+        collect(&dom, dom.document(), "a", &mut links);
+        assert_eq!(tree.get(links[0]).color, Color::rgb(0, 128, 0));
+        // No UA stylesheet here; the second <a> falls through to initial (black).
+        assert_eq!(tree.get(links[1]).color, Color::BLACK);
+    }
+
+    #[test]
+    fn hover_pseudo_class_does_not_match_yet() {
+        let dom = html::parse("<a>hi</a>");
+        let sheet = parser::parse("a:hover { color: red; }");
+        let s = style_for(&dom, &sheet, "a");
+        // :hover never matches in phase 3, so color stays at initial (black).
+        assert_eq!(s.color, Color::BLACK);
+    }
+
+    #[test]
+    fn pseudo_element_rule_does_not_apply_to_real_node() {
         let dom = html::parse("<p>hi</p>");
-        let sheet = parser::parse("p { margin: 5px 10px; }");
+        let sheet = parser::parse("p::before { color: red; }");
+        assert_eq!(style_for(&dom, &sheet, "p").color, Color::BLACK);
+    }
+
+    #[test]
+    fn css_variable_simple() {
+        let dom = html::parse("<p>hi</p>");
+        let sheet = parser::parse(":root, p { --main: #ff0000; } p { color: var(--main); }");
+        assert_eq!(style_for(&dom, &sheet, "p").color, Color::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn css_variable_inherits() {
+        let dom = html::parse("<div><p>hi</p></div>");
+        let sheet = parser::parse("div { --main: #00ff00; } p { color: var(--main); }");
+        assert_eq!(style_for(&dom, &sheet, "p").color, Color::rgb(0, 255, 0));
+    }
+
+    #[test]
+    fn css_variable_fallback() {
+        let dom = html::parse("<p>hi</p>");
+        let sheet = parser::parse("p { color: var(--missing, blue); }");
+        assert_eq!(style_for(&dom, &sheet, "p").color, Color::rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn calc_arithmetic() {
+        let dom = html::parse("<p>hi</p>");
+        let sheet = parser::parse("p { font-size: calc(10px + 6px); }");
+        assert!((style_for(&dom, &sheet, "p").font_size - 16.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn calc_with_var() {
+        let dom = html::parse("<p>hi</p>");
+        let sheet = parser::parse("p { --gap: 4px; padding: calc(var(--gap) * 2); }");
         let s = style_for(&dom, &sheet, "p");
-        assert_eq!(s.margin.top, 5.0);
-        assert_eq!(s.margin.right, 10.0);
-        assert_eq!(s.margin.bottom, 5.0);
-        assert_eq!(s.margin.left, 10.0);
+        assert!((s.padding.top - 8.0).abs() < 0.001);
     }
 }

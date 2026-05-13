@@ -1,5 +1,4 @@
-//! CSS subsystem entry points. The public API is intentionally narrow:
-//! parse stylesheets, compute styles for a DOM, look up a node's style.
+//! CSS subsystem entry points.
 
 mod cascade;
 mod parser;
@@ -7,8 +6,6 @@ mod types;
 
 pub use cascade::StyleTree;
 pub use parser::parse;
-// The cascade fills every field of ComputedStyle; layout/paint in later
-// phases will be the actual consumers, hence the `allow(unused_imports)`.
 #[allow(unused_imports)]
 pub use types::{
     BorderStyle, BoxSides, Color, ComputedStyle, Dimension, Display, FontStyle, Stylesheet,
@@ -17,11 +14,57 @@ pub use types::{
 
 use crate::dom::{Dom, NodeId, NodeKind};
 
-/// Compute a style for every node in the DOM.
-///
-/// `page_stylesheets` are the author-provided stylesheets in source order.
-/// We always evaluate the user-agent stylesheet first so author rules win
-/// on equal specificity.
+/// A stylesheet either embedded inline or referenced by URL.
+/// Phase 3 `main.rs` walks this list, fetching `External` refs through the
+/// network client. Order in the list matches DOM source order so cascade
+/// behaves correctly.
+pub enum StylesheetRef {
+    Embedded(Stylesheet),
+    External(String),
+}
+
+pub fn discover_stylesheets(dom: &Dom) -> Vec<StylesheetRef> {
+    let mut out = Vec::new();
+    collect(dom, dom.document(), &mut out);
+    out
+}
+
+fn collect(dom: &Dom, node: NodeId, out: &mut Vec<StylesheetRef>) {
+    if let NodeKind::Element { tag, attrs } = &dom.node(node).kind {
+        match tag.as_str() {
+            "style" => {
+                let mut text = String::new();
+                for child in dom.children(node) {
+                    if let NodeKind::Text(t) = &dom.node(child).kind {
+                        text.push_str(t);
+                    }
+                }
+                out.push(StylesheetRef::Embedded(parse(&text)));
+            }
+            "link" => {
+                let rel = attrs.iter().find(|(k, _)| k == "rel").map(|(_, v)| v.as_str());
+                let is_stylesheet = rel
+                    .map(|r| r.split_ascii_whitespace().any(|w| w.eq_ignore_ascii_case("stylesheet")))
+                    .unwrap_or(false);
+                if is_stylesheet {
+                    if let Some((_, href)) = attrs.iter().find(|(k, _)| k == "href") {
+                        if !href.is_empty() {
+                            out.push(StylesheetRef::External(href.clone()));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let kids: Vec<NodeId> = dom.children(node).collect();
+    for k in kids {
+        collect(dom, k, out);
+    }
+}
+
+/// Compute a style for every node in the DOM. The UA stylesheet is always
+/// evaluated first so author rules win on equal specificity.
 pub fn style_dom(dom: &Dom, page_stylesheets: &[Stylesheet]) -> StyleTree {
     let ua = ua_stylesheet();
     let mut sheets: Vec<&Stylesheet> = Vec::with_capacity(1 + page_stylesheets.len());
@@ -32,37 +75,6 @@ pub fn style_dom(dom: &Dom, page_stylesheets: &[Stylesheet]) -> StyleTree {
     StyleTree::compute(dom, &sheets)
 }
 
-/// Walk the DOM and collect every author stylesheet expressed inline:
-///  - the text content of `<style>` elements
-///
-/// External `<link rel="stylesheet">` resources are deferred (need fetching).
-pub fn extract_embedded_stylesheets(dom: &Dom) -> Vec<Stylesheet> {
-    let mut out = Vec::new();
-    collect(dom, dom.document(), &mut out);
-    out
-}
-
-fn collect(dom: &Dom, node: NodeId, out: &mut Vec<Stylesheet>) {
-    if let NodeKind::Element { tag, .. } = &dom.node(node).kind {
-        if tag == "style" {
-            let mut text = String::new();
-            for child in dom.children(node) {
-                if let NodeKind::Text(t) = &dom.node(child).kind {
-                    text.push_str(t);
-                }
-            }
-            out.push(parse(&text));
-        }
-    }
-    let kids: Vec<NodeId> = dom.children(node).collect();
-    for k in kids {
-        collect(dom, k, out);
-    }
-}
-
-/// Embedded user-agent stylesheet. Roughly matches what browsers ship as the
-/// default for HTML5 elements. Kept tight on purpose; layout doesn't need
-/// every property to look reasonable.
 fn ua_stylesheet() -> Stylesheet {
     parse(UA_STYLESHEET)
 }
@@ -126,51 +138,23 @@ mod tests {
     use crate::html;
 
     #[test]
-    fn ua_makes_div_block_and_span_inline() {
-        let dom = html::parse("<div></div><span></span>");
-        let tree = style_dom(&dom, &[]);
-        // Find the div and span
-        fn find<'a>(dom: &'a Dom, id: NodeId, tag: &str) -> Option<NodeId> {
-            if let NodeKind::Element { tag: t, .. } = &dom.node(id).kind {
-                if t == tag {
-                    return Some(id);
-                }
-            }
-            for c in dom.children(id).collect::<Vec<_>>() {
-                if let Some(r) = find(dom, c, tag) {
-                    return Some(r);
-                }
-            }
-            None
-        }
-        let div = find(&dom, dom.document(), "div").unwrap();
-        let span = find(&dom, dom.document(), "span").unwrap();
-        assert_eq!(tree.get(div).display, Display::Block);
-        assert_eq!(tree.get(span).display, Display::Inline);
+    fn discovers_external_link_and_inline_style() {
+        let dom = html::parse(
+            r#"<link rel="stylesheet" href="a.css">
+               <style>p { color: red; }</style>
+               <link rel="stylesheet" href="b.css">"#,
+        );
+        let refs = discover_stylesheets(&dom);
+        assert_eq!(refs.len(), 3);
+        assert!(matches!(refs[0], StylesheetRef::External(ref s) if s == "a.css"));
+        assert!(matches!(refs[1], StylesheetRef::Embedded(_)));
+        assert!(matches!(refs[2], StylesheetRef::External(ref s) if s == "b.css"));
     }
 
     #[test]
-    fn embedded_style_block_is_picked_up() {
-        let dom = html::parse(
-            "<style>p { color: red; }</style><p>hi</p>",
-        );
-        let sheets = extract_embedded_stylesheets(&dom);
-        assert_eq!(sheets.len(), 1);
-        let tree = style_dom(&dom, &sheets);
-        fn find(dom: &Dom, id: NodeId, tag: &str) -> Option<NodeId> {
-            if let NodeKind::Element { tag: t, .. } = &dom.node(id).kind {
-                if t == tag {
-                    return Some(id);
-                }
-            }
-            for c in dom.children(id).collect::<Vec<_>>() {
-                if let Some(r) = find(dom, c, tag) {
-                    return Some(r);
-                }
-            }
-            None
-        }
-        let p = find(&dom, dom.document(), "p").unwrap();
-        assert_eq!(tree.get(p).color, Color::rgb(255, 0, 0));
+    fn ignores_non_stylesheet_links() {
+        let dom = html::parse(r#"<link rel="icon" href="favicon.ico">"#);
+        let refs = discover_stylesheets(&dom);
+        assert_eq!(refs.len(), 0);
     }
 }

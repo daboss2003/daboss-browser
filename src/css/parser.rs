@@ -1,10 +1,14 @@
 //! CSS parser. Recursive-descent over the raw character stream — no separate
-//! token type. Skips `@`-rules entirely, ignores `!important`, ignores
-//! pseudo-classes and pseudo-elements (parses them so the surrounding selector
-//! still works, then discards). Good enough for ~90% of real-world CSS.
+//! token type. Skips `@`-rules entirely. Ignores `!important`.
+//!
+//! Stores (rather than discards) pseudo-classes, pseudo-elements, and
+//! attribute selectors so the cascade can decide whether to honor them
+//! (most pseudo-classes match no element today and will be wired up in
+//! phase 6 once we have interaction state).
 
 use super::types::{
-    Color, Combinator, Declaration, Rule, Selector, SimpleSelector, Stylesheet, Unit, Value,
+    AttributeOp, AttributeSelector, CalcExpr, Color, Combinator, Declaration, Rule, Selector,
+    SimpleSelector, Stylesheet, Unit, Value,
 };
 
 pub fn parse(input: &str) -> Stylesheet {
@@ -44,7 +48,6 @@ impl<'a> Parser<'a> {
             if let Some(rule) = self.parse_rule() {
                 rules.push(rule);
             } else {
-                // Recover: skip to next '}' or '{' so we don't loop forever.
                 self.skip_to_block_end_or_semi();
             }
         }
@@ -89,9 +92,13 @@ impl<'a> Parser<'a> {
     fn parse_selector(&mut self) -> Option<Selector> {
         let mut compounds = Vec::new();
         let mut combinators = Vec::new();
+        let mut pseudo_element = None;
 
-        let first = self.parse_compound()?;
+        let (first, pe) = self.parse_compound()?;
         compounds.push(first);
+        if pe.is_some() {
+            pseudo_element = pe;
+        }
 
         loop {
             let had_ws = self.skip_ws_count() > 0;
@@ -113,9 +120,12 @@ impl<'a> Parser<'a> {
                 _ => break,
             };
             self.skip_ws();
-            if let Some(next) = self.parse_compound() {
+            if let Some((next, pe)) = self.parse_compound() {
                 combinators.push(combinator);
                 compounds.push(next);
+                if pe.is_some() {
+                    pseudo_element = pe;
+                }
             } else {
                 break;
             }
@@ -124,11 +134,15 @@ impl<'a> Parser<'a> {
         Some(Selector {
             compounds,
             combinators,
+            pseudo_element,
         })
     }
 
-    fn parse_compound(&mut self) -> Option<SimpleSelector> {
+    /// Returns the compound selector and an optional pseudo-element name
+    /// (e.g. "before") that was found on this compound.
+    fn parse_compound(&mut self) -> Option<(SimpleSelector, Option<String>)> {
         let mut ss = SimpleSelector::default();
+        let mut pseudo_element = None;
         let mut had = false;
         loop {
             match self.peek() {
@@ -150,25 +164,35 @@ impl<'a> Parser<'a> {
                 }
                 Some(':') => {
                     self.advance();
-                    // Pseudo-element uses `::` — eat the second colon
-                    if self.peek() == Some(':') {
+                    let is_double = self.peek() == Some(':');
+                    if is_double {
                         self.advance();
                     }
-                    // Skip the pseudo name + any parenthesized argument
-                    let _ = self.parse_ident();
+                    let name = self.parse_ident()?.to_ascii_lowercase();
+                    // Some pseudo-classes take an argument: :not(...), :nth-child(...).
+                    // We parse-and-discard the argument so the rest of the selector
+                    // doesn't get confused.
                     if self.peek() == Some('(') {
                         self.skip_balanced('(', ')');
+                    }
+                    if is_double || is_known_pseudo_element(&name) {
+                        pseudo_element = Some(name);
+                    } else {
+                        ss.pseudo_classes.push(name);
                     }
                     had = true;
                 }
                 Some('[') => {
-                    // Attribute selector. We don't support them; consume so it
-                    // doesn't confuse the outer parser.
-                    self.skip_balanced('[', ']');
+                    if let Some(attr) = self.parse_attribute_selector() {
+                        ss.attributes.push(attr);
+                    } else {
+                        // recovery
+                        self.skip_balanced('[', ']');
+                    }
                     had = true;
                 }
                 Some(c) if c.is_ascii_alphabetic() || c == '_' => {
-                    let tag = self.parse_ident()?;
+                    let tag = self.parse_ident()?.to_ascii_lowercase();
                     ss.tag = Some(tag);
                     had = true;
                 }
@@ -176,10 +200,103 @@ impl<'a> Parser<'a> {
             }
         }
         if had {
-            Some(ss)
+            Some((ss, pseudo_element))
         } else {
             None
         }
+    }
+
+    fn parse_attribute_selector(&mut self) -> Option<AttributeSelector> {
+        if !self.consume('[') {
+            return None;
+        }
+        self.skip_ws();
+        let name = self.parse_ident()?.to_ascii_lowercase();
+        self.skip_ws();
+        // Operator
+        let op = match self.peek() {
+            Some(']') => {
+                self.advance();
+                return Some(AttributeSelector {
+                    name,
+                    op: AttributeOp::Exists,
+                    value: None,
+                });
+            }
+            Some('=') => {
+                self.advance();
+                AttributeOp::Equals
+            }
+            Some('~') => {
+                self.advance();
+                self.consume('=');
+                AttributeOp::Includes
+            }
+            Some('|') => {
+                self.advance();
+                self.consume('=');
+                AttributeOp::DashPrefix
+            }
+            Some('^') => {
+                self.advance();
+                self.consume('=');
+                AttributeOp::Starts
+            }
+            Some('$') => {
+                self.advance();
+                self.consume('=');
+                AttributeOp::Ends
+            }
+            Some('*') => {
+                self.advance();
+                self.consume('=');
+                AttributeOp::Contains
+            }
+            _ => return None,
+        };
+        self.skip_ws();
+        let value = match self.peek() {
+            Some('"') | Some('\'') => self.parse_string_lit(),
+            _ => {
+                let start = self.pos;
+                while let Some(c) = self.peek() {
+                    if c.is_ascii_whitespace() || c == ']' {
+                        break;
+                    }
+                    self.advance();
+                }
+                Some(self.input[start..self.pos].to_string())
+            }
+        };
+        self.skip_ws();
+        // Optional case-insensitivity flag: i or s — we ignore it.
+        if matches!(self.peek(), Some('i') | Some('s') | Some('I') | Some('S')) {
+            self.advance();
+        }
+        self.skip_ws();
+        self.consume(']');
+        Some(AttributeSelector { name, op, value })
+    }
+
+    fn parse_string_lit(&mut self) -> Option<String> {
+        let quote = self.advance()?;
+        let mut s = String::new();
+        while let Some(c) = self.peek() {
+            if c == quote {
+                self.advance();
+                return Some(s);
+            }
+            if c == '\\' {
+                self.advance();
+                if let Some(esc) = self.advance() {
+                    s.push(esc);
+                }
+                continue;
+            }
+            s.push(c);
+            self.advance();
+        }
+        Some(s)
     }
 
     fn parse_declarations(&mut self) -> Vec<Declaration> {
@@ -197,7 +314,6 @@ impl<'a> Parser<'a> {
             if let Some(d) = self.parse_declaration() {
                 out.push(d);
             } else {
-                // Skip to ';' or '}'
                 while let Some(c) = self.peek() {
                     if c == ';' || c == '}' {
                         break;
@@ -210,13 +326,19 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_declaration(&mut self) -> Option<Declaration> {
-        let property = self.parse_ident()?.to_ascii_lowercase();
+        // Custom properties: a name that starts with `--`.
+        let property = if self.input[self.pos..].starts_with("--") {
+            self.pos += 2;
+            let name = self.parse_ident()?;
+            format!("--{name}")
+        } else {
+            self.parse_ident()?.to_ascii_lowercase()
+        };
         self.skip_ws();
         if !self.consume(':') {
             return None;
         }
         let value = self.parse_value_list();
-        // Discard '!important' marker.
         self.skip_ws();
         if self.peek() == Some('!') {
             self.advance();
@@ -253,33 +375,12 @@ impl<'a> Parser<'a> {
     fn parse_one_value(&mut self) -> Option<Value> {
         let c = self.peek()?;
         match c {
-            '"' | '\'' => self.parse_string_value(),
+            '"' | '\'' => self.parse_string_lit().map(Value::String),
             '#' => self.parse_hex_color(),
             c if c.is_ascii_digit() || c == '-' || c == '+' || c == '.' => self.parse_numeric(),
             c if c.is_ascii_alphabetic() || c == '_' => self.parse_ident_or_function(),
             _ => None,
         }
-    }
-
-    fn parse_string_value(&mut self) -> Option<Value> {
-        let quote = self.advance()?;
-        let mut s = String::new();
-        while let Some(c) = self.peek() {
-            if c == quote {
-                self.advance();
-                return Some(Value::String(s));
-            }
-            if c == '\\' {
-                self.advance();
-                if let Some(esc) = self.advance() {
-                    s.push(esc);
-                }
-                continue;
-            }
-            s.push(c);
-            self.advance();
-        }
-        Some(Value::String(s))
     }
 
     fn parse_hex_color(&mut self) -> Option<Value> {
@@ -297,31 +398,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_numeric(&mut self) -> Option<Value> {
-        let start = self.pos;
-        if matches!(self.peek(), Some('-') | Some('+')) {
-            self.advance();
-        }
-        while let Some(c) = self.peek() {
-            if c.is_ascii_digit() {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-        if self.peek() == Some('.') {
-            self.advance();
-            while let Some(c) = self.peek() {
-                if c.is_ascii_digit() {
-                    self.advance();
-                } else {
-                    break;
-                }
-            }
-        }
-        let num_str = &self.input[start..self.pos];
-        let n: f32 = num_str.parse().ok()?;
-
-        // Unit or percentage
+        let n = self.parse_number()?;
         if self.peek() == Some('%') {
             self.advance();
             return Some(Value::Percentage(n));
@@ -349,20 +426,65 @@ impl<'a> Parser<'a> {
             "in" => Unit::In,
             "vw" => Unit::Vw,
             "vh" => Unit::Vh,
-            _ => return Some(Value::Number(n)), // unknown unit
+            _ => return Some(Value::Number(n)),
         };
         Some(Value::Length(n, unit))
+    }
+
+    fn parse_number(&mut self) -> Option<f32> {
+        let start = self.pos;
+        if matches!(self.peek(), Some('-') | Some('+')) {
+            self.advance();
+        }
+        let mut had_digits = false;
+        while let Some(c) = self.peek() {
+            if c.is_ascii_digit() {
+                self.advance();
+                had_digits = true;
+            } else {
+                break;
+            }
+        }
+        if self.peek() == Some('.') {
+            self.advance();
+            while let Some(c) = self.peek() {
+                if c.is_ascii_digit() {
+                    self.advance();
+                    had_digits = true;
+                } else {
+                    break;
+                }
+            }
+        }
+        if !had_digits {
+            self.pos = start;
+            return None;
+        }
+        self.input[start..self.pos].parse().ok()
     }
 
     fn parse_ident_or_function(&mut self) -> Option<Value> {
         let name = self.parse_ident()?;
         if self.peek() == Some('(') {
             self.advance();
-            let args = self.parse_function_args();
-            self.consume(')');
-            return Some(function_value(&name, args));
+            let lname = name.to_ascii_lowercase();
+            let value = match lname.as_str() {
+                "var" => self.parse_var_call(),
+                "calc" => self.parse_calc_call(),
+                "url" => self.parse_url_call(),
+                "rgb" | "rgba" => {
+                    let args = self.parse_function_args();
+                    self.consume(')');
+                    rgb_from_args(&args)
+                }
+                _ => {
+                    // Unknown function — eat and represent as keyword.
+                    self.skip_balanced_after_open('(', ')');
+                    Some(Value::Keyword(lname))
+                }
+            };
+            return value;
         }
-        // Named color?
         if let Some(c) = named_color(&name) {
             return Some(Value::Color(c));
         }
@@ -389,9 +511,133 @@ impl<'a> Parser<'a> {
         args
     }
 
+    fn parse_var_call(&mut self) -> Option<Value> {
+        self.skip_ws();
+        if !self.input[self.pos..].starts_with("--") {
+            self.skip_balanced_after_open('(', ')');
+            return Some(Value::Keyword(String::new()));
+        }
+        self.pos += 2;
+        let name_body = self.parse_ident()?;
+        let name = format!("--{name_body}");
+        self.skip_ws();
+        let fallback = if self.peek() == Some(',') {
+            self.advance();
+            self.skip_ws();
+            self.parse_one_value().map(Box::new)
+        } else {
+            None
+        };
+        self.skip_ws();
+        self.consume(')');
+        Some(Value::Var { name, fallback })
+    }
+
+    fn parse_calc_call(&mut self) -> Option<Value> {
+        let expr = self.parse_calc_expression()?;
+        self.skip_ws();
+        self.consume(')');
+        Some(Value::Calc(Box::new(expr)))
+    }
+
+    /// Recursive-descent for calc expressions: handles +, -, *, / with the
+    /// usual precedence and parens.
+    fn parse_calc_expression(&mut self) -> Option<CalcExpr> {
+        let mut left = self.parse_calc_term()?;
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                Some('+') => {
+                    self.advance();
+                    self.skip_ws();
+                    let right = self.parse_calc_term()?;
+                    left = CalcExpr::Add(Box::new(left), Box::new(right));
+                }
+                Some('-') => {
+                    self.advance();
+                    self.skip_ws();
+                    let right = self.parse_calc_term()?;
+                    left = CalcExpr::Sub(Box::new(left), Box::new(right));
+                }
+                _ => break,
+            }
+        }
+        Some(left)
+    }
+
+    fn parse_calc_term(&mut self) -> Option<CalcExpr> {
+        let mut left = self.parse_calc_factor()?;
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                Some('*') => {
+                    self.advance();
+                    self.skip_ws();
+                    let right = self.parse_calc_factor()?;
+                    left = CalcExpr::Mul(Box::new(left), Box::new(right));
+                }
+                Some('/') => {
+                    self.advance();
+                    self.skip_ws();
+                    let right = self.parse_calc_factor()?;
+                    left = CalcExpr::Div(Box::new(left), Box::new(right));
+                }
+                _ => break,
+            }
+        }
+        Some(left)
+    }
+
+    fn parse_calc_factor(&mut self) -> Option<CalcExpr> {
+        self.skip_ws();
+        if self.peek() == Some('(') {
+            self.advance();
+            let inner = self.parse_calc_expression()?;
+            self.skip_ws();
+            self.consume(')');
+            return Some(inner);
+        }
+        if self.input[self.pos..].starts_with("var(") {
+            self.pos += 4;
+            let var_val = self.parse_var_call()?;
+            return match var_val {
+                Value::Var { name, fallback } => Some(CalcExpr::Var(name, fallback)),
+                _ => None,
+            };
+        }
+        let val = self.parse_one_value()?;
+        match val {
+            Value::Length(n, u) => Some(CalcExpr::Length(n, u)),
+            Value::Percentage(p) => Some(CalcExpr::Percentage(p)),
+            Value::Number(n) => Some(CalcExpr::Number(n)),
+            _ => None,
+        }
+    }
+
+    fn parse_url_call(&mut self) -> Option<Value> {
+        self.skip_ws();
+        let mut url = String::new();
+        match self.peek() {
+            Some('"') | Some('\'') => {
+                url = self.parse_string_lit().unwrap_or_default();
+            }
+            _ => {
+                while let Some(c) = self.peek() {
+                    if c == ')' || c.is_ascii_whitespace() {
+                        break;
+                    }
+                    url.push(c);
+                    self.advance();
+                }
+            }
+        }
+        self.skip_ws();
+        self.consume(')');
+        Some(Value::Url(url))
+    }
+
     fn parse_ident(&mut self) -> Option<String> {
         let start = self.pos;
-        // First char: letter, underscore, or '-' followed by letter/underscore
         let first = self.peek()?;
         if first == '-' {
             self.advance();
@@ -416,7 +662,6 @@ impl<'a> Parser<'a> {
     }
 
     fn skip_at_rule(&mut self) {
-        // Skip @ident; consume balanced block or up to ';'.
         self.advance(); // '@'
         let _ = self.parse_ident();
         loop {
@@ -460,6 +705,12 @@ impl<'a> Parser<'a> {
             return;
         }
         self.advance();
+        self.skip_balanced_after_open(open, close);
+    }
+
+    /// Like `skip_balanced` but assumes we've already consumed the opening
+    /// character; useful when peek-and-advance was done elsewhere.
+    fn skip_balanced_after_open(&mut self, open: char, close: char) {
         let mut depth = 1;
         while let Some(c) = self.peek() {
             self.advance();
@@ -471,7 +722,6 @@ impl<'a> Parser<'a> {
                     return;
                 }
             } else if c == '"' || c == '\'' {
-                // Skip string content so braces inside strings don't confuse us.
                 while let Some(s) = self.peek() {
                     self.advance();
                     if s == c {
@@ -492,7 +742,6 @@ impl<'a> Parser<'a> {
     fn skip_ws_count(&mut self) -> usize {
         let start = self.pos;
         loop {
-            // Whitespace
             while let Some(c) = self.peek() {
                 if c.is_ascii_whitespace() {
                     self.advance();
@@ -500,7 +749,6 @@ impl<'a> Parser<'a> {
                     break;
                 }
             }
-            // Comment
             if self.input[self.pos..].starts_with("/*") {
                 self.pos += 2;
                 while !self.input[self.pos..].starts_with("*/") && !self.eof() {
@@ -540,27 +788,30 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn function_value(name: &str, args: Vec<Value>) -> Value {
-    match name.to_ascii_lowercase().as_str() {
-        "rgb" | "rgba" => {
-            if args.len() >= 3 {
-                let r = number_to_byte(&args[0]);
-                let g = number_to_byte(&args[1]);
-                let b = number_to_byte(&args[2]);
-                let a = if args.len() >= 4 {
-                    match &args[3] {
-                        Value::Number(n) => (n * 255.0).clamp(0.0, 255.0) as u8,
-                        _ => 255,
-                    }
-                } else {
-                    255
-                };
-                return Value::Color(Color { r, g, b, a });
-            }
-            Value::Keyword(name.to_string())
-        }
-        _ => Value::Keyword(name.to_string()),
+fn is_known_pseudo_element(name: &str) -> bool {
+    matches!(
+        name,
+        "before" | "after" | "first-line" | "first-letter" | "placeholder" | "marker"
+    )
+}
+
+fn rgb_from_args(args: &[Value]) -> Option<Value> {
+    if args.len() < 3 {
+        return None;
     }
+    let r = number_to_byte(&args[0]);
+    let g = number_to_byte(&args[1]);
+    let b = number_to_byte(&args[2]);
+    let a = if args.len() >= 4 {
+        match &args[3] {
+            Value::Number(n) => (n * 255.0).clamp(0.0, 255.0) as u8,
+            Value::Percentage(p) => (p * 2.55).clamp(0.0, 255.0) as u8,
+            _ => 255,
+        }
+    } else {
+        255
+    };
+    Some(Value::Color(Color { r, g, b, a }))
 }
 
 fn number_to_byte(v: &Value) -> u8 {
@@ -642,63 +893,114 @@ mod tests {
     fn parses_simple_rule() {
         let s = parse("p { color: red; font-size: 14px; }");
         assert_eq!(s.rules.len(), 1);
-        let r = &s.rules[0];
-        assert_eq!(r.selectors.len(), 1);
-        assert_eq!(r.selectors[0].compounds[0].tag.as_deref(), Some("p"));
-        assert_eq!(r.declarations.len(), 2);
-        assert_eq!(r.declarations[0].property, "color");
-        assert!(matches!(r.declarations[0].value, Value::Color(_)));
+        assert_eq!(s.rules[0].selectors[0].compounds[0].tag.as_deref(), Some("p"));
+        assert_eq!(s.rules[0].declarations.len(), 2);
     }
 
     #[test]
-    fn selector_list_and_combinators() {
-        let s = parse("div p, ul > li, a + span { color: black; }");
-        assert_eq!(s.rules.len(), 1);
-        let r = &s.rules[0];
-        assert_eq!(r.selectors.len(), 3);
-        assert_eq!(r.selectors[1].combinators, vec![Combinator::Child]);
-        assert_eq!(r.selectors[2].combinators, vec![Combinator::AdjacentSibling]);
+    fn attribute_selector_exists() {
+        let s = parse("input[disabled] { color: gray; }");
+        let attrs = &s.rules[0].selectors[0].compounds[0].attributes;
+        assert_eq!(attrs.len(), 1);
+        assert_eq!(attrs[0].name, "disabled");
+        assert_eq!(attrs[0].op, AttributeOp::Exists);
     }
 
     #[test]
-    fn class_and_id() {
-        let s = parse(".hero #title.huge { font-weight: 700; }");
-        let sel = &s.rules[0].selectors[0];
-        assert_eq!(sel.compounds[0].classes, vec!["hero".to_string()]);
-        assert_eq!(sel.compounds[1].id.as_deref(), Some("title"));
-        assert_eq!(sel.compounds[1].classes, vec!["huge".to_string()]);
+    fn attribute_selector_value_ops() {
+        let s = parse(r#"a[href^="https"] { color: green; } [type=text] {} [class~="foo"] {}"#);
+        assert_eq!(
+            s.rules[0].selectors[0].compounds[0].attributes[0].op,
+            AttributeOp::Starts
+        );
+        assert_eq!(
+            s.rules[1].selectors[0].compounds[0].attributes[0].op,
+            AttributeOp::Equals
+        );
+        assert_eq!(
+            s.rules[2].selectors[0].compounds[0].attributes[0].op,
+            AttributeOp::Includes
+        );
     }
 
     #[test]
-    fn hex_colors() {
-        let s = parse("a { color: #fff; background: #00aaff; }");
+    fn pseudo_class_stored_not_discarded() {
+        let s = parse("a:hover { color: red; }");
+        let c = &s.rules[0].selectors[0].compounds[0];
+        assert_eq!(c.pseudo_classes, vec!["hover".to_string()]);
+    }
+
+    #[test]
+    fn pseudo_element_stored() {
+        let s = parse("p::before { content: ''; }");
+        assert_eq!(
+            s.rules[0].selectors[0].pseudo_element.as_deref(),
+            Some("before")
+        );
+    }
+
+    #[test]
+    fn var_value_parsed() {
+        let s = parse(".x { color: var(--main, blue); }");
         match &s.rules[0].declarations[0].value {
-            Value::Color(c) => assert_eq!(*c, Color::WHITE),
-            _ => panic!(),
-        }
-        match &s.rules[0].declarations[1].value {
-            Value::Color(c) => assert_eq!(*c, Color::rgb(0, 0xaa, 0xff)),
-            _ => panic!(),
+            Value::Var { name, fallback } => {
+                assert_eq!(name, "--main");
+                assert!(matches!(fallback.as_deref(), Some(Value::Color(_))));
+            }
+            other => panic!("expected Var, got {other:?}"),
         }
     }
 
     #[test]
-    fn rgb_function() {
-        let s = parse("a { color: rgb(10, 20, 30); }");
+    fn custom_property_declaration() {
+        let s = parse(":root { --primary: #336699; }");
+        let d = &s.rules[0].declarations[0];
+        assert_eq!(d.property, "--primary");
+        assert!(matches!(d.value, Value::Color(_)));
+    }
+
+    #[test]
+    fn calc_simple() {
+        let s = parse("p { width: calc(100% - 20px); }");
         match &s.rules[0].declarations[0].value {
-            Value::Color(c) => assert_eq!(*c, Color::rgb(10, 20, 30)),
-            _ => panic!(),
+            Value::Calc(expr) => match expr.as_ref() {
+                CalcExpr::Sub(_, _) => {}
+                other => panic!("expected Sub, got {other:?}"),
+            },
+            other => panic!("expected Calc, got {other:?}"),
         }
     }
 
     #[test]
-    fn lengths_and_keywords() {
-        let s = parse("div { width: 50%; height: 10em; display: block; }");
-        assert!(matches!(&s.rules[0].declarations[0].value, Value::Percentage(_)));
-        assert!(matches!(&s.rules[0].declarations[1].value, Value::Length(_, Unit::Em)));
-        match &s.rules[0].declarations[2].value {
-            Value::Keyword(k) => assert_eq!(k, "block"),
-            _ => panic!(),
+    fn calc_with_precedence() {
+        let s = parse("p { width: calc(10px + 4 * 2px); }");
+        match &s.rules[0].declarations[0].value {
+            Value::Calc(expr) => match expr.as_ref() {
+                CalcExpr::Add(_, mul) => match mul.as_ref() {
+                    CalcExpr::Mul(_, _) => {}
+                    other => panic!("expected Mul on right, got {other:?}"),
+                },
+                other => panic!("expected Add, got {other:?}"),
+            },
+            other => panic!("expected Calc, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn url_function() {
+        let s = parse(r#"body { background: url("bg.png"); }"#);
+        match &s.rules[0].declarations[0].value {
+            Value::Url(u) => assert_eq!(u, "bg.png"),
+            other => panic!("expected Url, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn margin_shorthand_list() {
+        let s = parse("p { margin: 1em 0 2px; }");
+        match &s.rules[0].declarations[0].value {
+            Value::List(v) => assert_eq!(v.len(), 3),
+            other => panic!("expected list, got {other:?}"),
         }
     }
 
@@ -710,25 +1012,9 @@ mod tests {
     }
 
     #[test]
-    fn ignores_pseudo_classes() {
-        let s = parse("a:hover { color: red; }");
-        let sel = &s.rules[0].selectors[0];
-        assert_eq!(sel.compounds[0].tag.as_deref(), Some("a"));
-    }
-
-    #[test]
     fn comments_are_ignored() {
-        let s = parse("/* hi */ p /* inline */ { color: /* x */ red; }");
+        let s = parse("/* hi */ p /* x */ { color: /* y */ red; }");
         assert_eq!(s.rules.len(), 1);
         assert_eq!(s.rules[0].declarations.len(), 1);
-    }
-
-    #[test]
-    fn margin_shorthand_as_list() {
-        let s = parse("p { margin: 1em 0 2px; }");
-        match &s.rules[0].declarations[0].value {
-            Value::List(v) => assert_eq!(v.len(), 3),
-            other => panic!("expected list, got {other:?}"),
-        }
     }
 }

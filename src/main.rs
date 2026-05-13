@@ -46,12 +46,19 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_fetch(url: &str) -> Result<(), net::Error> {
+/// Cap on external `<link rel=stylesheet>` fetches per page. Real browsers
+/// have no fixed limit but we don't want a hostile page to make us issue
+/// hundreds of subrequests.
+const MAX_EXTERNAL_STYLESHEETS: usize = 30;
+
+fn run_fetch(url_str: &str) -> Result<(), net::Error> {
     let allow_loopback = std::env::var("DABOSS_ALLOW_LOOPBACK").is_ok();
     let client = net::Client::new().with_allow_loopback(allow_loopback);
-    let response = client.get(url)?;
 
-    // Status + headers on stderr; the DOM tree on stdout so `> tree.txt` works.
+    let base_url =
+        url::Url::parse(url_str).map_err(|e| net::Error::InvalidUrl(e.to_string()))?;
+    let response = client.get(url_str)?;
+
     eprintln!("HTTP/1.1 {} {}", response.status, response.reason);
     for (name, value) in &response.headers {
         eprintln!("{name}: {value}");
@@ -61,12 +68,55 @@ fn run_fetch(url: &str) -> Result<(), net::Error> {
     let body = String::from_utf8_lossy(&response.body);
     let dom = html::parse(&body);
 
-    let sheets = css::extract_embedded_stylesheets(&dom);
+    // Discover stylesheets in source order; fetch externals through the same
+    // hardened HTTP client we used for the page itself.
+    let refs = css::discover_stylesheets(&dom);
+    let mut sheets: Vec<css::Stylesheet> = Vec::new();
+    let mut external_count = 0usize;
+    let mut embedded_count = 0usize;
+    for r in refs {
+        match r {
+            css::StylesheetRef::Embedded(s) => {
+                sheets.push(s);
+                embedded_count += 1;
+            }
+            css::StylesheetRef::External(href) => {
+                if external_count >= MAX_EXTERNAL_STYLESHEETS {
+                    eprintln!("[phase 3] external stylesheet cap reached; skipping {href}");
+                    continue;
+                }
+                external_count += 1;
+                let abs = match base_url.join(&href) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        eprintln!("[phase 3] bad <link href>: {e}");
+                        continue;
+                    }
+                };
+                let abs_str = abs.to_string();
+                match client.get(&abs_str) {
+                    Ok(resp) if (200..300).contains(&resp.status) => {
+                        let text = String::from_utf8_lossy(&resp.body);
+                        sheets.push(css::parse(&text));
+                        eprintln!("[phase 3] fetched {abs_str} ({} bytes)", resp.body.len());
+                    }
+                    Ok(resp) => {
+                        eprintln!("[phase 3] {abs_str}: HTTP {}", resp.status);
+                    }
+                    Err(e) => {
+                        eprintln!("[phase 3] {abs_str}: {e}");
+                    }
+                }
+            }
+        }
+    }
+
     let style_tree = css::style_dom(&dom, &sheets);
     eprintln!(
-        "[phase 3] computed styles for {} nodes from {} embedded stylesheet(s)",
+        "[phase 3] computed styles for {} nodes from {} embedded + {} external stylesheet(s)",
         style_tree.styles.len(),
-        sheets.len()
+        embedded_count,
+        external_count
     );
 
     dom.print();

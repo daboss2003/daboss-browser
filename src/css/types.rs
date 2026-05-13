@@ -1,6 +1,7 @@
 //! CSS types: parser AST plus the computed-style struct that layout/paint
-//! will read from. Kept deliberately small — a real CSS engine has hundreds
-//! of properties; we have maybe twenty.
+//! will read from.
+
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Default)]
 pub struct Stylesheet {
@@ -13,15 +14,14 @@ pub struct Rule {
     pub declarations: Vec<Declaration>,
 }
 
-/// A compound selector chain. `compounds` is left-to-right (ancestor → target),
-/// `combinators[i]` is the relationship between `compounds[i]` and `compounds[i+1]`.
-/// e.g. `div > p span` parses as:
-///   compounds = [div, p, span]
-///   combinators = [Child, Descendant]
+/// `compounds` left-to-right (ancestor → target); `combinators[i]` joins
+/// `compounds[i]` to `compounds[i+1]`. `pseudo_element` (if any) applies to
+/// the rightmost compound and only matches generated content in layout.
 #[derive(Debug, Clone)]
 pub struct Selector {
     pub compounds: Vec<SimpleSelector>,
     pub combinators: Vec<Combinator>,
+    pub pseudo_element: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -29,6 +29,26 @@ pub struct SimpleSelector {
     pub tag: Option<String>,
     pub id: Option<String>,
     pub classes: Vec<String>,
+    pub attributes: Vec<AttributeSelector>,
+    pub pseudo_classes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AttributeSelector {
+    pub name: String,
+    pub op: AttributeOp,
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttributeOp {
+    Exists,     // [name]
+    Equals,     // [name=val]
+    Includes,   // [name~=val]    whitespace-separated word match
+    DashPrefix, // [name|=val]    val or val-...
+    Starts,     // [name^=val]
+    Ends,       // [name$=val]
+    Contains,   // [name*=val]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,11 +61,12 @@ pub enum Combinator {
 
 #[derive(Debug, Clone)]
 pub struct Declaration {
-    pub property: String,
+    pub property: String, // includes leading `--` for custom properties
     pub value: Value,
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Url field consumed by background-image in phase 5/paint
 pub enum Value {
     Keyword(String),
     Length(f32, Unit),
@@ -53,7 +74,31 @@ pub enum Value {
     Color(Color),
     Number(f32),
     String(String),
+    Url(String),
     List(Vec<Value>),
+    /// `var(--name)` or `var(--name, fallback)` — substituted at apply time
+    /// against the element's resolved custom properties.
+    Var {
+        name: String,
+        fallback: Option<Box<Value>>,
+    },
+    /// `calc(...)` — evaluated at apply time. Falls back to `Keyword("")`
+    /// (no effect) if it can't be resolved at cascade time (e.g. contains
+    /// percentages or vw/vh that need layout context).
+    Calc(Box<CalcExpr>),
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Percentage resolved at layout time in phase 4
+pub enum CalcExpr {
+    Length(f32, Unit),
+    Percentage(f32),
+    Number(f32),
+    Var(String, Option<Box<Value>>),
+    Add(Box<CalcExpr>, Box<CalcExpr>),
+    Sub(Box<CalcExpr>, Box<CalcExpr>),
+    Mul(Box<CalcExpr>, Box<CalcExpr>),
+    Div(Box<CalcExpr>, Box<CalcExpr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,7 +188,7 @@ impl BoxSides {
 }
 
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // Length / Percent values are consumed by layout in phase 4
+#[allow(dead_code)] // Length / Percent consumed by layout in phase 4
 pub enum Dimension {
     Auto,
     Length(f32),
@@ -157,7 +202,7 @@ pub struct ComputedStyle {
     pub background_color: Color,
     pub font_family: Vec<String>,
     pub font_size: f32, // px
-    pub font_weight: u16, // 100..=900
+    pub font_weight: u16,
     pub font_style: FontStyle,
     pub text_align: TextAlign,
     pub margin: BoxSides,
@@ -169,13 +214,13 @@ pub struct ComputedStyle {
     pub height: Dimension,
     pub line_height: f32, // multiplier of font_size
     pub white_space: WhiteSpace,
+    /// Resolved custom properties (CSS variables). Inherited like color.
+    pub custom_properties: HashMap<String, Value>,
 }
 
 impl ComputedStyle {
     pub const ROOT_FONT_SIZE: f32 = 16.0;
 
-    /// CSS initial values for every property we model. The UA stylesheet
-    /// then overrides per-element defaults (e.g. body → display: block).
     pub fn initial() -> Self {
         Self {
             display: Display::Inline,
@@ -195,11 +240,10 @@ impl ComputedStyle {
             height: Dimension::Auto,
             line_height: 1.2,
             white_space: WhiteSpace::Normal,
+            custom_properties: HashMap::new(),
         }
     }
 
-    /// Child starts from parent's *inheritable* values. Non-inheritable ones
-    /// reset to the initial value.
     pub fn inherit_from(parent: &Self) -> Self {
         let mut s = Self::initial();
         s.color = parent.color;
@@ -210,6 +254,7 @@ impl ComputedStyle {
         s.text_align = parent.text_align;
         s.line_height = parent.line_height;
         s.white_space = parent.white_space;
+        s.custom_properties = parent.custom_properties.clone();
         s
     }
 }

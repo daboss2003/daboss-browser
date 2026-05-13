@@ -9,6 +9,7 @@
 
 mod block;
 mod replaced;
+mod table;
 mod text;
 
 use crate::css::{BoxSides, StyleTree};

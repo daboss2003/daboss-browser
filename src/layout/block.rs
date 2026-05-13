@@ -44,12 +44,18 @@ pub fn layout(
             }
             y - containing.y
         }
-        NodeKind::Element { .. } => {
+        NodeKind::Element { tag, .. } => {
             let style = styles.get(node);
             if style.display == Display::None {
                 return 0.0;
             }
-            layout_block(dom, styles, text, images, node, style, containing, tree)
+            if tag == "table" {
+                super::table::layout_table(
+                    dom, styles, text, images, node, style, containing, tree,
+                )
+            } else {
+                layout_block(dom, styles, text, images, node, style, containing, tree)
+            }
         }
         NodeKind::Text(_) | NodeKind::Comment(_) | NodeKind::Doctype(_) => 0.0,
     }

@@ -21,7 +21,16 @@ pub struct ImageInfo {
     pub rgba: Vec<u8>,
 }
 
-pub type ImageCache = HashMap<NodeId, ImageInfo>;
+#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq)]
+pub enum ImageSlot {
+    /// The element is `<img>`; its `src` produced this bitmap.
+    Img,
+    /// The element has a `background-image: url(...)` that resolved to this
+    /// bitmap.
+    Background,
+}
+
+pub type ImageCache = HashMap<(NodeId, ImageSlot), ImageInfo>;
 
 /// Decode an image from its raw bytes. Recognises PNG, JPEG, WebP, GIF, BMP.
 /// Returns `None` for unknown formats, decode errors, or oversized images.

@@ -19,7 +19,7 @@
 
 use std::ops::Range;
 
-use super::replaced::ImageCache;
+use super::replaced::{ImageCache, ImageSlot};
 use super::text::{collapse_whitespace, InlineContent, InlineSpan, TextLayout};
 use super::{BoxKind, BoxTree, LayoutBox, PseudoBox, PseudoKind, Rect};
 use crate::css::{BoxSides, ComputedStyle, Dimension, Display, StyleTree};
@@ -65,7 +65,7 @@ fn intrinsic_size(dom: &Dom, node: NodeId, images: &ImageCache) -> Option<(f32, 
     if let NodeKind::Element { tag, .. } = &dom.node(node).kind {
         if tag == "img" {
             return images
-                .get(&node)
+                .get(&(node, ImageSlot::Img))
                 .map(|i| (i.width as f32, i.height as f32));
         }
     }
@@ -123,22 +123,46 @@ fn layout_block(
     let kids: Vec<NodeId> = dom.children(node).collect();
     let groups = group_children(dom, styles, &kids);
 
+    // Pick where to put the host's own ::before / ::after content. If any
+    // child group is inline, the pseudo flows into the first/last IFC.
+    // Otherwise, fall back to "own row" placement above / below children.
+    let host_before_text = styles
+        .before_style(node)
+        .and_then(|s| s.content.clone());
+    let host_after_text = styles.after_style(node).and_then(|s| s.content.clone());
+    let first_inline_idx = groups
+        .iter()
+        .position(|g| matches!(g, ChildGroup::Inline(_)));
+    let last_inline_idx = groups
+        .iter()
+        .rposition(|g| matches!(g, ChildGroup::Inline(_)));
+
     let mut child_y = content_y;
 
-    // ::before pseudo (toy: laid out as its own row above real children).
-    if let Some(before_style) = styles.before_style(node) {
-        if let Some(text_content) = &before_style.content {
+    // ::before as own row (only when there's no IFC to absorb it).
+    if first_inline_idx.is_none() {
+        if let (Some(before_style), Some(text_content)) =
+            (styles.before_style(node), host_before_text.as_deref())
+        {
             let cb = Rect {
                 x: content_x,
                 y: child_y,
                 width: content_width,
                 height: 0.0,
             };
-            child_y += layout_pseudo(node, PseudoKind::Before, text_content, before_style, text, cb, tree);
+            child_y += layout_pseudo(
+                node,
+                PseudoKind::Before,
+                text_content,
+                before_style,
+                text,
+                cb,
+                tree,
+            );
         }
     }
 
-    for group in groups {
+    for (i, group) in groups.into_iter().enumerate() {
         let cb = Rect {
             x: content_x,
             y: child_y,
@@ -148,22 +172,53 @@ fn layout_block(
         let h = match group {
             ChildGroup::Block(child) => layout(dom, styles, text, images, child, cb, tree),
             ChildGroup::Inline(nodes) => {
-                layout_inline_run(dom, styles, text, &nodes, style, cb, tree)
+                let host_before = if Some(i) == first_inline_idx {
+                    host_before_text.as_deref()
+                } else {
+                    None
+                };
+                let host_after = if Some(i) == last_inline_idx {
+                    host_after_text.as_deref()
+                } else {
+                    None
+                };
+                layout_inline_run(
+                    dom,
+                    styles,
+                    text,
+                    &nodes,
+                    style,
+                    cb,
+                    tree,
+                    node,
+                    host_before,
+                    host_after,
+                )
             }
         };
         child_y += h;
     }
 
-    // ::after pseudo (toy: own row below real children).
-    if let Some(after_style) = styles.after_style(node) {
-        if let Some(text_content) = &after_style.content {
+    // ::after as own row (only when there's no IFC to absorb it).
+    if last_inline_idx.is_none() {
+        if let (Some(after_style), Some(text_content)) =
+            (styles.after_style(node), host_after_text.as_deref())
+        {
             let cb = Rect {
                 x: content_x,
                 y: child_y,
                 width: content_width,
                 height: 0.0,
             };
-            child_y += layout_pseudo(node, PseudoKind::After, text_content, after_style, text, cb, tree);
+            child_y += layout_pseudo(
+                node,
+                PseudoKind::After,
+                text_content,
+                after_style,
+                text,
+                cb,
+                tree,
+            );
         }
     }
 
@@ -268,6 +323,7 @@ fn group_children(dom: &Dom, styles: &StyleTree, kids: &[NodeId]) -> Vec<ChildGr
 
 // ---------------- Inline formatting context ----------------
 
+#[allow(clippy::too_many_arguments)]
 fn layout_inline_run(
     dom: &Dom,
     styles: &StyleTree,
@@ -276,18 +332,32 @@ fn layout_inline_run(
     parent_style: &ComputedStyle,
     cb: Rect,
     tree: &mut BoxTree,
+    host: NodeId,
+    host_before: Option<&str>,
+    host_after: Option<&str>,
 ) -> f32 {
     let mut content = InlineContent::default();
+
+    // Host's own ::before (block-level pseudo flowing into its IFC).
+    if let Some(text_content) = host_before {
+        push_pseudo_span(&mut content, host, PseudoKind::Before, text_content);
+    }
+
     for &child in nodes {
         collect_inline(dom, styles, child, &mut content);
     }
+
+    if let Some(text_content) = host_after {
+        push_pseudo_span(&mut content, host, PseudoKind::After, text_content);
+    }
+
     if content.text.trim().is_empty() {
         return 0.0;
     }
 
     let shaped = text_layout.shape_inline(&content, cb.width.max(0.0), parent_style, styles);
 
-    // Distribute glyphs to source nodes by byte range.
+    // Distribute glyphs to source nodes / pseudo slots by byte range.
     for span in &content.spans {
         let mut rect_opt: Option<Rect> = None;
         for glyph in &shaped.glyphs {
@@ -304,7 +374,22 @@ fn layout_inline_run(
                 });
             }
         }
-        if let Some(rect) = rect_opt {
+        let Some(rect) = rect_opt else {
+            continue;
+        };
+        if let Some(kind) = span.pseudo {
+            // Pseudo's text is the collapsed slice of our IFC text.
+            let pseudo_text = content.text[span.range.start..span.range.end].to_string();
+            tree.pseudo_boxes.insert(
+                (span.node, kind),
+                super::PseudoBox {
+                    host: span.node,
+                    kind,
+                    rect,
+                    text: pseudo_text,
+                },
+            );
+        } else {
             tree.boxes[span.node.index()] = Some(LayoutBox {
                 kind: if span.is_element {
                     BoxKind::Inline
@@ -322,6 +407,27 @@ fn layout_inline_run(
     shaped.total_height
 }
 
+fn push_pseudo_span(
+    content: &mut InlineContent,
+    host: NodeId,
+    kind: PseudoKind,
+    raw: &str,
+) {
+    let collapsed = collapse_whitespace(raw);
+    if collapsed.is_empty() {
+        return;
+    }
+    let start = content.text.len();
+    content.text.push_str(&collapsed);
+    let end = content.text.len();
+    content.spans.push(InlineSpan {
+        range: Range { start, end },
+        node: host,
+        is_element: false,
+        pseudo: Some(kind),
+    });
+}
+
 fn collect_inline(dom: &Dom, styles: &StyleTree, node: NodeId, content: &mut InlineContent) {
     match &dom.node(node).kind {
         NodeKind::Text(raw) => {
@@ -336,6 +442,7 @@ fn collect_inline(dom: &Dom, styles: &StyleTree, node: NodeId, content: &mut Inl
                 range: Range { start, end },
                 node,
                 is_element: false,
+                pseudo: None,
             });
         }
         NodeKind::Element { .. } => {
@@ -344,16 +451,32 @@ fn collect_inline(dom: &Dom, styles: &StyleTree, node: NodeId, content: &mut Inl
                 return;
             }
             let start = content.text.len();
+
+            // Inline element's own ::before flows into the IFC.
+            if let Some(pseudo_style) = styles.before_style(node) {
+                if let Some(text) = &pseudo_style.content {
+                    push_pseudo_span(content, node, PseudoKind::Before, text);
+                }
+            }
+
             let kids: Vec<NodeId> = dom.children(node).collect();
             for child in kids {
                 collect_inline(dom, styles, child, content);
             }
+
+            if let Some(pseudo_style) = styles.after_style(node) {
+                if let Some(text) = &pseudo_style.content {
+                    push_pseudo_span(content, node, PseudoKind::After, text);
+                }
+            }
+
             let end = content.text.len();
             if end > start {
                 content.spans.push(InlineSpan {
                     range: Range { start, end },
                     node,
                     is_element: true,
+                    pseudo: None,
                 });
             }
         }
@@ -573,7 +696,7 @@ mod tests {
 
     #[test]
     fn img_uses_intrinsic_dimensions() {
-        use crate::layout::replaced::ImageInfo;
+        use crate::layout::replaced::{ImageInfo, ImageSlot};
         let html = "<style>body { margin: 0; }</style><img src=\"x\">";
         let dom = html::parse(html);
         let sheets = match css::discover_stylesheets(&dom).into_iter().next() {
@@ -581,10 +704,12 @@ mod tests {
             _ => vec![],
         };
         let styles = css::style_dom(&dom, &sheets);
-        // Find the <img> and stuff a fake decoded image into the cache.
         let img = find(&dom, dom.document(), "img").unwrap();
         let mut images = ImageCache::new();
-        images.insert(img, ImageInfo { width: 120, height: 80, rgba: vec![0; 120 * 80 * 4] });
+        images.insert(
+            (img, ImageSlot::Img),
+            ImageInfo { width: 120, height: 80, rgba: vec![0; 120 * 80 * 4] },
+        );
 
         let viewport = Rect { x: 0.0, y: 0.0, width: 1000.0, height: 0.0 };
         let tree = super::super::layout(&dom, &styles, &images, viewport);
@@ -628,7 +753,9 @@ mod tests {
     }
 
     #[test]
-    fn after_pseudo_creates_box_below() {
+    fn after_pseudo_creates_box_on_host_line() {
+        // Now that pseudos flow inline within the host's IFC, ::after sits
+        // on the same line as the host's text rather than below it.
         let (dom, tree) = run(
             "<style>body { margin: 0; } \
              p { margin: 0; padding: 0; } \
@@ -642,9 +769,11 @@ mod tests {
             .get(&(p, super::PseudoKind::After))
             .expect("::after should have a box");
         assert_eq!(pseudo.text, "!");
-        // The pseudo sits below the host's text content.
         let p_box = tree.get(p).unwrap();
-        assert!(pseudo.rect.y > p_box.rect.y);
+        // Same line as the host content (within one line-height tolerance).
+        assert!((pseudo.rect.y - p_box.rect.y).abs() < 25.0);
+        // After the host's text horizontally.
+        assert!(pseudo.rect.x > p_box.rect.x);
     }
 
     #[test]

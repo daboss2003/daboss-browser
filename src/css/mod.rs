@@ -8,8 +8,8 @@ pub use cascade::StyleTree;
 pub use parser::parse;
 #[allow(unused_imports)]
 pub use types::{
-    BorderStyle, BoxSides, Color, ComputedStyle, Dimension, Display, FontStyle, Stylesheet,
-    TableLayout, TextAlign, WhiteSpace,
+    BackgroundImage, BorderStyle, BoxShadow, BoxSides, Color, ComputedStyle, Dimension, Display,
+    FontStyle, Stylesheet, TableLayout, TextAlign, TextDecoration, WhiteSpace,
 };
 
 use crate::dom::{Dom, NodeId, NodeKind};

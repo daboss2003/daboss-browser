@@ -19,7 +19,7 @@ use crate::dom::{Dom, NodeId, NodeKind};
 use text::TextLayout;
 
 #[allow(unused_imports)] // ImageInfo will be re-exported when paint consumes rgba
-pub use replaced::{decode_image, ImageCache, ImageInfo};
+pub use replaced::{decode_image, ImageCache, ImageInfo, ImageSlot};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Rect {
@@ -81,12 +81,14 @@ impl BoxTree {
         self.boxes.get(id.index()).and_then(|b| b.as_ref())
     }
 
-    /// Prints the DOM with its rect annotation per element. Used as the
-    /// stdout demo from Phase 4 onwards (replaces `Dom::print`).
+    /// Prints the DOM with its rect annotation per element. Useful for
+    /// debugging and used by the `--png` headless flow's verbose output.
+    #[allow(dead_code)]
     pub fn print(&self, dom: &Dom) {
         self.print_node(dom, dom.document(), 0);
     }
 
+    #[allow(dead_code)]
     fn print_node(&self, dom: &Dom, node: NodeId, depth: usize) {
         let indent = "  ".repeat(depth);
         let rect_str = self.get(node).map_or(String::new(), |b| {
@@ -123,6 +125,7 @@ impl BoxTree {
         self.print_pseudo(node, PseudoKind::After, depth + 1);
     }
 
+    #[allow(dead_code)]
     fn print_pseudo(&self, host: NodeId, kind: PseudoKind, depth: usize) {
         let Some(p) = self.pseudo_boxes.get(&(host, kind)) else {
             return;
@@ -143,6 +146,7 @@ impl BoxTree {
     }
 }
 
+#[allow(dead_code)]
 fn truncate(s: &str, max_chars: usize) -> String {
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
@@ -153,6 +157,39 @@ fn truncate(s: &str, max_chars: usize) -> String {
         out.push(c);
     }
     out
+}
+
+/// Find the deepest box that contains the point `(x, y)` in *page* coords
+/// (so the caller should add scroll offset before calling). Uses the
+/// painters'-algorithm ordering: descendants paint on top of ancestors and
+/// later siblings paint on top of earlier ones, so the deepest match wins.
+pub fn hit_test(dom: &Dom, tree: &BoxTree, x: f32, y: f32) -> Option<NodeId> {
+    let mut found = None;
+    hit_test_walk(dom, tree, dom.document(), x, y, &mut found);
+    found
+}
+
+fn hit_test_walk(
+    dom: &Dom,
+    tree: &BoxTree,
+    node: NodeId,
+    x: f32,
+    y: f32,
+    out: &mut Option<NodeId>,
+) {
+    if let Some(b) = tree.get(node) {
+        let inside = x >= b.rect.x
+            && x < b.rect.x + b.rect.width
+            && y >= b.rect.y
+            && y < b.rect.y + b.rect.height;
+        if inside {
+            *out = Some(node);
+        }
+    }
+    let kids: Vec<NodeId> = dom.children(node).collect();
+    for c in kids {
+        hit_test_walk(dom, tree, c, x, y, out);
+    }
 }
 
 pub fn layout(

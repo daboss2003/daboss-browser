@@ -17,9 +17,9 @@ use std::collections::HashMap;
 
 use crate::css::parser::parse_inline_declarations;
 use crate::css::types::{
-    AttributeOp, AttributeSelector, BorderStyle, BoxSides, CalcExpr, Color, Combinator,
-    ComputedStyle, Declaration, Dimension, Display, FontStyle, Rule, Selector, SimpleSelector,
-    Stylesheet, TableLayout, TextAlign, Unit, Value, WhiteSpace,
+    AttributeOp, AttributeSelector, BackgroundImage, BorderStyle, BoxShadow, BoxSides, CalcExpr,
+    Color, Combinator, ComputedStyle, Declaration, Dimension, Display, FontStyle, Rule, Selector,
+    SimpleSelector, Stylesheet, TableLayout, TextAlign, TextDecoration, Unit, Value, WhiteSpace,
 };
 use crate::dom::{Dom, NodeId, NodeKind};
 
@@ -668,8 +668,126 @@ fn apply_declaration(
         "content" => {
             style.content = content_from(value);
         }
-        _ => {}
+        "text-decoration" | "text-decoration-line" => {
+            if let Value::Keyword(k) = value {
+                style.text_decoration = match k.as_str() {
+                    "underline" => TextDecoration::Underline,
+                    "line-through" => TextDecoration::LineThrough,
+                    "overline" => TextDecoration::Overline,
+                    "none" => TextDecoration::None,
+                    _ => style.text_decoration,
+                };
+            }
+        }
+        "background-image" => {
+            style.background_image = background_image_from(value);
+        }
+        "border-radius" => {
+            if let Some(px) = length_to_px(value, style.font_size, parent) {
+                style.border_radius = px.max(0.0);
+            }
+        }
+        "opacity" => {
+            if let Value::Number(n) = value {
+                style.opacity = n.clamp(0.0, 1.0);
+            } else if let Value::Percentage(p) = value {
+                style.opacity = (p / 100.0).clamp(0.0, 1.0);
+            }
+        }
+        "box-shadow" => {
+            style.box_shadow = box_shadow_from(value, style.font_size, parent);
+        }
+        "transform" => {
+            style.transform_translate = transform_translate_from(value, style.font_size, parent);
+        }
+        _ => {
+            // Background shorthand can carry an image (URL or gradient) too;
+            // we already grabbed the color above. Walk the value list once
+            // more here so authors using `background: <color> url(...)` see
+            // both applied.
+            if property == "background" {
+                if let Some(img) = background_image_from(value) {
+                    style.background_image = Some(img);
+                }
+            }
+        }
     }
+}
+
+fn background_image_from(v: &Value) -> Option<BackgroundImage> {
+    match v {
+        Value::Url(u) => Some(BackgroundImage::Url(u.clone())),
+        Value::LinearGradient { angle_deg, stops } => Some(BackgroundImage::LinearGradient {
+            angle_deg: *angle_deg,
+            stops: stops.clone(),
+        }),
+        Value::List(items) => items.iter().find_map(background_image_from),
+        Value::Keyword(k) if k == "none" => None,
+        _ => None,
+    }
+}
+
+fn box_shadow_from(
+    value: &Value,
+    em_base: f32,
+    parent: Option<&ComputedStyle>,
+) -> Option<BoxShadow> {
+    let items = match value {
+        Value::List(v) => v.clone(),
+        Value::Keyword(k) if k == "none" => return None,
+        other => vec![other.clone()],
+    };
+    let mut lengths = Vec::new();
+    let mut color = Color::rgb(0, 0, 0);
+    for it in items {
+        match it {
+            Value::Length(_, _) | Value::Number(0.0) => {
+                if let Some(px) = length_to_px(&it, em_base, parent) {
+                    lengths.push(px);
+                }
+            }
+            Value::Color(c) => color = c,
+            _ => {}
+        }
+    }
+    let offset_x = lengths.first().copied().unwrap_or(0.0);
+    let offset_y = lengths.get(1).copied().unwrap_or(0.0);
+    let blur = lengths.get(2).copied().unwrap_or(0.0);
+    Some(BoxShadow {
+        offset_x,
+        offset_y,
+        blur,
+        color,
+    })
+}
+
+fn transform_translate_from(
+    value: &Value,
+    em_base: f32,
+    parent: Option<&ComputedStyle>,
+) -> Option<(f32, f32)> {
+    // Look for the first `translate*(...)` function in the value (a value list
+    // can mix multiple transforms; the toy honors the first translate).
+    let candidates: Vec<&Value> = match value {
+        Value::List(items) => items.iter().collect(),
+        single => vec![single],
+    };
+    for v in candidates {
+        if let Value::Function { name, args } = v {
+            let n = name.as_str();
+            if n == "translate" || n == "translatex" || n == "translatey" {
+                let resolve = |v: &Value| length_to_px(v, em_base, parent);
+                let a = args.first().and_then(resolve).unwrap_or(0.0);
+                let b = args.get(1).and_then(resolve).unwrap_or(0.0);
+                return Some(match n {
+                    "translatex" => (a, 0.0),
+                    "translatey" => (0.0, a),
+                    _ => (a, b),
+                });
+            }
+        }
+    }
+    None
 }
 
 fn content_from(v: &Value) -> Option<String> {

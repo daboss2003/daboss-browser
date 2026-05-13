@@ -472,15 +472,18 @@ impl<'a> Parser<'a> {
                 "var" => self.parse_var_call(),
                 "calc" => self.parse_calc_call(),
                 "url" => self.parse_url_call(),
+                "linear-gradient" => self.parse_linear_gradient(),
                 "rgb" | "rgba" => {
                     let args = self.parse_function_args();
                     self.consume(')');
                     rgb_from_args(&args)
                 }
                 _ => {
-                    // Unknown function — eat and represent as keyword.
-                    self.skip_balanced_after_open('(', ')');
-                    Some(Value::Keyword(lname))
+                    // Unknown function — keep args so e.g. `transform:
+                    // translate(10px, 20px)` can be picked up later.
+                    let args = self.parse_function_args();
+                    self.consume(')');
+                    Some(Value::Function { name: lname, args })
                 }
             };
             return value;
@@ -612,6 +615,47 @@ impl<'a> Parser<'a> {
             Value::Number(n) => Some(CalcExpr::Number(n)),
             _ => None,
         }
+    }
+
+    /// Parse `linear-gradient(angle, color, color, ...)`. Accepts:
+    ///   - leading angle like `45deg` (stored as a `Value::Number(45)` by
+    ///     `parse_numeric` because `deg` isn't in our `Unit` enum),
+    ///   - keyword direction like `to bottom` / `to top` etc.,
+    ///   - or no leading direction at all (defaults to 180° = top → bottom).
+    /// Colors are spread evenly across stop positions.
+    fn parse_linear_gradient(&mut self) -> Option<Value> {
+        let args = self.parse_function_args();
+        self.consume(')');
+        let mut angle_deg = 180.0_f32;
+        let mut saw_to = false;
+        let mut colors: Vec<Color> = Vec::new();
+        for arg in args {
+            match arg {
+                Value::Number(n) => angle_deg = n,
+                Value::Color(c) => colors.push(c),
+                Value::Keyword(k) => match k.as_str() {
+                    "to" => {
+                        saw_to = true;
+                    }
+                    "bottom" if saw_to => angle_deg = 180.0,
+                    "top" if saw_to => angle_deg = 0.0,
+                    "right" if saw_to => angle_deg = 90.0,
+                    "left" if saw_to => angle_deg = 270.0,
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        if colors.is_empty() {
+            return Some(Value::Keyword("linear-gradient".into()));
+        }
+        let denom = (colors.len() - 1).max(1) as f32;
+        let stops = colors
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i as f32 / denom, *c))
+            .collect();
+        Some(Value::LinearGradient { angle_deg, stops })
     }
 
     fn parse_url_call(&mut self) -> Option<Value> {

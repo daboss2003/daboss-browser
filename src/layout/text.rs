@@ -16,6 +16,8 @@ use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Style, We
 use crate::css::{ComputedStyle, FontStyle, StyleTree};
 use crate::dom::NodeId;
 
+use super::PseudoKind;
+
 pub struct TextLayout {
     system: FontSystem,
 }
@@ -168,11 +170,17 @@ pub struct InlineContent {
 #[derive(Debug)]
 pub struct InlineSpan {
     pub range: Range<usize>,
+    /// The DOM element this span comes from. For pseudo spans, this is the
+    /// *host* element (the one the `::before` / `::after` belongs to).
     pub node: NodeId,
     /// Element spans nest text spans; their range is the union of their
     /// inline descendants. Used to compute bounding rects per inline
     /// element. Text spans don't nest and are leaves.
     pub is_element: bool,
+    /// `Some(kind)` for pseudo-element content carried inside the IFC. The
+    /// computed bounding rect for such spans is stored in
+    /// `BoxTree.pseudo_boxes[(node, kind)]` rather than in `boxes[node]`.
+    pub pseudo: Option<PseudoKind>,
 }
 
 /// CSS `white-space: normal` collapse — runs of whitespace become a single

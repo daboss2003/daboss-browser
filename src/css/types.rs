@@ -86,6 +86,18 @@ pub enum Value {
     /// (no effect) if it can't be resolved at cascade time (e.g. contains
     /// percentages or vw/vh that need layout context).
     Calc(Box<CalcExpr>),
+    /// `linear-gradient(<angle>, <color>, ...)` pre-parsed into uniformly
+    /// spaced color stops + an angle in degrees (180 = top → bottom).
+    LinearGradient {
+        angle_deg: f32,
+        stops: Vec<(f32, Color)>,
+    },
+    /// Unrecognised function call kept structured so consumers like `transform`
+    /// can still pattern-match on it.
+    Function {
+        name: String,
+        args: Vec<Value>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +191,31 @@ pub enum TableLayout {
     Fixed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextDecoration {
+    None,
+    Underline,
+    LineThrough,
+    Overline,
+}
+
+#[derive(Debug, Clone)]
+pub enum BackgroundImage {
+    Url(String),
+    LinearGradient {
+        angle_deg: f32,
+        stops: Vec<(f32, Color)>, // (position 0..1, color)
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BoxShadow {
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub blur: f32,
+    pub color: Color,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct BoxSides {
     pub top: f32,
@@ -231,6 +268,23 @@ pub struct ComputedStyle {
     /// non-`None` value triggers generation of a pseudo-element box during
     /// layout. Not inherited.
     pub content: Option<String>,
+    /// Underline / line-through / overline. Inherited.
+    pub text_decoration: TextDecoration,
+    /// `background-image` value: an image URL to fetch, or a
+    /// `linear-gradient(...)` to render. Not inherited.
+    pub background_image: Option<BackgroundImage>,
+    /// Single uniform corner radius in pixels (no per-corner support).
+    /// Not inherited.
+    pub border_radius: f32,
+    /// 0..=1. Multiplies the alpha of every painted pixel in this element's
+    /// subtree. Not inherited.
+    pub opacity: f32,
+    /// One drop shadow. Not inherited.
+    pub box_shadow: Option<BoxShadow>,
+    /// `transform: translate(...)` only — `(dx_px, dy_px)`. Not inherited
+    /// in the CSS sense but propagates to descendants via the paint
+    /// translate stack.
+    pub transform_translate: Option<(f32, f32)>,
     /// Resolved custom properties (CSS variables). Inherited like color.
     pub custom_properties: HashMap<String, Value>,
 }
@@ -260,6 +314,12 @@ impl ComputedStyle {
             border_spacing: (2.0, 2.0), // CSS initial value
             table_layout: TableLayout::Auto,
             content: None,
+            text_decoration: TextDecoration::None,
+            background_image: None,
+            border_radius: 0.0,
+            opacity: 1.0,
+            box_shadow: None,
+            transform_translate: None,
             custom_properties: HashMap::new(),
         }
     }
@@ -275,7 +335,9 @@ impl ComputedStyle {
         s.line_height = parent.line_height;
         s.white_space = parent.white_space;
         s.border_spacing = parent.border_spacing; // inherited
-        // table_layout is not inherited (CSS spec)
+        s.text_decoration = parent.text_decoration; // inherited
+        // table_layout, background_image, border_radius, opacity, box_shadow,
+        // and transform are NOT inherited per CSS spec.
         s.custom_properties = parent.custom_properties.clone();
         s
     }

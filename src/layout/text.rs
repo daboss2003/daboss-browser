@@ -27,33 +27,6 @@ impl TextLayout {
         }
     }
 
-    pub fn measure(&mut self, text: &str, max_width: f32, style: &ComputedStyle) -> TextMetrics {
-        if text.is_empty() || max_width <= 0.0 {
-            return TextMetrics::zero();
-        }
-        let line_height = style.font_size * style.line_height;
-        let metrics = Metrics::new(style.font_size, line_height);
-        let mut buffer = Buffer::new(&mut self.system, metrics);
-        buffer.set_size(&mut self.system, Some(max_width), None);
-        buffer.set_wrap(&mut self.system, Wrap::Word);
-        buffer.set_text(&mut self.system, text, Attrs::new(), Shaping::Advanced);
-        buffer.shape_until_scroll(&mut self.system, false);
-
-        let mut lines = 0usize;
-        let mut max_w = 0.0_f32;
-        for run in buffer.layout_runs() {
-            lines += 1;
-            if run.line_w > max_w {
-                max_w = run.line_w;
-            }
-        }
-        TextMetrics {
-            lines,
-            height: lines as f32 * line_height,
-            width: max_w,
-        }
-    }
-
     /// Shape an inline run made of contiguous spans from different DOM nodes.
     /// Returns absolute glyph positions (relative to the IFC origin) so the
     /// caller can union glyph rects per source node.
@@ -138,24 +111,6 @@ fn attrs_from_style(style: &ComputedStyle) -> Attrs<'static> {
             FontStyle::Italic => Style::Italic,
             FontStyle::Normal => Style::Normal,
         })
-}
-
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // width is consumed by inline rect attribution in phase 4c
-pub struct TextMetrics {
-    pub lines: usize,
-    pub height: f32,
-    pub width: f32,
-}
-
-impl TextMetrics {
-    fn zero() -> Self {
-        Self {
-            lines: 0,
-            height: 0.0,
-            width: 0.0,
-        }
-    }
 }
 
 #[derive(Debug, Default)]

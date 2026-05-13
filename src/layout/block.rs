@@ -19,6 +19,7 @@
 
 use std::ops::Range;
 
+use super::replaced::ImageCache;
 use super::text::{collapse_whitespace, InlineContent, InlineSpan, TextLayout};
 use super::{BoxKind, BoxTree, LayoutBox, Rect};
 use crate::css::{BoxSides, ComputedStyle, Dimension, Display, StyleTree};
@@ -28,6 +29,7 @@ pub fn layout(
     dom: &Dom,
     styles: &StyleTree,
     text: &mut TextLayout,
+    images: &ImageCache,
     node: NodeId,
     containing: Rect,
     tree: &mut BoxTree,
@@ -38,7 +40,7 @@ pub fn layout(
             let kids: Vec<NodeId> = dom.children(node).collect();
             for child in kids {
                 let cb = Rect { y, ..containing };
-                y += layout(dom, styles, text, child, cb, tree);
+                y += layout(dom, styles, text, images, child, cb, tree);
             }
             y - containing.y
         }
@@ -47,21 +49,28 @@ pub fn layout(
             if style.display == Display::None {
                 return 0.0;
             }
-            layout_block(dom, styles, text, node, style, containing, tree)
+            layout_block(dom, styles, text, images, node, style, containing, tree)
         }
-        NodeKind::Text(_) | NodeKind::Comment(_) | NodeKind::Doctype(_) => {
-            // Loose text / metadata outside an element shouldn't normally exist
-            // after the tree builder runs, but if it does we ignore it for
-            // block layout; an enclosing IFC would have absorbed it.
-            0.0
+        NodeKind::Text(_) | NodeKind::Comment(_) | NodeKind::Doctype(_) => 0.0,
+    }
+}
+
+fn intrinsic_size(dom: &Dom, node: NodeId, images: &ImageCache) -> Option<(f32, f32)> {
+    if let NodeKind::Element { tag, .. } = &dom.node(node).kind {
+        if tag == "img" {
+            return images
+                .get(&node)
+                .map(|i| (i.width as f32, i.height as f32));
         }
     }
+    None
 }
 
 fn layout_block(
     dom: &Dom,
     styles: &StyleTree,
     text: &mut TextLayout,
+    images: &ImageCache,
     node: NodeId,
     style: &ComputedStyle,
     containing: Rect,
@@ -70,11 +79,12 @@ fn layout_block(
     let margin = style.margin;
     let border = style.border_width;
     let padding = style.padding;
+    let intrinsic = intrinsic_size(dom, node, images);
 
     let cb_width = containing.width;
-    let content_width = match style.width {
-        Dimension::Length(w) => w,
-        Dimension::Percent(pct) => {
+    let content_width = match (style.width, intrinsic) {
+        (Dimension::Length(w), _) => w,
+        (Dimension::Percent(pct), _) => {
             (cb_width * pct / 100.0
                 - border.left
                 - border.right
@@ -82,7 +92,9 @@ fn layout_block(
                 - padding.right)
                 .max(0.0)
         }
-        Dimension::Auto => (cb_width
+        // Replaced elements with `auto` width use their intrinsic width.
+        (Dimension::Auto, Some((iw, _))) => iw,
+        (Dimension::Auto, None) => (cb_width
             - margin.left
             - margin.right
             - border.left
@@ -114,7 +126,7 @@ fn layout_block(
             height: 0.0,
         };
         let h = match group {
-            ChildGroup::Block(child) => layout(dom, styles, text, child, cb, tree),
+            ChildGroup::Block(child) => layout(dom, styles, text, images, child, cb, tree),
             ChildGroup::Inline(nodes) => {
                 layout_inline_run(dom, styles, text, &nodes, style, cb, tree)
             }
@@ -123,9 +135,11 @@ fn layout_block(
     }
     let computed_content_height = child_y - content_y;
 
-    let content_height = match style.height {
-        Dimension::Length(h) => h,
-        Dimension::Percent(_) | Dimension::Auto => computed_content_height,
+    let content_height = match (style.height, intrinsic) {
+        (Dimension::Length(h), _) => h,
+        // Replaced element with `auto` height: use intrinsic height.
+        (Dimension::Auto, Some((_, ih))) => ih,
+        (Dimension::Percent(_), _) | (Dimension::Auto, None) => computed_content_height,
     };
     let border_box_height =
         content_height + border.top + border.bottom + padding.top + padding.bottom;
@@ -176,11 +190,23 @@ fn classify(dom: &Dom, styles: &StyleTree, child: NodeId) -> ChildClass {
                 ChildClass::Inline
             }
         }
-        NodeKind::Element { .. } => match styles.get(child).display {
-            Display::Block | Display::ListItem => ChildClass::Block,
-            Display::Inline | Display::InlineBlock => ChildClass::Inline,
-            Display::None => ChildClass::Skip,
-        },
+        NodeKind::Element { tag, .. } => {
+            // Replaced elements (img/iframe/video/canvas) need a fixed-size
+            // box; cosmic-text doesn't know how to lay a non-text glyph into
+            // an IFC, so we promote them to their own block-style row even
+            // when their `display` is inline-block. Phase 4f can revisit
+            // this to flow them properly inside lines.
+            let is_replaced = matches!(
+                tag.as_str(),
+                "img" | "iframe" | "video" | "canvas"
+            );
+            match styles.get(child).display {
+                Display::Block | Display::ListItem => ChildClass::Block,
+                Display::InlineBlock if is_replaced => ChildClass::Block,
+                Display::Inline | Display::InlineBlock => ChildClass::Inline,
+                Display::None => ChildClass::Skip,
+            }
+        }
         _ => ChildClass::Skip,
     }
 }
@@ -333,7 +359,8 @@ mod tests {
             width: viewport_w,
             height: 0.0,
         };
-        let tree = super::super::layout(&dom, &styles, viewport);
+        let images = ImageCache::new();
+        let tree = super::super::layout(&dom, &styles, &images, viewport);
         (dom, tree)
     }
 
@@ -472,6 +499,41 @@ mod tests {
         // And they're left-to-right.
         assert!(tree.get(span).unwrap().rect.x < tree.get(em).unwrap().rect.x);
         assert!(tree.get(em).unwrap().rect.x < tree.get(strong).unwrap().rect.x);
+    }
+
+    #[test]
+    fn img_uses_intrinsic_dimensions() {
+        use crate::layout::replaced::ImageInfo;
+        let html = "<style>body { margin: 0; }</style><img src=\"x\">";
+        let dom = html::parse(html);
+        let sheets = match css::discover_stylesheets(&dom).into_iter().next() {
+            Some(css::StylesheetRef::Embedded(s)) => vec![s],
+            _ => vec![],
+        };
+        let styles = css::style_dom(&dom, &sheets);
+        // Find the <img> and stuff a fake decoded image into the cache.
+        let img = find(&dom, dom.document(), "img").unwrap();
+        let mut images = ImageCache::new();
+        images.insert(img, ImageInfo { width: 120, height: 80, rgba: vec![0; 120 * 80 * 4] });
+
+        let viewport = Rect { x: 0.0, y: 0.0, width: 1000.0, height: 0.0 };
+        let tree = super::super::layout(&dom, &styles, &images, viewport);
+        let b = tree.get(img).expect("img should have a box");
+        assert_eq!(b.rect.width, 120.0);
+        assert_eq!(b.rect.height, 80.0);
+    }
+
+    #[test]
+    fn img_without_decoded_data_gets_zero_size() {
+        let (dom, tree) = run(
+            "<style>body { margin: 0; }</style><img src=\"missing.png\">",
+            1000.0,
+        );
+        let img = find(&dom, dom.document(), "img").unwrap();
+        let b = tree.get(img).expect("img should still have a box");
+        // No intrinsic; falls back to Auto width with the container shrunk
+        // to inline-block (replaced) semantics — content_width 0.
+        assert_eq!(b.rect.height, 0.0);
     }
 
     #[test]

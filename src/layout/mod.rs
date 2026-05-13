@@ -8,11 +8,15 @@
 //! shaping and line boxes. Text nodes get a single-line height for now.
 
 mod block;
+mod replaced;
 mod text;
 
 use crate::css::{BoxSides, StyleTree};
 use crate::dom::{Dom, NodeId, NodeKind};
 use text::TextLayout;
+
+#[allow(unused_imports)] // ImageInfo will be re-exported when paint consumes rgba
+pub use replaced::{decode_image, ImageCache, ImageInfo};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Rect {
@@ -106,12 +110,17 @@ fn truncate(s: &str, max_chars: usize) -> String {
     out
 }
 
-pub fn layout(dom: &Dom, styles: &StyleTree, viewport: Rect) -> BoxTree {
+pub fn layout(
+    dom: &Dom,
+    styles: &StyleTree,
+    images: &ImageCache,
+    viewport: Rect,
+) -> BoxTree {
     let mut tree = BoxTree {
         boxes: vec![None; styles.styles.len()],
         viewport,
     };
     let mut text = TextLayout::new();
-    block::layout(dom, styles, &mut text, dom.document(), viewport, &mut tree);
+    block::layout(dom, styles, &mut text, images, dom.document(), viewport, &mut tree);
     tree
 }

@@ -120,18 +120,84 @@ fn run_fetch(url_str: &str) -> Result<(), net::Error> {
         external_count
     );
 
+    let mut images = layout::ImageCache::new();
+    let image_count = prefetch_images(&dom, &client, &base_url, &mut images);
+    eprintln!("[phase 4d] decoded {image_count} image(s)");
+
     let viewport = layout::Rect {
         x: 0.0,
         y: 0.0,
         width: 1024.0,
         height: 768.0,
     };
-    let box_tree = layout::layout(&dom, &style_tree, viewport);
+    let box_tree = layout::layout(&dom, &style_tree, &images, viewport);
     let total_boxes = box_tree.boxes.iter().filter(|b| b.is_some()).count();
     eprintln!("[phase 4a] laid out {total_boxes} boxes for a {}x{} viewport", viewport.width as i32, viewport.height as i32);
 
     box_tree.print(&dom);
     Ok(())
+}
+
+/// Hard cap on how many `<img>` URLs we'll fetch for a page. A hostile page
+/// could otherwise weaponise us as a subrequest amplifier.
+const MAX_IMAGES: usize = 50;
+
+fn prefetch_images(
+    dom: &dom::Dom,
+    client: &net::Client,
+    base_url: &url::Url,
+    cache: &mut layout::ImageCache,
+) -> usize {
+    let mut count = 0usize;
+    walk_images(dom, dom.document(), client, base_url, cache, &mut count);
+    cache.len()
+}
+
+fn walk_images(
+    dom_ref: &dom::Dom,
+    node: dom::NodeId,
+    client: &net::Client,
+    base_url: &url::Url,
+    cache: &mut layout::ImageCache,
+    count: &mut usize,
+) {
+    if *count >= MAX_IMAGES {
+        return;
+    }
+    if let dom::NodeKind::Element { tag, attrs } = &dom_ref.node(node).kind {
+        if tag == "img" {
+            if let Some((_, src)) = attrs.iter().find(|(k, _)| k == "src") {
+                if !src.is_empty() {
+                    *count += 1;
+                    match base_url.join(src) {
+                        Ok(abs) => {
+                            let url = abs.to_string();
+                            match client.get(&url) {
+                                Ok(resp) if (200..300).contains(&resp.status) => {
+                                    if let Some(info) = layout::decode_image(&resp.body) {
+                                        cache.insert(node, info);
+                                    }
+                                }
+                                Ok(resp) => {
+                                    tracing::debug!(url=%url, status=resp.status, "image fetch returned non-2xx");
+                                }
+                                Err(e) => {
+                                    tracing::debug!(url=%url, err=%e, "image fetch failed");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(src=%src, err=%e, "bad <img src>");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let kids: Vec<dom::NodeId> = dom_ref.children(node).collect();
+    for c in kids {
+        walk_images(dom_ref, c, client, base_url, cache, count);
+    }
 }
 
 #[derive(Default)]

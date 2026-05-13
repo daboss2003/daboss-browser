@@ -224,6 +224,14 @@ Each phase ends with a demoable artifact and a website that should "work" at tha
 
 - Tokenizer: state machine that emits `StartTag`, `EndTag`, `Text`, `Comment`, `Doctype`. The HTML spec's state machine is long but mechanical — implement maybe 20 of its ~80 states.
 - Tree construction: walk tokens, build the arena DOM. Handle implicit `<html>`, `<head>`, `<body>` insertion. Don't try to be spec-perfect; handle the common cases.
+- **Element coverage target.** The parser is name-agnostic — these are the elements layout/paint will care about later:
+  - text/inline: `p`, `span`, `a`, `em`, `strong`, `code`, `br`
+  - structural: `div`, `section`, `header`, `main`, `nav`, `footer`, `article`, `aside`
+  - headings: `h1`–`h6`
+  - lists: `ul`, `ol`, `li`, `dl`, `dt`, `dd`
+  - tables: `table`, `thead`, `tbody`, `tfoot`, `tr`, `td`, `th` (layout in Phase 4)
+  - forms: `form`, `input`, `button`, `label`, `select`, `option`, `textarea` (interaction in Phase 6)
+  - media: `img` with `src`/`alt`/`width`/`height` (decode in Phase 5), `iframe` with `src`/`sandbox`
 - Print the DOM tree to stdout
 
 **Outcome:** `cargo run -- https://example.com` prints a tree.
@@ -247,8 +255,10 @@ Implement in this order — do not skip ahead:
 1. **Block layout only.** Vertical stack of block boxes. Compute width from parent, height from children. Margins, padding, borders. No floats, no flex.
 2. **Inline layout.** Wrap text into line boxes using `cosmic-text` for shaping. Mix inline boxes (e.g. `<a>` inside a `<p>`).
 3. **Block+inline together.** Anonymous block boxes for stray inlines inside blocks.
+4. **Replaced elements** (`<img>`, `<iframe>`). Rectangular boxes whose intrinsic size comes from outside the box tree: `<img>` from the decoded image's pixel dimensions; `<iframe>` from CSS `width`/`height` or the default `300×150`. Treat them as inline-blocks.
+5. **Tables.** Two-pass: column-width pass (auto layout — measure each cell's natural width), then row-height pass. Support `rowspan`/`colspan`. Skip `table-layout: fixed`.
 
-Skip for now: flexbox, grid, floats, positioning (absolute/fixed), tables. Add later if you want.
+Skip for now: flexbox, grid, floats, positioning (absolute/fixed). Add later if you want.
 
 **Outcome:** a "box tree" with `(x, y, width, height)` for every visible element.
 
@@ -256,8 +266,10 @@ Skip for now: flexbox, grid, floats, positioning (absolute/fixed), tables. Add l
 
 ### Phase 5 — Painting (1 week)
 
-- Walk the box tree, emit a **display list**: `[FillRect, DrawText, DrawBorder, ...]`
+- Walk the box tree, emit a **display list**: `[FillRect, DrawText, DrawBorder, DrawImage, ...]`
 - Replay the display list onto a `tiny-skia` `Pixmap` and **save it as a PNG** — keep this working forever, it's how we test layout/paint headlessly in Docker
+- **Images:** add the [`image`](https://crates.io/crates/image) crate to decode PNG, JPEG, WebP into `tiny-skia` pixmaps. Draw with `Pixmap::draw_pixmap`. Cap decoded image dimensions (refuse images above e.g. 16384×16384 pixels — decompression bomb defense).
+- **iframes:** each nested document renders into its own child pixmap, blitted into the parent at the iframe's box position.
 - Only after PNG snapshots look right, wire the pixmap into the `softbuffer` window surface
 - Redraw on resize
 - **Security:** transition point. PNG-snapshot tests still run inside Docker (no GUI needed). The windowed binary now runs on the macOS host. Write `profiles/macos.sb` (Seatbelt) and the `linux-bwrap.sh` wrapper for CI. From this phase on, **only** launch the windowed binary via `cargo run-sandboxed`. Verify with a deliberate test: a debug build that tries to write to `~/Documents/canary.txt` must be blocked by Seatbelt before we trust the profile.
@@ -273,8 +285,23 @@ Skip for now: flexbox, grid, floats, positioning (absolute/fixed), tables. Add l
 - Mouse wheel scroll: translate the display list's origin
 - Keyboard shortcuts: Cmd/Ctrl+L (focus URL bar later), Cmd/Ctrl+R (reload)
 - History (back/forward) as a `Vec<Url>` + cursor
+- **Forms.** Focus on click into an `<input>`, take key events, fill its value. `<button type="submit">` or Enter in a form input collects the form fields, encodes as `application/x-www-form-urlencoded` (`method="get"` puts it in the query string; `method="post"` sends it as the body), and submits via the network layer. Defer `multipart/form-data` and file uploads.
+- **iframes.** Each iframe owns its own DOM, style tree, box tree, and slice of history. Mouse/keyboard events inside the iframe's box route to the nested document. Cross-origin scripted access between parent and child is **denied** — that's our toy version of the same-origin policy. The iframe `sandbox` attribute (when present) further strips JS, forms, top-level navigation.
 
-**Outcome:** you can click around Wikipedia using your own browser.
+**Outcome:** you can click around Wikipedia using your own browser, fill in a search box, and pages with iframes render their inner content.
+
+### Phase 6.5 — WebSocket (1 week)
+
+A new module in `src/net/websocket.rs` that piggybacks on the HTTP/1.1 transport we already have.
+
+- **Handshake.** Send GET with `Upgrade: websocket`, `Connection: Upgrade`, `Sec-WebSocket-Version: 13`, `Sec-WebSocket-Key: <random 16 bytes, base64>`. Verify the server's `101` response has `Sec-WebSocket-Accept = base64(sha1(key || "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))`.
+- **Framing** (RFC 6455). 1-byte header (FIN + RSV + 4-bit opcode), 1/3/9-byte payload length, optional 4-byte mask, payload. Client→server frames **must** be masked; server→client must **not**. Implement opcodes: text (1), binary (2), close (8), ping (9), pong (10), continuation (0).
+- **Fragmentation.** Reassemble continuation frames into one message before delivering up to the JS layer.
+- **Heartbeat.** Reply to server pings with matching pongs. Send our own pings on idle, time out on no response.
+- Exposed to JS as `new WebSocket(url)` in Phase 7.
+- **Security.** Scheme allowlist extends to `ws` (→ http transport) and `wss` (→ https transport) — both still flow through the SSRF guard in [dns.rs](src/net/dns.rs) because they resolve via the same code. Message size cap (16 MB), max in-flight frames, idle timeout. Reject any masked server→client frame as a protocol error. Treat control frames > 125 bytes as a protocol error. Refuse to upgrade if `Connection: close` was forced.
+
+**Outcome:** a JS demo page does `new WebSocket("wss://echo.websocket.events")`, sends `"hello"`, gets `"hello"` back, logs to console.
 
 ### Phase 7 — JavaScript (2 weeks)
 
@@ -308,6 +335,29 @@ The original motivation. Now trivial because *you wrote the network layer*.
 - **Security:** fetch updates over HTTPS with a pinned host (`easylist.to`), strict format validation, size cap, fall back to last-known-good on parse error (never to "filtering disabled").
 
 **Outcome:** load a news site, see the ad slots empty out. Compare against the same page in vanilla Chrome.
+
+---
+
+## Post-v1 phases
+
+These are real phases with real plans, but **explicitly gated** behind v1 (phases 0–9) shipping. Do not begin them in parallel — they will stall the rest of the project.
+
+### Phase 11 — WebRTC, data channels only (2–4 months full-time)
+
+WebRTC is a parallel protocol stack with effectively zero shared code with the rest of the browser. Plan it as its own multi-month project after v1 is rendering real pages.
+
+- **Scope.** Data channels only. No audio, no video, no screen sharing. Adding A/V is another 2–4 months on top (Opus codec, VP8/VP9, jitter buffer, lipsync).
+- **What to build:**
+  - **STUN** (RFC 8489) — binding requests, HMAC-SHA1 integrity. ~800 lines.
+  - **TURN** (RFC 8656) — allocate, send/data indications, channel bindings, for relayed traffic when P2P fails. ~1000 lines.
+  - **ICE** (RFC 8445) — candidate gathering (host/srflx/relay), prioritized connectivity checks, nomination. ~1500 lines.
+  - **DTLS** (RFC 6347) — TLS-over-UDP. `rustls` doesn't do DTLS. Either use a pure-Rust DTLS crate or implement the DTLS 1.2 record layer + handshake against rustls' state machine. ~2000 lines if from scratch.
+  - **SCTP-over-DTLS** (RFC 4960 + 8261) — reliable framing for data channels. The biggest single piece. ~3000 lines.
+  - **SDP** (RFC 8866) — offer/answer text format for session negotiation. ~1000 lines.
+- **Security.** DTLS handshake with self-signed cert + SDP fingerprint pinning. TURN credentials never sent over insecure transport. Rate-limit STUN/TURN to prevent reflection-amplification attacks where our browser is used to flood a victim.
+- **Honest disclaimer.** This is the only phase where using an existing library is genuinely tempting. [`str0m`](https://github.com/algesten/str0m) hands you the state machine and lets you wire transport — a reasonable middle ground. [`webrtc-rs`](https://github.com/webrtc-rs/webrtc) is the full stack and defeats most of the learning.
+
+**Outcome:** a JS page creates `new RTCPeerConnection()`, exchanges an SDP offer/answer (via a WebSocket-based signaling server you write, ~50 lines of Node or Python), opens a data channel, sends bytes peer-to-peer.
 
 ---
 
@@ -350,8 +400,12 @@ daboss_browser/
 │   ├── main.rs                  # entry, event loop
 │   ├── app.rs                   # browser-level state, tabs, history
 │   ├── net/
-│   │   ├── mod.rs
-│   │   ├── http.rs              # HTTP client
+│   │   ├── mod.rs               # Client + redirect handling
+│   │   ├── error.rs
+│   │   ├── dns.rs               # SSRF-guarded resolver
+│   │   ├── transport.rs         # TCP + TLS connection
+│   │   ├── http.rs              # HTTP/1.1 wire protocol
+│   │   ├── websocket.rs         # phase 6.5
 │   │   └── adblock.rs           # blocklist check (phase 9)
 │   ├── html/
 │   │   ├── mod.rs
@@ -359,7 +413,8 @@ daboss_browser/
 │   │   └── tree_builder.rs
 │   ├── dom/
 │   │   ├── mod.rs
-│   │   └── arena.rs
+│   │   ├── arena.rs
+│   │   └── iframe.rs            # nested document contexts
 │   ├── css/
 │   │   ├── mod.rs
 │   │   ├── parser.rs
@@ -368,10 +423,13 @@ daboss_browser/
 │   ├── layout/
 │   │   ├── mod.rs
 │   │   ├── block.rs
-│   │   └── inline.rs
+│   │   ├── inline.rs
+│   │   ├── replaced.rs          # <img>, <iframe>
+│   │   └── table.rs
 │   ├── paint/
 │   │   ├── mod.rs
-│   │   └── display_list.rs
+│   │   ├── display_list.rs
+│   │   └── image.rs             # PNG/JPEG/WebP decoding
 │   ├── ui/
 │   │   ├── mod.rs
 │   │   ├── urlbar.rs
@@ -401,16 +459,23 @@ daboss_browser/
 | Phase | Calendar weeks |
 |---|---|
 | 0–1 Setup + network | 1 |
-| 2 HTML parsing | 2 |
+| 2 HTML parsing (incl. table/iframe/form/img elements) | 2 |
 | 3 CSS + cascade | 2 |
-| 4 Layout | 3 |
-| 5 Paint | 1 |
-| 6 Interaction | 1 |
+| 4 Layout (block + inline + replaced + tables) | 4 |
+| 5 Paint (incl. image decoding) | 1.5 |
+| 6 Interaction (incl. forms + iframe nested docs) | 2 |
+| 6.5 WebSocket | 1 |
 | 7 JS | 2 |
 | 8 Chrome | 1 |
 | 9 Ad blocker | <1 |
 
-**Total: ~13 weeks part-time** to a thing you can browse Wikipedia with, block ads in, and demo to friends. Full-time: 3–4 weeks.
+**v1 total: ~17 weeks part-time** to a thing you can browse Wikipedia with, fill forms, block ads in, render iframes, and demo to friends. Full-time: 4–5 weeks.
+
+**Post-v1, only after v1 ships:**
+
+| Phase | Calendar weeks (full-time equivalent) |
+|---|---|
+| 11 WebRTC (data channels only) | 8–16 |
 
 If you stop after phase 5 you still have a respectable "renders real websites" demo. Phases 6–9 are what make it a browser instead of a renderer.
 

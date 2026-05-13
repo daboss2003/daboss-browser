@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 
+mod dom;
+mod html;
 mod net;
 
-use std::io::Write as _;
 use std::num::NonZeroU32;
 use std::process::ExitCode;
 use std::rc::Rc;
@@ -49,13 +50,16 @@ fn run_fetch(url: &str) -> Result<(), net::Error> {
     let client = net::Client::new().with_allow_loopback(allow_loopback);
     let response = client.get(url)?;
 
-    println!("HTTP/1.1 {} {}", response.status, response.reason);
+    // Status + headers on stderr; the DOM tree on stdout so `> tree.txt` works.
+    eprintln!("HTTP/1.1 {} {}", response.status, response.reason);
     for (name, value) in &response.headers {
-        println!("{name}: {value}");
+        eprintln!("{name}: {value}");
     }
-    println!();
-    let _ = std::io::stdout().write_all(&response.body);
-    println!();
+    eprintln!();
+
+    let body = String::from_utf8_lossy(&response.body);
+    let dom = html::parse(&body);
+    dom.print();
     Ok(())
 }
 

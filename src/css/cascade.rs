@@ -19,7 +19,7 @@ use crate::css::parser::parse_inline_declarations;
 use crate::css::types::{
     AttributeOp, AttributeSelector, BorderStyle, BoxSides, CalcExpr, Color, Combinator,
     ComputedStyle, Declaration, Dimension, Display, FontStyle, Rule, Selector, SimpleSelector,
-    Stylesheet, TextAlign, Unit, Value, WhiteSpace,
+    Stylesheet, TableLayout, TextAlign, Unit, Value, WhiteSpace,
 };
 use crate::dom::{Dom, NodeId, NodeKind};
 
@@ -528,6 +528,34 @@ fn apply_declaration(
         "border" => apply_border_shorthand(value, style),
         "width" => style.width = dimension_from(value, style.font_size, parent),
         "height" => style.height = dimension_from(value, style.font_size, parent),
+        "border-spacing" => {
+            // 1 length: same horizontal + vertical. 2 lengths: h, v.
+            let em = style.font_size;
+            let resolved: Vec<f32> = match value {
+                Value::List(items) => items
+                    .iter()
+                    .filter_map(|v| length_to_px(v, em, parent))
+                    .collect(),
+                _ => length_to_px(value, em, parent).into_iter().collect(),
+            };
+            match resolved.as_slice() {
+                [h] => style.border_spacing = (*h, *h),
+                [h, v, ..] => style.border_spacing = (*h, *v),
+                _ => {}
+            }
+        }
+        "table-layout" => {
+            if let Value::Keyword(k) = value {
+                style.table_layout = match k.as_str() {
+                    "fixed" => TableLayout::Fixed,
+                    _ => TableLayout::Auto,
+                };
+            }
+        }
+        // `border-collapse` is parsed and silently ignored; the toy table
+        // engine doesn't implement collapse mode and rendering is identical
+        // either way until phase 5 paints borders.
+        "border-collapse" => {}
         _ => {}
     }
 }

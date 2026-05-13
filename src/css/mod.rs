@@ -9,7 +9,7 @@ pub use parser::parse;
 #[allow(unused_imports)]
 pub use types::{
     BorderStyle, BoxSides, Color, ComputedStyle, Dimension, Display, FontStyle, Stylesheet,
-    TextAlign, WhiteSpace,
+    TableLayout, TextAlign, WhiteSpace,
 };
 
 use crate::dom::{Dom, NodeId, NodeKind};

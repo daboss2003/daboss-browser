@@ -27,6 +27,30 @@ impl TextLayout {
         }
     }
 
+    /// Measure how wide `text` would be if it were never wrapped — i.e. its
+    /// "max content" intrinsic width. Used by table layout to size columns
+    /// against the natural widths of their cells.
+    pub fn measure_natural_width(&mut self, text: &str, style: &ComputedStyle) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        let line_height = style.font_size * style.line_height;
+        let metrics = Metrics::new(style.font_size, line_height);
+        let mut buffer = Buffer::new(&mut self.system, metrics);
+        // Effectively unbounded width: cosmic-text won't wrap.
+        buffer.set_size(&mut self.system, Some(f32::MAX / 2.0), None);
+        buffer.set_wrap(&mut self.system, Wrap::None);
+        buffer.set_text(&mut self.system, text, attrs_from_style(style), Shaping::Advanced);
+        buffer.shape_until_scroll(&mut self.system, false);
+        let mut max_w = 0.0f32;
+        for run in buffer.layout_runs() {
+            if run.line_w > max_w {
+                max_w = run.line_w;
+            }
+        }
+        max_w
+    }
+
     /// Shape an inline run made of contiguous spans from different DOM nodes.
     /// Returns absolute glyph positions (relative to the IFC origin) so the
     /// caller can union glyph rects per source node.

@@ -173,6 +173,12 @@ pub enum WhiteSpace {
     NoWrap,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableLayout {
+    Auto,
+    Fixed,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct BoxSides {
     pub top: f32,
@@ -214,6 +220,12 @@ pub struct ComputedStyle {
     pub height: Dimension,
     pub line_height: f32, // multiplier of font_size
     pub white_space: WhiteSpace,
+    /// Horizontal and vertical gap between adjacent table cells (the CSS
+    /// `border-spacing` property). Inherited.
+    pub border_spacing: (f32, f32),
+    /// `auto` measures intrinsic content widths per column; `fixed` uses
+    /// `<col>` widths and first-row widths. Not inherited.
+    pub table_layout: TableLayout,
     /// Resolved custom properties (CSS variables). Inherited like color.
     pub custom_properties: HashMap<String, Value>,
 }
@@ -240,6 +252,8 @@ impl ComputedStyle {
             height: Dimension::Auto,
             line_height: 1.2,
             white_space: WhiteSpace::Normal,
+            border_spacing: (2.0, 2.0), // CSS initial value
+            table_layout: TableLayout::Auto,
             custom_properties: HashMap::new(),
         }
     }
@@ -254,6 +268,8 @@ impl ComputedStyle {
         s.text_align = parent.text_align;
         s.line_height = parent.line_height;
         s.white_space = parent.white_space;
+        s.border_spacing = parent.border_spacing; // inherited
+        // table_layout is not inherited (CSS spec)
         s.custom_properties = parent.custom_properties.clone();
         s
     }

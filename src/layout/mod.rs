@@ -8,6 +8,8 @@
 //! shaping and line boxes. Text nodes get a single-line height for now.
 
 mod block;
+mod flex;
+mod grid;
 mod replaced;
 mod table;
 mod text;

@@ -17,9 +17,11 @@ use std::collections::HashMap;
 
 use crate::css::parser::parse_inline_declarations;
 use crate::css::types::{
-    AttributeOp, AttributeSelector, BackgroundImage, BorderStyle, BoxShadow, BoxSides, CalcExpr,
-    Color, Combinator, ComputedStyle, Declaration, Dimension, Display, FontStyle, Rule, Selector,
-    SimpleSelector, Stylesheet, TableLayout, TextAlign, TextDecoration, Unit, Value, WhiteSpace,
+    AlignContent, AlignItems, AttributeOp, AttributeSelector, BackgroundImage, BorderStyle,
+    BoxShadow, BoxSides, BoxSizing, CalcExpr, Color, Combinator, ComputedStyle, Declaration,
+    Dimension, Display, FlexDirection, FlexWrap, FontStyle, GridAutoFlow, GridLine, GridTrack,
+    JustifyContent, Position, Rule, Selector, SimpleSelector, Stylesheet, TableLayout, TextAlign,
+    TextDecoration, Unit, Value, WhiteSpace,
 };
 use crate::dom::{Dom, NodeId, NodeKind};
 
@@ -560,7 +562,7 @@ fn length_n_unit_to_px_maybe(n: f32, u: Unit) -> Option<f32> {
         // em/rem need a base font size; we don't have it inside calc evaluation
         // without threading it through. Toy: treat as initial root font size.
         Unit::Em | Unit::Rem => Some(n * ComputedStyle::ROOT_FONT_SIZE),
-        Unit::Vw | Unit::Vh => None,
+        Unit::Vw | Unit::Vh | Unit::Fr => None,
     }
 }
 
@@ -715,6 +717,198 @@ fn apply_declaration(
         "content" => {
             style.content = content_from(value);
         }
+        "flex-direction" => {
+            if let Value::Keyword(k) = value {
+                style.flex_direction = match k.as_str() {
+                    "row-reverse" => FlexDirection::RowReverse,
+                    "column" => FlexDirection::Column,
+                    "column-reverse" => FlexDirection::ColumnReverse,
+                    _ => FlexDirection::Row,
+                };
+            }
+        }
+        "flex-wrap" => {
+            if let Value::Keyword(k) = value {
+                style.flex_wrap = match k.as_str() {
+                    "wrap" => FlexWrap::Wrap,
+                    "wrap-reverse" => FlexWrap::WrapReverse,
+                    _ => FlexWrap::NoWrap,
+                };
+            }
+        }
+        "justify-content" => {
+            if let Value::Keyword(k) = value {
+                style.justify_content = match k.as_str() {
+                    "flex-end" | "end" | "right" => JustifyContent::FlexEnd,
+                    "center" => JustifyContent::Center,
+                    "space-between" => JustifyContent::SpaceBetween,
+                    "space-around" => JustifyContent::SpaceAround,
+                    "space-evenly" => JustifyContent::SpaceEvenly,
+                    _ => JustifyContent::FlexStart,
+                };
+            }
+        }
+        "align-items" => {
+            if let Value::Keyword(k) = value {
+                style.align_items = match k.as_str() {
+                    "flex-end" | "end" => AlignItems::FlexEnd,
+                    "center" => AlignItems::Center,
+                    "baseline" => AlignItems::Baseline,
+                    "stretch" => AlignItems::Stretch,
+                    _ => AlignItems::FlexStart,
+                };
+            }
+        }
+        "flex-grow" => {
+            if let Value::Number(n) = value {
+                style.flex_grow = n.max(0.0);
+            }
+        }
+        "flex-shrink" => {
+            if let Value::Number(n) = value {
+                style.flex_shrink = n.max(0.0);
+            }
+        }
+        "flex-basis" => {
+            style.flex_basis = dimension_from(value, style.font_size, parent);
+        }
+        "flex" => {
+            // Shorthand: `flex: <grow> <shrink> <basis>` or just `flex: <grow>`
+            // or `flex: <basis>`. Toy implementation honours the common forms.
+            apply_flex_shorthand(value, style, parent);
+        }
+        "gap" | "grid-gap" => {
+            // `gap: <length>` sets both row and column gap. With two values:
+            // `gap: row column`.
+            let em = style.font_size;
+            match value {
+                Value::List(items) => {
+                    let a = items
+                        .first()
+                        .and_then(|v| length_to_px(v, em, parent))
+                        .unwrap_or(0.0);
+                    let b = items
+                        .get(1)
+                        .and_then(|v| length_to_px(v, em, parent))
+                        .unwrap_or(a);
+                    style.gap = (a, b);
+                }
+                _ => {
+                    if let Some(px) = length_to_px(value, em, parent) {
+                        style.gap = (px, px);
+                    }
+                }
+            }
+        }
+        "row-gap" => {
+            if let Some(px) = length_to_px(value, style.font_size, parent) {
+                style.gap.0 = px;
+            }
+        }
+        "column-gap" => {
+            if let Some(px) = length_to_px(value, style.font_size, parent) {
+                style.gap.1 = px;
+            }
+        }
+        "grid-template-columns" => {
+            style.grid_template_columns = grid_tracks_from(value, style.font_size, parent);
+        }
+        "grid-template-rows" => {
+            style.grid_template_rows = grid_tracks_from(value, style.font_size, parent);
+        }
+        "grid-template-areas" => {
+            style.grid_template_areas = grid_template_areas_from(value);
+        }
+        "grid-auto-flow" => {
+            if let Value::Keyword(k) = value {
+                style.grid_auto_flow = match k.as_str() {
+                    "column" => GridAutoFlow::Column,
+                    "row dense" | "dense row" | "dense" => GridAutoFlow::RowDense,
+                    "column dense" | "dense column" => GridAutoFlow::ColumnDense,
+                    _ => GridAutoFlow::Row,
+                };
+            } else if let Value::List(items) = value {
+                let mut dense = false;
+                let mut column = false;
+                for it in items {
+                    if let Value::Keyword(k) = it {
+                        match k.as_str() {
+                            "dense" => dense = true,
+                            "column" => column = true,
+                            _ => {}
+                        }
+                    }
+                }
+                style.grid_auto_flow = match (column, dense) {
+                    (true, true) => GridAutoFlow::ColumnDense,
+                    (true, false) => GridAutoFlow::Column,
+                    (false, true) => GridAutoFlow::RowDense,
+                    (false, false) => GridAutoFlow::Row,
+                };
+            }
+        }
+        "grid-area" => {
+            // `grid-area: name` or shorthand `<row-start> / <col-start> / <row-end> / <col-end>`
+            apply_grid_area(value, style);
+        }
+        "grid-column" => apply_grid_axis(value, style, true),
+        "grid-row" => apply_grid_axis(value, style, false),
+        "grid-column-start" => style.grid_placement.column_start = grid_line_from(value),
+        "grid-column-end" => style.grid_placement.column_end = grid_line_from(value),
+        "grid-row-start" => style.grid_placement.row_start = grid_line_from(value),
+        "grid-row-end" => style.grid_placement.row_end = grid_line_from(value),
+        "align-content" => {
+            if let Value::Keyword(k) = value {
+                style.align_content = match k.as_str() {
+                    "flex-start" | "start" => AlignContent::FlexStart,
+                    "flex-end" | "end" => AlignContent::FlexEnd,
+                    "center" => AlignContent::Center,
+                    "space-between" => AlignContent::SpaceBetween,
+                    "space-around" => AlignContent::SpaceAround,
+                    "space-evenly" => AlignContent::SpaceEvenly,
+                    _ => AlignContent::Stretch,
+                };
+            }
+        }
+        "order" => {
+            if let Value::Number(n) = value {
+                style.order = *n as i32;
+            }
+        }
+        "box-sizing" => {
+            if let Value::Keyword(k) = value {
+                style.box_sizing = match k.as_str() {
+                    "border-box" => BoxSizing::BorderBox,
+                    _ => BoxSizing::ContentBox,
+                };
+            }
+        }
+        "min-width" => style.min_width = max_min_from(value, style.font_size, parent),
+        "max-width" => style.max_width = max_min_from(value, style.font_size, parent),
+        "min-height" => style.min_height = max_min_from(value, style.font_size, parent),
+        "max-height" => style.max_height = max_min_from(value, style.font_size, parent),
+        "position" => {
+            if let Value::Keyword(k) = value {
+                style.position = match k.as_str() {
+                    "relative" => Position::Relative,
+                    "absolute" => Position::Absolute,
+                    "fixed" => Position::Fixed,
+                    "sticky" => Position::Sticky,
+                    _ => Position::Static,
+                };
+            }
+        }
+        "top" => style.top = offset_from(value, style.font_size, parent),
+        "right" => style.right = offset_from(value, style.font_size, parent),
+        "bottom" => style.bottom = offset_from(value, style.font_size, parent),
+        "left" => style.left = offset_from(value, style.font_size, parent),
+        "z-index" => {
+            if let Value::Number(n) = value {
+                style.z_index = Some(*n as i32);
+            } else if matches!(value, Value::Keyword(k) if k == "auto") {
+                style.z_index = None;
+            }
+        }
         "text-decoration" | "text-decoration-line" => {
             if let Value::Keyword(k) = value {
                 style.text_decoration = match k.as_str() {
@@ -837,6 +1031,268 @@ fn transform_translate_from(
     None
 }
 
+fn offset_from(v: &Value, em: f32, parent: Option<&ComputedStyle>) -> Option<f32> {
+    match v {
+        Value::Keyword(k) if k == "auto" => None,
+        _ => length_to_px(v, em, parent),
+    }
+}
+
+fn apply_flex_shorthand(value: &Value, style: &mut ComputedStyle, parent: Option<&ComputedStyle>) {
+    let em = style.font_size;
+    let items: Vec<&Value> = match value {
+        Value::List(v) => v.iter().collect(),
+        single => vec![single],
+    };
+    if items.is_empty() {
+        return;
+    }
+    // CSS spec: a single number → flex-grow; a single length/percent → flex-basis.
+    // Two values: <grow> <shrink>, <grow> <basis>, or <grow> <basis>.
+    // Three values: <grow> <shrink> <basis>.
+    let mut grow = 0.0_f32;
+    let mut shrink = 1.0_f32;
+    let mut basis = Dimension::Auto;
+    let mut grow_set = false;
+    let mut shrink_set = false;
+    let mut basis_set = false;
+    for it in items {
+        match it {
+            Value::Number(n) => {
+                if !grow_set {
+                    grow = (*n).max(0.0);
+                    grow_set = true;
+                } else if !shrink_set {
+                    shrink = (*n).max(0.0);
+                    shrink_set = true;
+                }
+            }
+            Value::Length(_, _) | Value::Percentage(_) => {
+                basis = dimension_from(it, em, parent);
+                basis_set = true;
+            }
+            Value::Keyword(k) if k == "auto" => {
+                basis = Dimension::Auto;
+                basis_set = true;
+            }
+            Value::Keyword(k) if k == "none" => {
+                grow = 0.0;
+                shrink = 0.0;
+                basis = Dimension::Auto;
+                grow_set = true;
+                shrink_set = true;
+                basis_set = true;
+            }
+            _ => {}
+        }
+    }
+    style.flex_grow = grow;
+    if shrink_set {
+        style.flex_shrink = shrink;
+    }
+    let _ = basis_set;
+    style.flex_basis = basis;
+}
+
+fn grid_tracks_from(value: &Value, em: f32, parent: Option<&ComputedStyle>) -> Vec<GridTrack> {
+    let items: Vec<&Value> = match value {
+        Value::List(v) => v.iter().collect(),
+        Value::Keyword(k) if k == "none" => return Vec::new(),
+        single => vec![single],
+    };
+    let mut tracks = Vec::with_capacity(items.len());
+    for it in items {
+        match it {
+            Value::Function { name, args } if name == "repeat" => {
+                // repeat(<count>, <track-list>) → expand by replicating the
+                // pattern `count` times.
+                let count = args
+                    .first()
+                    .and_then(|v| match v {
+                        Value::Number(n) => Some((*n as i32).max(0) as usize),
+                        Value::Keyword(k) if k == "auto-fit" || k == "auto-fill" => {
+                            // We don't have a viewport context to honour
+                            // auto-fit; expand to a single instance.
+                            Some(1)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                let mut pattern: Vec<GridTrack> = Vec::new();
+                for a in args.iter().skip(1) {
+                    let sub = grid_tracks_from(a, em, parent);
+                    pattern.extend(sub);
+                }
+                if pattern.is_empty() {
+                    continue;
+                }
+                for _ in 0..count {
+                    tracks.extend(pattern.iter().cloned());
+                }
+            }
+            Value::Keyword(k) if k == "auto" => tracks.push(GridTrack::Auto),
+            Value::Percentage(p) => tracks.push(GridTrack::Percent(*p)),
+            Value::Number(n) => tracks.push(GridTrack::Px(*n)),
+            Value::Length(n, Unit::Fr) => tracks.push(GridTrack::Fr(*n)),
+            Value::Length(_, _) => {
+                if let Some(px) = length_to_px(it, em, parent) {
+                    tracks.push(GridTrack::Px(px));
+                } else {
+                    tracks.push(GridTrack::Auto);
+                }
+            }
+            _ => tracks.push(GridTrack::Auto),
+        }
+    }
+    tracks
+}
+
+fn grid_template_areas_from(value: &Value) -> Vec<Vec<String>> {
+    let items: Vec<&Value> = match value {
+        Value::List(v) => v.iter().collect(),
+        single => vec![single],
+    };
+    let mut rows = Vec::new();
+    for it in items {
+        if let Value::String(s) = it {
+            let row: Vec<String> = s
+                .split_ascii_whitespace()
+                .map(|w| w.to_string())
+                .collect();
+            if !row.is_empty() {
+                rows.push(row);
+            }
+        }
+    }
+    rows
+}
+
+fn grid_line_from(value: &Value) -> Option<GridLine> {
+    match value {
+        Value::Keyword(k) if k == "auto" => Some(GridLine::Auto),
+        Value::Number(n) => Some(GridLine::Index(*n as i32)),
+        Value::Keyword(k) => Some(GridLine::Name(k.clone())),
+        Value::List(items) => {
+            // `span 2` or `span name` etc.
+            let mut span: Option<i32> = None;
+            let mut saw_span = false;
+            let mut name: Option<String> = None;
+            for it in items {
+                match it {
+                    Value::Keyword(k) if k == "span" => saw_span = true,
+                    Value::Number(n) => span = Some(*n as i32),
+                    Value::Keyword(k) => name = Some(k.clone()),
+                    _ => {}
+                }
+            }
+            if saw_span {
+                Some(GridLine::Span(span.unwrap_or(1)))
+            } else if let Some(n) = name {
+                Some(GridLine::Name(n))
+            } else if let Some(n) = span {
+                Some(GridLine::Index(n))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn apply_grid_axis(value: &Value, style: &mut ComputedStyle, is_column: bool) {
+    // `grid-column: start / end` or just `start`.
+    let (start, end) = match value {
+        Value::List(items) => {
+            // Look for a "/" separator. The parser may emit two list items
+            // separated by Keyword("/") or just two values; we handle both.
+            let mut slash_pos: Option<usize> = None;
+            for (i, v) in items.iter().enumerate() {
+                if matches!(v, Value::Keyword(k) if k == "/") {
+                    slash_pos = Some(i);
+                    break;
+                }
+            }
+            if let Some(p) = slash_pos {
+                let left: Value =
+                    if p == 1 { items[0].clone() } else { Value::List(items[..p].to_vec()) };
+                let right: Value = if items.len() == p + 2 {
+                    items[p + 1].clone()
+                } else {
+                    Value::List(items[p + 1..].to_vec())
+                };
+                (grid_line_from(&left), grid_line_from(&right))
+            } else if items.len() == 2 {
+                (grid_line_from(&items[0]), grid_line_from(&items[1]))
+            } else {
+                (grid_line_from(value), None)
+            }
+        }
+        single => (grid_line_from(single), None),
+    };
+    if is_column {
+        style.grid_placement.column_start = start;
+        style.grid_placement.column_end = end;
+    } else {
+        style.grid_placement.row_start = start;
+        style.grid_placement.row_end = end;
+    }
+}
+
+fn apply_grid_area(value: &Value, style: &mut ComputedStyle) {
+    match value {
+        Value::Keyword(k) => {
+            // `grid-area: name`
+            style.grid_placement.area = Some(k.clone());
+        }
+        Value::List(_) => {
+            // Shorthand: <row-start> / <col-start> / <row-end> / <col-end>
+            // The parser produces these as a flat list with "/" keyword
+            // separators interspersed.
+            let parts = split_on_slash(value);
+            let lines: Vec<Option<GridLine>> =
+                parts.iter().map(|p| grid_line_from(p)).collect();
+            style.grid_placement.row_start = lines.first().cloned().unwrap_or(None);
+            style.grid_placement.column_start = lines.get(1).cloned().unwrap_or(None);
+            style.grid_placement.row_end = lines.get(2).cloned().unwrap_or(None);
+            style.grid_placement.column_end = lines.get(3).cloned().unwrap_or(None);
+        }
+        _ => {}
+    }
+}
+
+fn split_on_slash(value: &Value) -> Vec<Value> {
+    let items: Vec<&Value> = match value {
+        Value::List(v) => v.iter().collect(),
+        single => return vec![single.clone()],
+    };
+    let mut out = Vec::new();
+    let mut group: Vec<Value> = Vec::new();
+    for v in items {
+        if matches!(v, Value::Keyword(k) if k == "/") {
+            if group.len() == 1 {
+                out.push(group.pop().unwrap());
+            } else if !group.is_empty() {
+                out.push(Value::List(std::mem::take(&mut group)));
+            }
+        } else {
+            group.push(v.clone());
+        }
+    }
+    if group.len() == 1 {
+        out.push(group.pop().unwrap());
+    } else if !group.is_empty() {
+        out.push(Value::List(group));
+    }
+    out
+}
+
+fn max_min_from(value: &Value, em: f32, parent: Option<&ComputedStyle>) -> Option<f32> {
+    match value {
+        Value::Keyword(k) if k == "none" || k == "auto" => None,
+        _ => length_to_px(value, em, parent),
+    }
+}
+
 fn content_from(v: &Value) -> Option<String> {
     match v {
         Value::String(s) => Some(s.clone()),
@@ -865,6 +1321,10 @@ fn display_from(v: &Value) -> Option<Display> {
         "inline" => Display::Inline,
         "inline-block" => Display::InlineBlock,
         "list-item" => Display::ListItem,
+        "flex" => Display::Flex,
+        "inline-flex" => Display::InlineFlex,
+        "grid" => Display::Grid,
+        "inline-grid" => Display::InlineGrid,
         "none" => Display::None,
         _ => return None,
     })
@@ -938,9 +1398,8 @@ fn length_to_px(v: &Value, em_base: f32, parent: Option<&ComputedStyle>) -> Opti
     let root_em = parent.map(|p| p.font_size).unwrap_or(ComputedStyle::ROOT_FONT_SIZE);
     match v {
         // vw/vh need viewport size, which we don't have at cascade time — defer
-        // to layout. Returning None makes dimension_from fall through to Auto,
-        // which then resolves naturally against the containing block.
-        Value::Length(_, Unit::Vw | Unit::Vh) => None,
+        // to layout. `fr` is a grid-track sizer, not a real length.
+        Value::Length(_, Unit::Vw | Unit::Vh | Unit::Fr) => None,
         Value::Length(n, u) => Some(length_n_unit_to_px(*n, *u, em_base, root_em)),
         Value::Number(0.0) => Some(0.0),
         Value::Percentage(_) => None,
@@ -958,7 +1417,7 @@ fn length_n_unit_to_px(n: f32, u: Unit, em_base: f32, root_em: f32) -> f32 {
         Unit::Cm => n * 96.0 / 2.54,
         Unit::Mm => n * 96.0 / 25.4,
         Unit::In => n * 96.0,
-        Unit::Vw | Unit::Vh => 0.0,
+        Unit::Vw | Unit::Vh | Unit::Fr => 0.0,
     }
 }
 

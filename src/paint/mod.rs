@@ -142,7 +142,12 @@ impl Painter {
             _ => {}
         }
 
-        let kids: Vec<NodeId> = dom.children(node).collect();
+        // Paint children in z-index order: items with `z-index: auto`
+        // (`None`) paint in DOM order at z=0; items with explicit z paint
+        // before (negative) or after (positive). Stable sort preserves DOM
+        // order within the same z bucket.
+        let mut kids: Vec<NodeId> = dom.children(node).collect();
+        kids.sort_by_key(|c| styles.get(*c).z_index.unwrap_or(0));
         for child in kids {
             self.paint_subtree(dom, styles, tree, images, child, ctx);
         }

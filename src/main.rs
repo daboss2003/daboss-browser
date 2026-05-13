@@ -823,6 +823,12 @@ impl Browser {
             }
         }
 
+        // Sticky positioning — re-blit pixmap regions of sticky elements
+        // when scrolled past their threshold.
+        if let Some(page) = &self.page {
+            paint_sticky_overlays(&mut buffer, vw as u32, vh as u32, page, self.scroll_y);
+        }
+
         // Input overlays — typed values painted on top of the page pixmap.
         if let Some(page) = &self.page {
             paint_input_overlays(
@@ -1007,6 +1013,105 @@ fn collect_form_fields(
     let kids: Vec<dom::NodeId> = dom.children(node).collect();
     for c in kids {
         collect_form_fields(dom, inputs, c, out);
+    }
+}
+
+// ---------------- Sticky overlays ----------------
+
+/// Walk the DOM for `position: sticky` elements. For each, if the natural
+/// position has scrolled above the threshold (`top` offset measured from
+/// the bottom of the chrome strip), copy the element's pixmap region to
+/// the threshold position. This re-paints the sticky element so it appears
+/// pinned to the top of the viewport even while the page scrolls beneath.
+fn paint_sticky_overlays(
+    buffer: &mut [u32],
+    vw: u32,
+    vh: u32,
+    page: &Page,
+    scroll_y: f32,
+) {
+    walk_sticky(buffer, vw, vh, page, scroll_y, page.dom.document());
+}
+
+fn walk_sticky(
+    buffer: &mut [u32],
+    vw: u32,
+    vh: u32,
+    page: &Page,
+    scroll_y: f32,
+    node: dom::NodeId,
+) {
+    if let dom::NodeKind::Element { .. } = &page.dom.node(node).kind {
+        let style = page.styles.get(node);
+        if style.position == css::Position::Sticky {
+            if let Some(b) = page.box_tree.get(node) {
+                let top_offset = style.top.unwrap_or(0.0);
+                // Element's natural y in viewport coords (after subtracting
+                // scroll + chrome offset).
+                let natural_top_in_page = b.rect.y;
+                let threshold_in_page = scroll_y + top_offset;
+                if natural_top_in_page < threshold_in_page {
+                    // Scrolled past — pin to threshold.
+                    blit_pixmap_region(
+                        buffer,
+                        vw,
+                        vh,
+                        &page.pixmap,
+                        b.rect.x as i32,
+                        b.rect.y as i32,
+                        b.rect.width.ceil() as i32,
+                        b.rect.height.ceil() as i32,
+                        b.rect.x as i32,
+                        (CHROME_HEIGHT as f32 + top_offset) as i32,
+                    );
+                }
+            }
+        }
+    }
+    let kids: Vec<dom::NodeId> = page.dom.children(node).collect();
+    for c in kids {
+        walk_sticky(buffer, vw, vh, page, scroll_y, c);
+    }
+}
+
+/// Blit a `(src_w × src_h)` region of `src` starting at `(src_x, src_y)`
+/// into `buffer` (laid out as `vw` × `vh`) at destination `(dst_x, dst_y)`.
+/// Clips to both pixmap and surface bounds.
+#[allow(clippy::too_many_arguments)]
+fn blit_pixmap_region(
+    buffer: &mut [u32],
+    vw: u32,
+    vh: u32,
+    src: &Pixmap,
+    src_x: i32,
+    src_y: i32,
+    src_w: i32,
+    src_h: i32,
+    dst_x: i32,
+    dst_y: i32,
+) {
+    let pmap_w = src.width() as i32;
+    let pmap_h = src.height() as i32;
+    let data = src.data();
+    for row in 0..src_h {
+        let sy = src_y + row;
+        let dy = dst_y + row;
+        if sy < 0 || sy >= pmap_h || dy < 0 || dy >= vh as i32 {
+            continue;
+        }
+        for col in 0..src_w {
+            let sx = src_x + col;
+            let dx = dst_x + col;
+            if sx < 0 || sx >= pmap_w || dx < 0 || dx >= vw as i32 {
+                continue;
+            }
+            let src_idx = (sy as usize * pmap_w as usize + sx as usize) * 4;
+            let r = data[src_idx];
+            let g = data[src_idx + 1];
+            let b = data[src_idx + 2];
+            let dst_idx = dy as usize * vw as usize + dx as usize;
+            buffer[dst_idx] = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+        }
     }
 }
 

@@ -8,8 +8,10 @@ pub use cascade::{InteractionState, StyleTree};
 pub use parser::parse;
 #[allow(unused_imports)]
 pub use types::{
-    BackgroundImage, BorderStyle, BoxShadow, BoxSides, Color, ComputedStyle, Dimension, Display,
-    FontStyle, Stylesheet, TableLayout, TextAlign, TextDecoration, WhiteSpace,
+    AlignContent, AlignItems, BackgroundImage, BorderStyle, BoxShadow, BoxSides, BoxSizing, Color,
+    ComputedStyle, Dimension, Display, FlexDirection, FlexWrap, FontStyle, GridAutoFlow, GridLine,
+    GridPlacement, GridTrack, JustifyContent, Position, Stylesheet, TableLayout, TextAlign,
+    TextDecoration, WhiteSpace,
 };
 
 use crate::dom::{Dom, NodeId, NodeKind};

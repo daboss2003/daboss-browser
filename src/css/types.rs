@@ -125,6 +125,8 @@ pub enum Unit {
     In,
     Vw,
     Vh,
+    /// CSS `fr` — only meaningful as a grid track sizer.
+    Fr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,7 +155,115 @@ pub enum Display {
     Inline,
     InlineBlock,
     ListItem,
+    Flex,
+    InlineFlex,
+    Grid,
+    InlineGrid,
     None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlexDirection {
+    Row,
+    RowReverse,
+    Column,
+    ColumnReverse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlexWrap {
+    NoWrap,
+    Wrap,
+    WrapReverse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JustifyContent {
+    FlexStart,
+    FlexEnd,
+    Center,
+    SpaceBetween,
+    SpaceAround,
+    SpaceEvenly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlignItems {
+    FlexStart,
+    FlexEnd,
+    Center,
+    Stretch,
+    Baseline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Position {
+    Static,
+    Relative,
+    Absolute,
+    Fixed,
+    Sticky,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoxSizing {
+    ContentBox,
+    BorderBox,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlignContent {
+    Stretch,
+    FlexStart,
+    FlexEnd,
+    Center,
+    SpaceBetween,
+    SpaceAround,
+    SpaceEvenly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GridAutoFlow {
+    Row,
+    Column,
+    RowDense,
+    ColumnDense,
+}
+
+/// A single endpoint of a `grid-column` / `grid-row` placement.
+#[derive(Debug, Clone)]
+pub enum GridLine {
+    Auto,
+    /// 1-based line number (negatives count from the end).
+    Index(i32),
+    /// Named line / area (`grid-column: header`).
+    Name(String),
+    /// Span N tracks.
+    Span(i32),
+}
+
+/// Resolved placement for a grid item.
+#[derive(Debug, Clone, Default)]
+pub struct GridPlacement {
+    pub column_start: Option<GridLine>,
+    pub column_end: Option<GridLine>,
+    pub row_start: Option<GridLine>,
+    pub row_end: Option<GridLine>,
+    /// `grid-area: name` references a named region in
+    /// `grid-template-areas`.
+    pub area: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum GridTrack {
+    /// A fixed pixel width (also used for em-resolved lengths).
+    Px(f32),
+    /// A flexible track sized in fractional units.
+    Fr(f32),
+    /// `auto` — sized to fit its content.
+    Auto,
+    /// `<percentage>` of the container.
+    Percent(f32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,6 +395,57 @@ pub struct ComputedStyle {
     /// in the CSS sense but propagates to descendants via the paint
     /// translate stack.
     pub transform_translate: Option<(f32, f32)>,
+
+    // ----- Flexbox container properties -----
+    pub flex_direction: FlexDirection,
+    pub flex_wrap: FlexWrap,
+    pub justify_content: JustifyContent,
+    pub align_items: AlignItems,
+    /// Spacing between adjacent flex/grid items (CSS `gap`). Tuple is
+    /// `(row_gap, column_gap)`.
+    pub gap: (f32, f32),
+
+    // ----- Flex item properties -----
+    /// `flex-grow` factor (default 0).
+    pub flex_grow: f32,
+    /// `flex-shrink` factor (default 1).
+    pub flex_shrink: f32,
+    /// `flex-basis` (default `auto` → use natural content size).
+    pub flex_basis: Dimension,
+
+    /// Multi-line flex cross-axis distribution.
+    pub align_content: AlignContent,
+    /// Flex item reordering. Items are laid out in ascending order, ties
+    /// broken by DOM order. Default 0.
+    pub order: i32,
+
+    // ----- Grid container properties -----
+    pub grid_template_columns: Vec<GridTrack>,
+    pub grid_template_rows: Vec<GridTrack>,
+    /// `grid-template-areas` parsed as a row-of-rows: outer Vec is rows,
+    /// inner Vec is the named cells across that row (or `.` for empty).
+    pub grid_template_areas: Vec<Vec<String>>,
+    pub grid_auto_flow: GridAutoFlow,
+
+    // ----- Grid item properties -----
+    pub grid_placement: GridPlacement,
+
+    // ----- Positioning -----
+    pub position: Position,
+    pub top: Option<f32>,
+    pub right: Option<f32>,
+    pub bottom: Option<f32>,
+    pub left: Option<f32>,
+    /// `z-index` painting order. `None` means "auto" (default DOM order).
+    pub z_index: Option<i32>,
+
+    // ----- Sizing constraints -----
+    pub box_sizing: BoxSizing,
+    pub min_width: Option<f32>,
+    pub max_width: Option<f32>,
+    pub min_height: Option<f32>,
+    pub max_height: Option<f32>,
+
     /// Resolved custom properties (CSS variables). Inherited like color.
     pub custom_properties: HashMap<String, Value>,
 }
@@ -320,6 +481,32 @@ impl ComputedStyle {
             opacity: 1.0,
             box_shadow: None,
             transform_translate: None,
+            flex_direction: FlexDirection::Row,
+            flex_wrap: FlexWrap::NoWrap,
+            justify_content: JustifyContent::FlexStart,
+            align_items: AlignItems::Stretch,
+            gap: (0.0, 0.0),
+            flex_grow: 0.0,
+            flex_shrink: 1.0,
+            flex_basis: Dimension::Auto,
+            align_content: AlignContent::Stretch,
+            order: 0,
+            grid_template_columns: Vec::new(),
+            grid_template_rows: Vec::new(),
+            grid_template_areas: Vec::new(),
+            grid_auto_flow: GridAutoFlow::Row,
+            grid_placement: GridPlacement::default(),
+            position: Position::Static,
+            top: None,
+            right: None,
+            bottom: None,
+            left: None,
+            z_index: None,
+            box_sizing: BoxSizing::ContentBox,
+            min_width: None,
+            max_width: None,
+            min_height: None,
+            max_height: None,
             custom_properties: HashMap::new(),
         }
     }

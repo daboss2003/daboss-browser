@@ -426,6 +426,7 @@ impl<'a> Parser<'a> {
             "in" => Unit::In,
             "vw" => Unit::Vw,
             "vh" => Unit::Vh,
+            "fr" => Unit::Fr,
             _ => return Some(Value::Number(n)),
         };
         Some(Value::Length(n, unit))

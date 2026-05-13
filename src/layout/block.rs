@@ -22,7 +22,7 @@ use std::ops::Range;
 use super::replaced::{ImageCache, ImageSlot};
 use super::text::{collapse_whitespace, InlineContent, InlineSpan, TextLayout};
 use super::{BoxKind, BoxTree, LayoutBox, PseudoBox, PseudoKind, Rect};
-use crate::css::{BoxSides, ComputedStyle, Dimension, Display, StyleTree};
+use crate::css::{BoxSides, BoxSizing, ComputedStyle, Dimension, Display, Position, StyleTree};
 use crate::dom::{Dom, NodeId, NodeKind};
 
 pub fn layout(
@@ -49,13 +49,34 @@ pub fn layout(
             if style.display == Display::None {
                 return 0.0;
             }
-            if tag == "table" {
-                super::table::layout_table(
+            // Absolute / fixed elements are removed from the normal flow:
+            // lay them out in their containing block but return zero so
+            // siblings don't shift. (Toy: containing block = current
+            // containing; real CSS = nearest positioned ancestor.)
+            if matches!(style.position, Position::Absolute | Position::Fixed) {
+                layout_positioned(
                     dom, styles, text, images, node, style, containing, tree,
-                )
-            } else {
-                layout_block(dom, styles, text, images, node, style, containing, tree)
+                );
+                return 0.0;
             }
+            let h = match style.display {
+                Display::Flex | Display::InlineFlex => super::flex::layout_flex(
+                    dom, styles, text, images, node, style, containing, tree,
+                ),
+                Display::Grid | Display::InlineGrid => super::grid::layout_grid(
+                    dom, styles, text, images, node, style, containing, tree,
+                ),
+                _ if tag == "table" => super::table::layout_table(
+                    dom, styles, text, images, node, style, containing, tree,
+                ),
+                _ => layout_block(dom, styles, text, images, node, style, containing, tree),
+            };
+            // `position: relative` shifts the painted box by top/left but
+            // keeps the height it consumed in the flow.
+            if style.position == Position::Relative {
+                apply_relative_offset(node, style, tree);
+            }
+            h
         }
         NodeKind::Text(_) | NodeKind::Comment(_) | NodeKind::Doctype(_) => 0.0,
     }
@@ -88,27 +109,52 @@ fn layout_block(
     let intrinsic = intrinsic_size(dom, node, images);
 
     let cb_width = containing.width;
-    let content_width = match (style.width, intrinsic) {
-        (Dimension::Length(w), _) => w,
+    let bp_h = border.left + border.right + padding.left + padding.right;
+    let mut content_width = match (style.width, intrinsic) {
+        (Dimension::Length(w), _) => {
+            if style.box_sizing == BoxSizing::BorderBox {
+                (w - bp_h).max(0.0)
+            } else {
+                w
+            }
+        }
         (Dimension::Percent(pct), _) => {
-            (cb_width * pct / 100.0
-                - border.left
-                - border.right
-                - padding.left
-                - padding.right)
-                .max(0.0)
+            let pct_box = cb_width * pct / 100.0;
+            if style.box_sizing == BoxSizing::BorderBox {
+                (pct_box - bp_h).max(0.0)
+            } else {
+                (pct_box - bp_h).max(0.0)
+            }
         }
         // Replaced elements with `auto` width use their intrinsic width.
         (Dimension::Auto, Some((iw, _))) => iw,
         (Dimension::Auto, None) => (cb_width
             - margin.left
             - margin.right
-            - border.left
-            - border.right
-            - padding.left
-            - padding.right)
+            - bp_h)
             .max(0.0),
     };
+    // Clamp by min-width / max-width.
+    if let Some(min) = style.min_width {
+        let min_content = if style.box_sizing == BoxSizing::BorderBox {
+            (min - bp_h).max(0.0)
+        } else {
+            min
+        };
+        if content_width < min_content {
+            content_width = min_content;
+        }
+    }
+    if let Some(max) = style.max_width {
+        let max_content = if style.box_sizing == BoxSizing::BorderBox {
+            (max - bp_h).max(0.0)
+        } else {
+            max
+        };
+        if content_width > max_content {
+            content_width = max_content;
+        }
+    }
 
     let border_box_width =
         content_width + border.left + border.right + padding.left + padding.right;
@@ -224,12 +270,39 @@ fn layout_block(
 
     let computed_content_height = child_y - content_y;
 
-    let content_height = match (style.height, intrinsic) {
-        (Dimension::Length(h), _) => h,
+    let bp_v = border.top + border.bottom + padding.top + padding.bottom;
+    let mut content_height = match (style.height, intrinsic) {
+        (Dimension::Length(h), _) => {
+            if style.box_sizing == BoxSizing::BorderBox {
+                (h - bp_v).max(0.0)
+            } else {
+                h
+            }
+        }
         // Replaced element with `auto` height: use intrinsic height.
         (Dimension::Auto, Some((_, ih))) => ih,
         (Dimension::Percent(_), _) | (Dimension::Auto, None) => computed_content_height,
     };
+    if let Some(min) = style.min_height {
+        let min_h = if style.box_sizing == BoxSizing::BorderBox {
+            (min - bp_v).max(0.0)
+        } else {
+            min
+        };
+        if content_height < min_h {
+            content_height = min_h;
+        }
+    }
+    if let Some(max) = style.max_height {
+        let max_h = if style.box_sizing == BoxSizing::BorderBox {
+            (max - bp_v).max(0.0)
+        } else {
+            max
+        };
+        if content_height > max_h {
+            content_height = max_h;
+        }
+    }
     let border_box_height =
         content_height + border.top + border.bottom + padding.top + padding.bottom;
 
@@ -240,8 +313,8 @@ fn layout_block(
         height: border_box_height,
     };
     let kind = match style.display {
-        Display::Block | Display::ListItem => BoxKind::Block,
-        Display::InlineBlock => BoxKind::InlineBlock,
+        Display::Block | Display::ListItem | Display::Flex | Display::Grid => BoxKind::Block,
+        Display::InlineBlock | Display::InlineFlex | Display::InlineGrid => BoxKind::InlineBlock,
         Display::Inline => BoxKind::Inline,
         Display::None => unreachable!(),
     };
@@ -290,9 +363,15 @@ fn classify(dom: &Dom, styles: &StyleTree, child: NodeId) -> ChildClass {
                 "img" | "iframe" | "video" | "canvas"
             );
             match styles.get(child).display {
-                Display::Block | Display::ListItem => ChildClass::Block,
+                Display::Block
+                | Display::ListItem
+                | Display::Flex
+                | Display::Grid => ChildClass::Block,
                 Display::InlineBlock if is_replaced => ChildClass::Block,
-                Display::Inline | Display::InlineBlock => ChildClass::Inline,
+                Display::Inline
+                | Display::InlineBlock
+                | Display::InlineFlex
+                | Display::InlineGrid => ChildClass::Inline,
                 Display::None => ChildClass::Skip,
             }
         }
@@ -518,6 +597,98 @@ fn layout_pseudo(
         },
     );
     line_height
+}
+
+/// Lay out an absolutely-positioned (or fixed) element. The element doesn't
+/// participate in normal-flow height. We still run block/flex/grid layout
+/// inside the same containing rect, then offset the element's box by
+/// `top` / `left` (or `right` / `bottom`, inferred from the container's
+/// edge).
+fn layout_positioned(
+    dom: &Dom,
+    styles: &StyleTree,
+    text: &mut TextLayout,
+    images: &ImageCache,
+    node: NodeId,
+    style: &ComputedStyle,
+    containing: Rect,
+    tree: &mut BoxTree,
+) {
+    // Tentative layout inside the same containing rect.
+    let _ = match style.display {
+        Display::Flex | Display::InlineFlex => super::flex::layout_flex(
+            dom, styles, text, images, node, style, containing, tree,
+        ),
+        Display::Grid | Display::InlineGrid => super::grid::layout_grid(
+            dom, styles, text, images, node, style, containing, tree,
+        ),
+        _ => layout_block(dom, styles, text, images, node, style, containing, tree),
+    };
+
+    // Determine offsets. `top` wins over `bottom`; `left` wins over `right`.
+    let cur = tree.boxes[node.index()].as_ref().cloned();
+    let Some(b) = cur else {
+        return;
+    };
+    let target_left = if let Some(left) = style.left {
+        containing.x + left
+    } else if let Some(right) = style.right {
+        containing.x + containing.width - b.rect.width - right
+    } else {
+        b.rect.x
+    };
+    let target_top = if let Some(top) = style.top {
+        containing.y + top
+    } else if let Some(bot) = style.bottom {
+        // Without a known containing height we just keep the natural y.
+        if containing.height > 0.0 {
+            containing.y + containing.height - b.rect.height - bot
+        } else {
+            b.rect.y
+        }
+    } else {
+        b.rect.y
+    };
+    let dx = target_left - b.rect.x;
+    let dy = target_top - b.rect.y;
+    if dx.abs() > 0.001 || dy.abs() > 0.001 {
+        shift_subtree(dom, node, dx, dy, tree);
+    }
+}
+
+/// `position: relative` shifts the element's painted box (and its descendant
+/// boxes) by `top` / `left` / `bottom` / `right` while leaving the
+/// reserved-flow space unchanged. We just translate the subtree.
+fn apply_relative_offset(node: NodeId, style: &ComputedStyle, tree: &mut BoxTree) {
+    let dx = style
+        .left
+        .or_else(|| style.right.map(|r| -r))
+        .unwrap_or(0.0);
+    let dy = style
+        .top
+        .or_else(|| style.bottom.map(|b| -b))
+        .unwrap_or(0.0);
+    if dx.abs() < 0.001 && dy.abs() < 0.001 {
+        return;
+    }
+    if let Some(b) = tree.boxes[node.index()].as_mut() {
+        b.rect.x += dx;
+        b.rect.y += dy;
+    }
+    // Don't shift descendants — `relative` only nudges the element itself;
+    // its content moves with it implicitly because content was laid out
+    // inside this rect. Toy compromise: only shift the box.
+}
+
+fn shift_subtree(dom: &Dom, node: NodeId, dx: f32, dy: f32, tree: &mut BoxTree) {
+    if let Some(b) = tree.boxes.get_mut(node.index()).and_then(|s| s.as_mut()) {
+        b.rect.x += dx;
+        b.rect.y += dy;
+    }
+    let kids: Vec<NodeId> = dom.children(node).collect();
+    for c in kids {
+        shift_subtree(dom, c, dx, dy, tree);
+    }
 }
 
 fn union(a: Rect, b: Rect) -> Rect {

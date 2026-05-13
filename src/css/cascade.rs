@@ -611,6 +611,10 @@ fn font_size_from(v: &Value, em_base: f32) -> Option<f32> {
 fn length_to_px(v: &Value, em_base: f32, parent: Option<&ComputedStyle>) -> Option<f32> {
     let root_em = parent.map(|p| p.font_size).unwrap_or(ComputedStyle::ROOT_FONT_SIZE);
     match v {
+        // vw/vh need viewport size, which we don't have at cascade time — defer
+        // to layout. Returning None makes dimension_from fall through to Auto,
+        // which then resolves naturally against the containing block.
+        Value::Length(_, Unit::Vw | Unit::Vh) => None,
         Value::Length(n, u) => Some(length_n_unit_to_px(*n, *u, em_base, root_em)),
         Value::Number(0.0) => Some(0.0),
         Value::Percentage(_) => None,

@@ -3,6 +3,7 @@
 mod css;
 mod dom;
 mod html;
+mod layout;
 mod net;
 
 use std::num::NonZeroU32;
@@ -119,7 +120,17 @@ fn run_fetch(url_str: &str) -> Result<(), net::Error> {
         external_count
     );
 
-    dom.print();
+    let viewport = layout::Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 1024.0,
+        height: 768.0,
+    };
+    let box_tree = layout::layout(&dom, &style_tree, viewport);
+    let total_boxes = box_tree.boxes.iter().filter(|b| b.is_some()).count();
+    eprintln!("[phase 4a] laid out {total_boxes} boxes for a {}x{} viewport", viewport.width as i32, viewport.height as i32);
+
+    box_tree.print(&dom);
     Ok(())
 }
 

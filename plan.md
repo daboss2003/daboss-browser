@@ -238,15 +238,24 @@ Each phase ends with a demoable artifact and a website that should "work" at tha
 
 **Reference:** [html.spec.whatwg.org/#tokenization](https://html.spec.whatwg.org/multipage/parsing.html#tokenization). Read, do not implement verbatim.
 
-### Phase 3 — CSS parsing + cascade (1–2 weeks)
+### Phase 3 — CSS parsing + cascade (2–3 weeks)
 
 - Tokenize CSS (similar state machine, simpler than HTML)
 - Parse rules into `Selector { ... } -> Declarations { ... }`
-- Match selectors against DOM nodes. Support: tag (`div`), class (`.foo`), id (`#bar`), descendant (`a b`), child (`a > b`). Skip pseudo-classes except `:hover` (later).
-- Compute specificity, apply cascade, inherit, resolve to a computed style per node
+- Match selectors against DOM nodes. Support:
+  - **Simple selectors:** tag (`div`), class (`.foo`), id (`#bar`), universal (`*`)
+  - **Attribute selectors:** `[name]`, `[name=value]`, `~=`, `|=`, `^=`, `$=`, `*=`
+  - **Combinators:** descendant (`a b`), child (`a > b`), adjacent sibling (`a + b`), general sibling (`a ~ b`)
+  - **Pseudo-classes:** parse all, match only stateless ones (`:root`, `:first-child`, `:last-child`). Stateful ones (`:hover`, `:focus`, etc.) are stored but match nothing until Phase 6.
+  - **Pseudo-elements:** parse `::before`, `::after`, `::first-line`, etc. — stored, but don't apply to real DOM nodes until Phase 4 generates content boxes.
+- Compute specificity (id, class+attr+pseudo-class, tag), apply cascade, inherit
+- **CSS variables:** `--foo: value` declarations stored per-element, inherited like color. `var(--foo, fallback)` resolved at apply time. Two-pass apply (custom props first, then normal) so out-of-order works.
+- **`calc()`:** full `+ - * /` expression parser with precedence and parens. Absolute lengths evaluate at cascade time; percentages and `vw`/`vh` defer to layout.
+- **`background` shorthand:** extracts color (image / position / repeat reserved for Phase 5 paint).
+- **External stylesheets:** `<link rel="stylesheet" href="...">` discovered in source order and fetched through the same SSRF-hardened client. Cap of 30 per page.
 - Build a parallel "styled tree" indexed by NodeId
 
-**Outcome:** every DOM element has a `ComputedStyle` with color, font-size, display, margins, padding, etc.
+**Outcome:** every DOM element has a `ComputedStyle` with color, font-size, display, margins, padding, etc. Real-world pages with external CSS and CSS variables get correctly cascaded.
 
 ### Phase 4 — Layout (2–3 weeks, the hardest phase)
 
@@ -460,8 +469,8 @@ daboss_browser/
 |---|---|
 | 0–1 Setup + network | 1 |
 | 2 HTML parsing (incl. table/iframe/form/img elements) | 2 |
-| 3 CSS + cascade | 2 |
-| 4 Layout (block + inline + replaced + tables) | 4 |
+| 3 CSS + cascade (incl. variables, calc, attribute selectors, external stylesheets) | 3 |
+| 4 Layout (block + inline + replaced + tables + pseudo-elements) | 4 |
 | 5 Paint (incl. image decoding) | 1.5 |
 | 6 Interaction (incl. forms + iframe nested docs) | 2 |
 | 6.5 WebSocket | 1 |
@@ -469,7 +478,7 @@ daboss_browser/
 | 8 Chrome | 1 |
 | 9 Ad blocker | <1 |
 
-**v1 total: ~17 weeks part-time** to a thing you can browse Wikipedia with, fill forms, block ads in, render iframes, and demo to friends. Full-time: 4–5 weeks.
+**v1 total: ~18 weeks part-time** to a thing you can browse Wikipedia with, fill forms, block ads in, render iframes, and demo to friends. Full-time: 4–5 weeks.
 
 **Post-v1, only after v1 ships:**
 

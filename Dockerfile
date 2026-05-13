@@ -13,6 +13,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Run as a non-root user. UID 1000 lines up with Docker Desktop's host bind-mount mapping
 # on macOS, so files we create in /workspace are readable from the host without chown.
 RUN useradd -m -u 1000 -s /bin/bash daboss
+
+# Pre-create the workspace and the target/ subdir as daboss-owned so the docker-compose
+# named volumes (target-cache, cargo-cache) inherit the right ownership on first use.
+# Without this, /workspace/target gets created as root:root when the volume initializes.
+RUN mkdir -p /workspace/target && chown -R daboss:daboss /workspace
+
 USER daboss
 
 # Cargo + rustup go in the user's home, which we mount as a named volume so deps cache

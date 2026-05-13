@@ -23,6 +23,7 @@ pub struct Node {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Comment payload preserved for phase-7 JS DOM access
 pub enum NodeKind {
     Document,
     Element {
@@ -134,44 +135,6 @@ impl Dom {
             next: self.node(parent).first_child,
         }
     }
-
-    pub fn print(&self) {
-        self.print_node(self.document, 0);
-    }
-
-    fn print_node(&self, id: NodeId, depth: usize) {
-        let node = self.node(id);
-        let indent = "  ".repeat(depth);
-        match &node.kind {
-            NodeKind::Document => println!("{indent}#document"),
-            NodeKind::Element { tag, attrs } => {
-                let mut attr_str = String::new();
-                for (k, v) in attrs {
-                    attr_str.push(' ');
-                    attr_str.push_str(k);
-                    attr_str.push('=');
-                    attr_str.push_str(&format!("{v:?}"));
-                }
-                println!("{indent}<{tag}{attr_str}>");
-            }
-            NodeKind::Text(s) => {
-                let trimmed = s.trim();
-                if !trimmed.is_empty() {
-                    println!("{indent}\"{}\"", truncate(trimmed, 80));
-                }
-            }
-            NodeKind::Comment(s) => {
-                println!("{indent}<!--{}-->", truncate(s, 80));
-            }
-            NodeKind::Doctype(s) => {
-                println!("{indent}<!DOCTYPE {s}>");
-            }
-        }
-        let kids: Vec<NodeId> = self.children(id).collect();
-        for child in kids {
-            self.print_node(child, depth + 1);
-        }
-    }
 }
 
 pub struct Children<'a> {
@@ -186,18 +149,6 @@ impl Iterator for Children<'_> {
         self.next = self.dom.node(current).next_sibling;
         Some(current)
     }
-}
-
-fn truncate(s: &str, max_chars: usize) -> String {
-    let mut out = String::new();
-    for (i, c) in s.chars().enumerate() {
-        if i >= max_chars {
-            out.push('…');
-            break;
-        }
-        out.push(c);
-    }
-    out
 }
 
 #[cfg(test)]

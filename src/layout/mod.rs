@@ -8,9 +8,11 @@
 //! shaping and line boxes. Text nodes get a single-line height for now.
 
 mod block;
+mod text;
 
 use crate::css::{BoxSides, StyleTree};
 use crate::dom::{Dom, NodeId, NodeKind};
+use text::TextLayout;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Rect {
@@ -31,6 +33,7 @@ pub enum BoxKind {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // kind / padding / border / margin consumed by paint in phase 5
 pub struct LayoutBox {
     pub kind: BoxKind,
     /// Border-box: outer edge of border on each side. Content rect is `rect`
@@ -42,6 +45,7 @@ pub struct LayoutBox {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // viewport consumed by paint scrolling / scale in phase 5
 pub struct BoxTree {
     pub boxes: Vec<Option<LayoutBox>>, // indexed by NodeId.index()
     pub viewport: Rect,
@@ -107,6 +111,7 @@ pub fn layout(dom: &Dom, styles: &StyleTree, viewport: Rect) -> BoxTree {
         boxes: vec![None; styles.styles.len()],
         viewport,
     };
-    block::layout(dom, styles, dom.document(), viewport, &mut tree);
+    let mut text = TextLayout::new();
+    block::layout(dom, styles, &mut text, dom.document(), viewport, &mut tree);
     tree
 }

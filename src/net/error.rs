@@ -16,6 +16,8 @@ pub enum Error {
     BadResponse(String),
     ResponseTooLarge(usize),
     TooManyRedirects(u32),
+    /// The request's hostname was on the bundled adblock blocklist.
+    Blocked(String),
 }
 
 impl fmt::Display for Error {
@@ -36,6 +38,7 @@ impl fmt::Display for Error {
             Self::BadResponse(s) => write!(f, "malformed http response: {s}"),
             Self::ResponseTooLarge(limit) => write!(f, "response exceeded {limit}-byte cap"),
             Self::TooManyRedirects(limit) => write!(f, "exceeded {limit} redirect hops"),
+            Self::Blocked(host) => write!(f, "request to {host} blocked by adblock"),
         }
     }
 }

@@ -1,9 +1,11 @@
+mod adblock;
 mod cookies;
 mod dns;
 mod error;
 mod http;
 mod transport;
 
+pub use self::adblock::Blocklist;
 pub use self::cookies::CookieJar;
 #[allow(unused_imports)] // re-exported for future tab-scoped storage hooks
 pub use self::cookies::Cookie;
@@ -28,6 +30,9 @@ pub struct Client {
     /// the network code stays single-threaded but multiple high-level
     /// callers can share one `Client` instance.
     cookies: RefCell<CookieJar>,
+    /// Hostname blocker — short-circuits ad/tracker requests before any
+    /// DNS or TCP work. Set via [`Client::with_blocklist`].
+    blocklist: Blocklist,
 }
 
 impl Default for Client {
@@ -46,11 +51,19 @@ impl Client {
             max_redirects: 10,
             allow_loopback: false,
             cookies: RefCell::new(CookieJar::new()),
+            blocklist: Blocklist::default_bundled(),
         }
     }
 
     pub fn with_allow_loopback(mut self, allow: bool) -> Self {
         self.allow_loopback = allow;
+        self
+    }
+
+    /// Swap in a different blocklist (e.g. an empty one for tests).
+    #[allow(dead_code)]
+    pub fn with_blocklist(mut self, bl: Blocklist) -> Self {
+        self.blocklist = bl;
         self
     }
 
@@ -74,6 +87,13 @@ impl Client {
     fn do_request(&self, url: Url, method: Method, depth: u32) -> Result<Response> {
         if depth >= self.max_redirects {
             return Err(Error::TooManyRedirects(self.max_redirects));
+        }
+
+        // Hostname-based ad blocker — short-circuit before any DNS /
+        // TCP work for entries on the bundled blocklist.
+        if self.blocklist.is_blocked(&url) {
+            tracing::info!(%url, "blocked by adblock");
+            return Err(Error::Blocked(url.host_str().unwrap_or("").to_string()));
         }
 
         let use_tls = match url.scheme() {

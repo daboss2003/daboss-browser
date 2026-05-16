@@ -79,6 +79,7 @@ impl Blocklist {
         }
     }
 
+    #[allow(dead_code)] // exposed for future user-toggle / tests
     pub fn disabled() -> Self {
         Self {
             hosts: HashSet::new(),

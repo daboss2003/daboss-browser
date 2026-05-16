@@ -4,14 +4,14 @@ mod cascade;
 mod parser;
 mod types;
 
-pub use cascade::{InteractionState, StyleTree};
-pub use parser::parse;
+pub use cascade::{selector_matches, InteractionState, StyleTree};
+pub use parser::{parse, parse_selector_list_str};
 #[allow(unused_imports)]
 pub use types::{
     AlignContent, AlignItems, BackgroundImage, BorderStyle, BoxShadow, BoxSides, BoxSizing, Color,
     ComputedStyle, Dimension, Display, FlexDirection, FlexWrap, FontStyle, GridAutoFlow, GridLine,
-    GridPlacement, GridTrack, JustifyContent, Position, Stylesheet, TableLayout, TextAlign,
-    TextDecoration, WhiteSpace,
+    GridPlacement, GridTrack, JustifyContent, Position, Selector, Stylesheet, TableLayout,
+    TextAlign, TextDecoration, WhiteSpace,
 };
 
 use crate::dom::{Dom, NodeId, NodeKind};

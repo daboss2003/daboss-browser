@@ -2,7 +2,13 @@
 version = 2
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-ignore = []
+ignore = [
+    # paste 1.0.15 is unmaintained (not vulnerable). Pulled in transitively by
+    # boa_engine through boa_ast/boa_string. boa is the only pure-Rust JS engine
+    # we can use, so we accept the dep until boa's maintainers migrate to
+    # pastey or with_builtin_macros.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 version = 2

@@ -10,6 +10,12 @@ impl NodeId {
     pub const fn index(self) -> usize {
         self.0 as usize
     }
+
+    /// Reconstruct a `NodeId` from its raw index. Used by the JS subsystem
+    /// to round-trip ids that have crossed into JS land as integers.
+    pub const fn from_raw(i: u32) -> Self {
+        NodeId(i)
+    }
 }
 
 #[derive(Debug)]
@@ -135,6 +141,55 @@ impl Dom {
             next: self.node(parent).first_child,
         }
     }
+
+    /// Total number of arena slots (including detached ones). Used by
+    /// the JS engine as a cheap "anything got allocated" signal.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Set an attribute on an element, overwriting any existing value with
+    /// the same name. No-op for non-element nodes. Used by the JS DOM
+    /// bindings (`element.setAttribute`, `element.className = ...`).
+    pub fn set_attribute(&mut self, node: NodeId, name: &str, value: String) {
+        if let NodeKind::Element { attrs, .. } = &mut self.node_mut(node).kind {
+            if let Some(slot) = attrs.iter_mut().find(|(k, _)| k == name) {
+                slot.1 = value;
+            } else {
+                attrs.push((name.to_string(), value));
+            }
+        }
+    }
+
+    /// Remove the named attribute from an element. No-op for non-elements
+    /// or missing attributes.
+    pub fn remove_attribute(&mut self, node: NodeId, name: &str) {
+        if let NodeKind::Element { attrs, .. } = &mut self.node_mut(node).kind {
+            attrs.retain(|(k, _)| k != name);
+        }
+    }
+
+    /// Detach every child of `parent` and replace them with a single text
+    /// node containing `text`. Equivalent to setting `textContent` on an
+    /// element in the web platform.
+    pub fn set_text_content(&mut self, parent: NodeId, text: String) {
+        // Walk all current children and unlink them (we leave their slots
+        // in `nodes` — the arena is append-only by design — but break the
+        // parent/sibling pointers so they're unreachable from the tree).
+        let kids: Vec<NodeId> = self.children(parent).collect();
+        for k in kids {
+            self.node_mut(k).parent = None;
+            self.node_mut(k).prev_sibling = None;
+            self.node_mut(k).next_sibling = None;
+        }
+        self.node_mut(parent).first_child = None;
+        self.node_mut(parent).last_child = None;
+
+        if !text.is_empty() {
+            let text_id = self.alloc(NodeKind::Text(text));
+            self.append_child(parent, text_id);
+        }
+    }
 }
 
 pub struct Children<'a> {
@@ -174,6 +229,64 @@ mod tests {
         dom.append_child(doc, c);
         let kids: Vec<NodeId> = dom.children(doc).collect();
         assert_eq!(kids, vec![a, b, c]);
+    }
+
+    #[test]
+    fn set_attribute_overwrites_existing_value() {
+        let mut dom = Dom::new();
+        let e = dom.create_element("div", vec![("id".into(), "old".into())]);
+        dom.set_attribute(e, "id", "new".into());
+        if let NodeKind::Element { attrs, .. } = &dom.node(e).kind {
+            assert_eq!(attrs.iter().find(|(k, _)| k == "id").unwrap().1, "new");
+            assert_eq!(attrs.len(), 1);
+        } else {
+            panic!("not an element");
+        }
+    }
+
+    #[test]
+    fn set_attribute_appends_when_missing() {
+        let mut dom = Dom::new();
+        let e = dom.create_element("div", vec![]);
+        dom.set_attribute(e, "data-x", "1".into());
+        if let NodeKind::Element { attrs, .. } = &dom.node(e).kind {
+            assert_eq!(attrs[0].0, "data-x");
+            assert_eq!(attrs[0].1, "1");
+        } else {
+            panic!("not an element");
+        }
+    }
+
+    #[test]
+    fn remove_attribute_works() {
+        let mut dom = Dom::new();
+        let e = dom.create_element("div", vec![("id".into(), "x".into())]);
+        dom.remove_attribute(e, "id");
+        if let NodeKind::Element { attrs, .. } = &dom.node(e).kind {
+            assert!(attrs.is_empty());
+        }
+    }
+
+    #[test]
+    fn set_text_content_replaces_children() {
+        let mut dom = Dom::new();
+        let doc = dom.document();
+        let div = dom.create_element("div", vec![]);
+        dom.append_child(doc, div);
+        let old = dom.create_text("old");
+        dom.append_child(div, old);
+
+        dom.set_text_content(div, "new".into());
+
+        let kids: Vec<NodeId> = dom.children(div).collect();
+        assert_eq!(kids.len(), 1);
+        if let NodeKind::Text(t) = &dom.node(kids[0]).kind {
+            assert_eq!(t, "new");
+        } else {
+            panic!("expected text node");
+        }
+        // The old text node is detached, not in the tree any more.
+        assert_eq!(dom.node(old).parent, None);
     }
 
     #[test]

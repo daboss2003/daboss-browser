@@ -20,6 +20,16 @@ pub fn parse_inline_declarations(input: &str) -> Vec<Declaration> {
     p.parse_declarations()
 }
 
+/// Parse a standalone selector list (e.g. `"div.foo, p#bar"`) — used by the
+/// JS subsystem to back `document.querySelector` / `querySelectorAll`.
+/// Returns `None` if the input doesn't contain a single valid selector.
+pub fn parse_selector_list_str(input: &str) -> Option<Vec<Selector>> {
+    let mut p = Parser::new(input);
+    let sels = p.parse_selector_list()?;
+    // Ignore trailing junk — the caller passes a selector string, not a rule.
+    Some(sels)
+}
+
 pub struct Parser<'a> {
     input: &'a str,
     pos: usize,

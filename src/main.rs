@@ -3,6 +3,7 @@
 mod css;
 mod dom;
 mod html;
+mod js;
 mod layout;
 mod net;
 mod paint;
@@ -74,7 +75,10 @@ fn run_png_export(url_str: &str) -> Result<(), net::Error> {
     let response = client.get(url_str)?;
     eprintln!("HTTP/1.1 {} {}", response.status, response.reason);
     let body = String::from_utf8_lossy(&response.body);
-    let dom = html::parse(&body);
+    let mut dom = html::parse(&body);
+    // We don't keep the engine for headless PNG export — no clicks land
+    // here, so addEventListener-registered handlers couldn't fire anyway.
+    let _engine = js::run_inline_scripts(&mut dom);
 
     let mut sheets: Vec<css::Stylesheet> = Vec::new();
     let mut ext_count = 0usize;
@@ -172,18 +176,24 @@ struct Page {
     inputs: std::collections::HashMap<dom::NodeId, String>,
     /// Rendered iframe contents, keyed by the iframe's NodeId in this page.
     iframes: std::collections::HashMap<dom::NodeId, IframeContent>,
+    /// Page-scoped JS context. Owns the long-lived `boa::Context` plus the
+    /// addEventListener registry, so click handlers registered by inline
+    /// scripts can fire on subsequent user input.
+    js: js::JsEngine,
 }
 
 /// A nested document loaded inside an `<iframe>`. We render it like a real
 /// page (own DOM, styles, layout, paint) into a small pixmap sized to the
-/// iframe's content box, then composite into the parent.
+/// iframe's content box, then composite into the parent. The DOM and box
+/// tree stay on this struct so clicks landing inside the iframe can be
+/// hit-tested against its own layout (Phase 6e click-to-navigate).
 struct IframeContent {
-    #[allow(dead_code)] // url retained for future click-to-navigate inside iframe
     url: url::Url,
+    dom: dom::Dom,
+    box_tree: layout::BoxTree,
     pixmap: Pixmap,
     /// True if the iframe element carried a `sandbox` attribute. Toy
-    /// behaviour: skip form submissions originating from inside it.
-    #[allow(dead_code)]
+    /// behaviour: block click-to-navigate when set.
     sandbox: bool,
 }
 
@@ -197,7 +207,7 @@ struct Browser {
     /// URL to load on first frame.
     pending_url: Option<String>,
 
-    client: net::Client,
+    client: Rc<net::Client>,
 
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
@@ -231,7 +241,7 @@ impl Browser {
         let allow_loopback = std::env::var("DABOSS_ALLOW_LOOPBACK").is_ok();
         Self {
             pending_url: initial_url.clone(),
-            client: net::Client::new().with_allow_loopback(allow_loopback),
+            client: Rc::new(net::Client::new().with_allow_loopback(allow_loopback)),
             window: None,
             surface: None,
             viewport_size: (1024, 768),
@@ -276,7 +286,18 @@ impl Browser {
             eprintln!("[nav] HTTP {}", response.status);
         }
         let body = String::from_utf8_lossy(&response.body).into_owned();
-        let dom = html::parse(&body);
+        let mut dom = html::parse(&body);
+
+        // Phase 7a/b/c/e: spin up a JS engine for the page and run its
+        // inline `<script>` content. The engine persists on `Page` so
+        // event handlers registered via `addEventListener` can fire on
+        // later clicks, and `fetch` is wired to the same SSRF-guarded
+        // client that powers page navigation.
+        let js_engine = js::JsEngine::with_fetch(
+            &mut dom,
+            Some(self.client.clone()),
+            Some(parsed.clone()),
+        );
 
         // External stylesheets (with size cap)
         let mut sheets: Vec<css::Stylesheet> = Vec::new();
@@ -381,6 +402,7 @@ impl Browser {
             focus: None,
             inputs,
             iframes,
+            js: js_engine,
         });
         self.scroll_y = 0.0;
 
@@ -490,6 +512,31 @@ impl Browser {
             }
         }
 
+        // Hit-test first so we know which element to fire JS at.
+        let hit_node: dom::NodeId = {
+            let Some(page) = &self.page else {
+                return;
+            };
+            let abs_y = page_y + self.scroll_y;
+            match layout::hit_test(&page.dom, &page.box_tree, x, abs_y) {
+                Some(n) => n,
+                None => return,
+            }
+        };
+
+        // Dispatch JS click before any built-in handling so scripts get a
+        // chance to `preventDefault()` (e.g., custom anchor handling).
+        let js_result = {
+            let Some(page) = self.page.as_mut() else {
+                return;
+            };
+            page.js
+                .dispatch_event(&mut page.dom, "click", hit_node)
+        };
+        if js_result.mutated {
+            self.recascade_and_paint();
+        }
+
         // Walk up the hit-tested node looking for: <a href> (navigate),
         // submit-type input/button (submit form), or focusable element
         // (input/textarea/select/button → focus).
@@ -499,15 +546,14 @@ impl Browser {
             Submit(dom::NodeId),
             Focus(dom::NodeId),
         }
-        let action = {
+        let action = if js_result.default_prevented {
+            // Script handled it — skip built-in behaviour entirely.
+            Action::None
+        } else {
             let Some(page) = &self.page else {
                 return;
             };
-            let abs_y = page_y + self.scroll_y;
-            let hit = match layout::hit_test(&page.dom, &page.box_tree, x, abs_y) {
-                Some(n) => n,
-                None => return,
-            };
+            let hit = hit_node;
 
             let mut cur = Some(hit);
             let mut chosen = Action::None;
@@ -1189,6 +1235,8 @@ fn load_iframe_document(
     eprintln!("[iframe] rendered {url_str} → {width}x{height}");
     Some(IframeContent {
         url: abs,
+        dom,
+        box_tree,
         pixmap,
         sandbox,
     })
@@ -1676,6 +1724,34 @@ impl ApplicationHandler for Browser {
             } => self.handle_key(logical_key, text),
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
+        }
+    }
+
+    /// Called whenever the event loop is about to wait. We use it to fire
+    /// any JS timers that have come due, and to set winit's control flow
+    /// so we wake up at the next pending timer's fire time (or wait
+    /// indefinitely if none are queued).
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.pump_js_timers();
+        let next = self
+            .page
+            .as_ref()
+            .and_then(|p| p.js.next_timer_at());
+        match next {
+            Some(at) => event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(at)),
+            None => event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait),
+        }
+    }
+}
+
+impl Browser {
+    fn pump_js_timers(&mut self) {
+        let Some(page) = self.page.as_mut() else {
+            return;
+        };
+        let r = page.js.pump_timers(&mut page.dom);
+        if r.mutated {
+            self.recascade_and_paint();
         }
     }
 }

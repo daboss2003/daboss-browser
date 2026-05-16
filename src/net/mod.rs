@@ -1,11 +1,16 @@
+mod cookies;
 mod dns;
 mod error;
 mod http;
 mod transport;
 
+pub use self::cookies::CookieJar;
+#[allow(unused_imports)] // re-exported for future tab-scoped storage hooks
+pub use self::cookies::Cookie;
 pub use self::error::{Error, Result};
 pub use self::http::{Request, Response};
 
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,6 +24,10 @@ pub struct Client {
     connect_timeout: Duration,
     max_redirects: u32,
     allow_loopback: bool,
+    /// Shared cookie jar for this user agent. Mutated under `RefCell` so
+    /// the network code stays single-threaded but multiple high-level
+    /// callers can share one `Client` instance.
+    cookies: RefCell<CookieJar>,
 }
 
 impl Default for Client {
@@ -36,6 +45,7 @@ impl Client {
             connect_timeout: Duration::from_secs(10),
             max_redirects: 10,
             allow_loopback: false,
+            cookies: RefCell::new(CookieJar::new()),
         }
     }
 
@@ -95,15 +105,32 @@ impl Client {
         )?;
 
         let path = build_path(&url);
-        let request = match &method {
+        let mut request = match &method {
             Method::Get => Request::get(&host, &path),
             Method::Post { body, content_type } => {
                 Request::post(&host, &path, body.clone(), content_type)
             }
         };
+        // Attach any matching cookies from the jar.
+        if let Some(cookie_header) = self.cookies.borrow().header_for(&url) {
+            request
+                .headers
+                .push(("Cookie".to_string(), cookie_header));
+        }
         request.write_to(&mut conn)?;
 
         let response = Response::read_from(conn, self.max_response_bytes)?;
+
+        // Ingest any Set-Cookie headers before deciding whether to follow
+        // a redirect — the spec scopes Set-Cookie to the redirect's
+        // *origin* (the response we just got).
+        {
+            let iter = response
+                .headers
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()));
+            self.cookies.borrow_mut().ingest_set_cookies(&url, iter);
+        }
 
         if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
             if let Some(location) = response.header("Location") {

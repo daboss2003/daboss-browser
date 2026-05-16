@@ -524,6 +524,15 @@ impl Browser {
             }
         };
 
+        // If the click landed inside an `<iframe>` element, give the
+        // iframe's own DOM a chance to handle it (typically a link
+        // navigation that should re-load just that iframe). Returns true
+        // when the iframe consumed the click — in that case we skip the
+        // parent's built-in handlers + JS dispatch entirely.
+        if self.try_handle_iframe_click(hit_node, x, page_y) {
+            return;
+        }
+
         // Dispatch JS click before any built-in handling so scripts get a
         // chance to `preventDefault()` (e.g., custom anchor handling).
         let js_result = {
@@ -952,6 +961,23 @@ fn chain_of(dom: &dom::Dom, node: Option<dom::NodeId>) -> Vec<dom::NodeId> {
         cur = dom.node(n).parent;
     }
     out
+}
+
+/// Walk from `node` up through its ancestors looking for an element
+/// whose tag matches `tag_name`. Returns the matching ancestor (or
+/// `node` itself if it qualifies). Used by click handling to decide
+/// whether the click landed inside an `<iframe>` element.
+fn ancestor_with_tag(dom: &dom::Dom, node: dom::NodeId, tag_name: &str) -> Option<dom::NodeId> {
+    let mut cur = Some(node);
+    while let Some(n) = cur {
+        if let dom::NodeKind::Element { tag, .. } = &dom.node(n).kind {
+            if tag == tag_name {
+                return Some(n);
+            }
+        }
+        cur = dom.node(n).parent;
+    }
+    None
 }
 
 fn attr_value<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -1745,6 +1771,123 @@ impl ApplicationHandler for Browser {
 }
 
 impl Browser {
+    /// If `hit_node` is (or is inside) an `<iframe>`, hit-test the click
+    /// against the iframe's own box tree and re-render it in place when
+    /// the click resolves to a link. Returns true if the iframe consumed
+    /// the click.
+    fn try_handle_iframe_click(&mut self, hit_node: dom::NodeId, x: f32, page_y: f32) -> bool {
+        let iframe_node = {
+            let Some(page) = &self.page else {
+                return false;
+            };
+            ancestor_with_tag(&page.dom, hit_node, "iframe")
+        };
+        let Some(iframe_node) = iframe_node else {
+            return false;
+        };
+
+        // Compute (local_x, local_y) relative to the iframe's content
+        // box, and look up the iframe's own DOM/box_tree.
+        let (local_x, local_y, dest_url, sandbox) = {
+            let Some(page) = &self.page else {
+                return false;
+            };
+            let Some(b) = page.box_tree.get(iframe_node) else {
+                return false;
+            };
+            // page_y already includes the chrome offset removed; scroll_y
+            // is the parent's scroll. The iframe's pixmap is composited
+            // at (b.rect.x, b.rect.y) in parent coords, so the click's
+            // iframe-local coords are:
+            let abs_y = page_y + self.scroll_y;
+            let local_x = x - b.rect.x;
+            let local_y = abs_y - b.rect.y;
+            if local_x < 0.0 || local_y < 0.0 {
+                return false;
+            }
+
+            let Some(iframe) = page.iframes.get(&iframe_node) else {
+                return false;
+            };
+            if local_x > b.rect.width || local_y > b.rect.height {
+                return false;
+            }
+
+            // Hit-test inside the iframe's own layout.
+            let Some(inner_hit) =
+                layout::hit_test(&iframe.dom, &iframe.box_tree, local_x, local_y)
+            else {
+                return false;
+            };
+
+            // Walk up looking for <a href>.
+            let mut cur = Some(inner_hit);
+            let mut found: Option<url::Url> = None;
+            while let Some(n) = cur {
+                if let dom::NodeKind::Element { tag, attrs } = &iframe.dom.node(n).kind {
+                    if tag == "a" {
+                        if let Some((_, h)) = attrs.iter().find(|(k, _)| k == "href") {
+                            if let Ok(abs) = iframe.url.join(h) {
+                                found = Some(abs);
+                                break;
+                            }
+                        }
+                    }
+                }
+                cur = iframe.dom.node(n).parent;
+            }
+            (local_x, local_y, found, iframe.sandbox)
+        };
+        let _ = (local_x, local_y); // computed for clarity; not used further
+
+        let Some(dest) = dest_url else {
+            return false;
+        };
+        if sandbox {
+            eprintln!("[iframe] click in sandboxed iframe blocked: {dest}");
+            return true;
+        }
+
+        // Re-render this iframe at its current box size with the new URL.
+        let (width, height, base) = {
+            let Some(page) = &self.page else {
+                return true;
+            };
+            let Some(b) = page.box_tree.get(iframe_node) else {
+                return true;
+            };
+            (
+                b.rect.width.max(1.0) as u32,
+                b.rect.height.max(1.0) as u32,
+                page.url.clone(),
+            )
+        };
+        let dest_str = dest.to_string();
+        eprintln!("[iframe] navigating iframe to {dest_str}");
+        if let Some(new_content) =
+            load_iframe_document(&self.client, &base, &dest_str, width, height, false)
+        {
+            if let Some(page) = self.page.as_mut() {
+                page.iframes.insert(iframe_node, new_content);
+            }
+            // Recomposite the parent pixmap so the iframe area updates.
+            self.recomposite_iframes();
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
+        true
+    }
+
+    /// Recomposite all iframes onto the parent pixmap. Called after an
+    /// iframe is re-rendered so we don't need to redo the parent paint.
+    fn recomposite_iframes(&mut self) {
+        let Some(page) = self.page.as_mut() else {
+            return;
+        };
+        composite_iframes(&mut page.pixmap, &page.box_tree, &page.iframes);
+    }
+
     fn pump_js_timers(&mut self) {
         let Some(page) = self.page.as_mut() else {
             return;

@@ -458,6 +458,7 @@ impl Browser {
         self.scroll_y = 0.0;
 
         self.refresh_js_bounding_rects();
+        self.refresh_js_computed_styles();
 
         // Lifecycle: DOMContentLoaded fires now (parse complete + script
         // execution done), then `load` after layout/paint also done.
@@ -809,6 +810,8 @@ impl Browser {
             })
             .collect();
         page.js.refresh_bounding_rects(entries);
+        let style_snaps = computed_style_snapshots(&page.dom, &page.styles);
+        page.js.refresh_computed_styles(style_snaps);
         let max_bottom = page.pixmap.height();
         paint::PAINT_CANVAS_SURFACES.with(|slot| {
             *slot.borrow_mut() = Some(page.js.canvas_surfaces());
@@ -1168,6 +1171,109 @@ fn logical_key_to_string(key: &Key, text: Option<&str>) -> String {
         Key::Character(s) => s.to_string(),
         _ => String::new(),
     }
+}
+
+/// Build the per-element computed-style snapshots backing
+/// `getComputedStyle()`. We export the handful of properties scripts
+/// actually probe — adding more is cheap if a script needs it.
+fn computed_style_snapshots(
+    dom: &dom::Dom,
+    styles: &css::StyleTree,
+) -> Vec<(dom::NodeId, Vec<(String, String)>)> {
+    let mut out = Vec::new();
+    fn walk(
+        dom: &dom::Dom,
+        styles: &css::StyleTree,
+        node: dom::NodeId,
+        out: &mut Vec<(dom::NodeId, Vec<(String, String)>)>,
+    ) {
+        if matches!(dom.node(node).kind, dom::NodeKind::Element { .. }) {
+            let s = styles.get(node);
+            let pairs = vec![
+                ("color".to_string(), color_to_css(s.color)),
+                (
+                    "background-color".to_string(),
+                    color_to_css(s.background_color),
+                ),
+                ("display".to_string(), display_to_css(&s.display)),
+                ("font-size".to_string(), format!("{}px", s.font_size)),
+                ("font-weight".to_string(), s.font_weight.to_string()),
+                ("font-style".to_string(), font_style_to_css(s.font_style)),
+                ("line-height".to_string(), format!("{}", s.line_height)),
+                ("opacity".to_string(), format!("{}", s.opacity)),
+                ("text-align".to_string(), text_align_to_css(&s.text_align)),
+                ("position".to_string(), position_to_css(&s.position)),
+                ("z-index".to_string(), s.z_index.map(|z| z.to_string()).unwrap_or_else(|| "auto".into())),
+                ("visibility".to_string(), "visible".to_string()),
+            ];
+            out.push((node, pairs));
+        }
+        for c in dom.children(node).collect::<Vec<_>>() {
+            walk(dom, styles, c, out);
+        }
+    }
+    walk(dom, styles, dom.document(), &mut out);
+    out
+}
+
+fn color_to_css(c: css::Color) -> String {
+    if c.a == 0 {
+        "rgba(0, 0, 0, 0)".into()
+    } else if c.a == 255 {
+        format!("rgb({}, {}, {})", c.r, c.g, c.b)
+    } else {
+        format!(
+            "rgba({}, {}, {}, {})",
+            c.r,
+            c.g,
+            c.b,
+            c.a as f32 / 255.0
+        )
+    }
+}
+
+fn display_to_css(d: &css::Display) -> String {
+    match d {
+        css::Display::Block => "block",
+        css::Display::Inline => "inline",
+        css::Display::InlineBlock => "inline-block",
+        css::Display::ListItem => "list-item",
+        css::Display::Flex => "flex",
+        css::Display::InlineFlex => "inline-flex",
+        css::Display::Grid => "grid",
+        css::Display::InlineGrid => "inline-grid",
+        css::Display::None => "none",
+    }
+    .to_string()
+}
+
+fn font_style_to_css(s: css::FontStyle) -> String {
+    match s {
+        css::FontStyle::Normal => "normal",
+        css::FontStyle::Italic => "italic",
+    }
+    .to_string()
+}
+
+fn text_align_to_css(t: &css::TextAlign) -> String {
+    match t {
+        css::TextAlign::Left => "left",
+        css::TextAlign::Right => "right",
+        css::TextAlign::Center => "center",
+        css::TextAlign::Justify => "justify",
+    }
+    .to_string()
+}
+
+fn position_to_css(p: &css::Position) -> String {
+    match p {
+        css::Position::Static => "static",
+        css::Position::Relative => "relative",
+        css::Position::Absolute => "absolute",
+        css::Position::Fixed => "fixed",
+        css::Position::Sticky => "sticky",
+    }
+    .to_string()
 }
 
 /// First element child of `parent` (skipping text/comments). Used by
@@ -2185,6 +2291,16 @@ impl Browser {
             Some((id, [b.rect.x, b.rect.y, b.rect.width, b.rect.height]))
         });
         page.js.refresh_bounding_rects(entries);
+    }
+
+    /// Build the `getComputedStyle` snapshot for the currently styled
+    /// page and push it into the JS engine.
+    fn refresh_js_computed_styles(&mut self) {
+        let Some(page) = self.page.as_mut() else {
+            return;
+        };
+        let snapshots = computed_style_snapshots(&page.dom, &page.styles);
+        page.js.refresh_computed_styles(snapshots);
     }
 
     fn pump_js_animation_frames(&mut self) {

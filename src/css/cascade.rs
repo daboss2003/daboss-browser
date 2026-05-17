@@ -19,9 +19,10 @@ use crate::css::parser::parse_inline_declarations;
 use crate::css::types::{
     AlignContent, AlignItems, AttributeOp, AttributeSelector, BackgroundImage, BorderStyle,
     BoxShadow, BoxSides, BoxSizing, CalcExpr, Color, Combinator, ComputedStyle, Declaration,
-    Dimension, Display, FlexDirection, FlexWrap, FontStyle, GridAutoFlow, GridLine, GridTrack,
-    JustifyContent, Position, PseudoClass, Rule, Selector, SimpleSelector, Stylesheet,
-    TableLayout, TextAlign, TextDecoration, Transform2D, Unit, Value, WhiteSpace,
+    Dimension, Direction, Display, FilterFunction, FlexDirection, FlexWrap, FontStyle,
+    GridAutoFlow, GridLine, GridTrack, JustifyContent, Overflow, Position, PseudoClass, Rule,
+    Selector, SimpleSelector, Stylesheet, TableLayout, TextAlign, TextDecoration, TextOverflow,
+    Transform2D, Unit, Value, WhiteSpace,
 };
 use crate::dom::{Dom, NodeId, NodeKind};
 
@@ -1134,6 +1135,40 @@ fn apply_declaration(
                 style.opacity = (p / 100.0).clamp(0.0, 1.0);
             }
         }
+        "direction" => {
+            if let Value::Keyword(k) = value {
+                style.direction = match k.as_str() {
+                    "rtl" => Direction::Rtl,
+                    _ => Direction::Ltr,
+                };
+            }
+        }
+        "overflow" => {
+            let v = overflow_from(value);
+            style.overflow_x = v;
+            style.overflow_y = v;
+        }
+        "overflow-x" => style.overflow_x = overflow_from(value),
+        "overflow-y" => style.overflow_y = overflow_from(value),
+        "text-overflow" => {
+            style.text_overflow = match value {
+                Value::Keyword(k) if k == "ellipsis" => TextOverflow::Ellipsis,
+                Value::Keyword(k) if k == "clip" => TextOverflow::Clip,
+                Value::String(s) => TextOverflow::String(s.clone()),
+                _ => TextOverflow::Clip,
+            };
+        }
+        "filter" => {
+            style.filter = filter_chain_from(value);
+            // Fold `opacity(<n>)` into the regular opacity for paint —
+            // it's the only filter function we can render correctly
+            // without offscreen rendering.
+            for f in &style.filter {
+                if let FilterFunction::Opacity(o) = f {
+                    style.opacity *= o.clamp(0.0, 1.0);
+                }
+            }
+        }
         "box-shadow" => {
             style.box_shadow = box_shadow_from(value, style.font_size, parent);
         }
@@ -1214,6 +1249,67 @@ fn box_shadow_from(
 /// translateX/Y, scale, scaleX/Y, rotate (+ rotateZ), skewX/Y, and
 /// matrix(). Unknown / 3D variants are skipped silently. Returns `None`
 /// only when the value is literally `none` or contains nothing usable.
+fn overflow_from(value: &Value) -> Overflow {
+    match value {
+        Value::Keyword(k) => match k.as_str() {
+            "hidden" => Overflow::Hidden,
+            "scroll" => Overflow::Scroll,
+            "auto" => Overflow::Auto,
+            "clip" => Overflow::Clip,
+            _ => Overflow::Visible,
+        },
+        _ => Overflow::Visible,
+    }
+}
+
+/// Parse the right-hand side of a `filter:` declaration into a list of
+/// [`FilterFunction`]s. Numeric arguments without units are taken as
+/// fractions (`0`..`1`); percentages divide by 100; `<length>` for
+/// `blur()` is normalised to pixels.
+fn filter_chain_from(value: &Value) -> Vec<FilterFunction> {
+    let mut out = Vec::new();
+    let items: Vec<&Value> = match value {
+        Value::Keyword(k) if k == "none" => return out,
+        Value::List(xs) => xs.iter().collect(),
+        single => vec![single],
+    };
+    for v in items {
+        let Value::Function { name, args } = v else {
+            continue;
+        };
+        let amount = |default: f32| -> f32 {
+            match args.first() {
+                Some(Value::Number(n)) => *n,
+                Some(Value::Percentage(p)) => *p / 100.0,
+                Some(Value::Length(n, _)) => *n,
+                _ => default,
+            }
+        };
+        let entry = match name.to_ascii_lowercase().as_str() {
+            "blur" => {
+                // blur() takes a length; use 0 default
+                let n = match args.first() {
+                    Some(Value::Length(n, _)) => *n,
+                    Some(Value::Number(n)) => *n,
+                    _ => 0.0,
+                };
+                FilterFunction::Blur(n.max(0.0))
+            }
+            "brightness" => FilterFunction::Brightness(amount(1.0).max(0.0)),
+            "contrast" => FilterFunction::Contrast(amount(1.0).max(0.0)),
+            "grayscale" => FilterFunction::Grayscale(amount(1.0).clamp(0.0, 1.0)),
+            "hue-rotate" => FilterFunction::HueRotate(amount(0.0)),
+            "invert" => FilterFunction::Invert(amount(1.0).clamp(0.0, 1.0)),
+            "opacity" => FilterFunction::Opacity(amount(1.0).clamp(0.0, 1.0)),
+            "saturate" => FilterFunction::Saturate(amount(1.0).max(0.0)),
+            "sepia" => FilterFunction::Sepia(amount(1.0).clamp(0.0, 1.0)),
+            _ => continue,
+        };
+        out.push(entry);
+    }
+    out
+}
+
 fn transform_matrix_from(
     value: &Value,
     em_base: f32,

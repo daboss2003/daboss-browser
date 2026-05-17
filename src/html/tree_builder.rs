@@ -117,12 +117,72 @@ impl TreeBuilder {
             }
         }
 
-        let parent = self.current();
+        // Foster-parenting: when we're inside `<table>` (or its
+        // structural descendants) and a non-table element opens, the
+        // HTML5 spec moves it before the enclosing table. Without
+        // this, generators that emit stray `<div>` between table
+        // tags render at the wrong position.
+        let parent = if self.is_table_insertion_mode() && !is_table_related(&name) {
+            self.foster_parent_target()
+        } else {
+            self.current()
+        };
         let elem = self.dom.create_element(name.clone(), attrs);
-        self.dom.append_child(parent, elem);
+        // Insert into the foster parent's children right before the
+        // enclosing table when foster-parented; append otherwise.
+        if let Some(table) = self.foster_parent_reference()
+            .filter(|_| self.is_table_insertion_mode() && !is_table_related(&name))
+        {
+            self.dom.insert_before(parent, elem, table);
+        } else {
+            self.dom.append_child(parent, elem);
+        }
         if !is_void(&name) && !self_closing {
             self.stack.push(elem);
         }
+    }
+
+    /// True when the top of the open-elements stack is a table-context
+    /// element. Foster-parenting kicks in here.
+    fn is_table_insertion_mode(&self) -> bool {
+        for &id in self.stack.iter().rev() {
+            if let NodeKind::Element { tag, .. } = &self.dom.node(id).kind {
+                match tag.as_str() {
+                    "table" | "tbody" | "thead" | "tfoot" | "tr" | "colgroup" => return true,
+                    "td" | "th" | "caption" => return false,
+                    _ => continue,
+                }
+            }
+        }
+        false
+    }
+
+    /// Where stray elements should be inserted — the parent of the
+    /// nearest enclosing `<table>`. Returns the document body if no
+    /// table is on the stack (shouldn't happen given the caller checks
+    /// `is_table_insertion_mode`).
+    fn foster_parent_target(&self) -> NodeId {
+        for &id in self.stack.iter().rev() {
+            if let NodeKind::Element { tag, .. } = &self.dom.node(id).kind {
+                if tag == "table" {
+                    return self.dom.node(id).parent.unwrap_or(self.body);
+                }
+            }
+        }
+        self.body
+    }
+
+    /// Node to `insert_before` against during foster parenting — the
+    /// table itself.
+    fn foster_parent_reference(&self) -> Option<NodeId> {
+        for &id in self.stack.iter().rev() {
+            if let NodeKind::Element { tag, .. } = &self.dom.node(id).kind {
+                if tag == "table" {
+                    return Some(id);
+                }
+            }
+        }
+        None
     }
 
     fn handle_end(&mut self, name: &str) {
@@ -153,6 +213,27 @@ impl TreeBuilder {
         self.stack.truncate(2); // [doc, html]
         self.stack.push(self.body);
     }
+}
+
+/// Tags that legitimately live inside table context. Anything else
+/// gets foster-parented out.
+fn is_table_related(name: &str) -> bool {
+    matches!(
+        name,
+        "table"
+            | "tbody"
+            | "thead"
+            | "tfoot"
+            | "tr"
+            | "td"
+            | "th"
+            | "caption"
+            | "col"
+            | "colgroup"
+            | "script"
+            | "style"
+            | "template"
+    )
 }
 
 fn is_void(name: &str) -> bool {
@@ -241,6 +322,31 @@ mod tests {
         // After </div>, stack should be back at body.
         assert_eq!(body_kids.len(), 1);
         assert_eq!(tag_of(&dom, body_kids[0]), "div");
+    }
+
+    #[test]
+    fn stray_div_in_table_is_foster_parented() {
+        let dom = parse("<table><div>stray</div><tr><td>cell</td></tr></table>");
+        let body = find_first(&dom, dom.document(), "body").unwrap();
+        let body_kids: Vec<NodeId> = dom.children(body).collect();
+        // Expect: <div>stray</div> then <table>… in body's children.
+        assert!(body_kids.len() >= 2);
+        let tags: Vec<&str> = body_kids
+            .iter()
+            .filter_map(|id| match &dom.node(*id).kind {
+                NodeKind::Element { tag, .. } => Some(tag.as_str()),
+                _ => None,
+            })
+            .collect();
+        let div_idx = tags.iter().position(|t| *t == "div").expect("div in body");
+        let table_idx = tags
+            .iter()
+            .position(|t| *t == "table")
+            .expect("table in body");
+        assert!(
+            div_idx < table_idx,
+            "div should appear before table after foster-parenting"
+        );
     }
 
     #[test]

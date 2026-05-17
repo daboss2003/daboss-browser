@@ -134,6 +134,12 @@ thread_local! {
         RefCell<Option<Rc<RefCell<std::collections::HashMap<NodeId, [f32; 4]>>>>> =
         const { RefCell::new(None) };
 
+    /// Per-element computed-style snapshot, populated by the browser
+    /// after each cascade. Backs `window.getComputedStyle()`.
+    pub(crate) static JS_COMPUTED_STYLES: RefCell<
+        Option<Rc<RefCell<std::collections::HashMap<NodeId, Vec<(String, String)>>>>>,
+    > = const { RefCell::new(None) };
+
     /// Per-dispatch flags toggled by `event.preventDefault()` /
     /// `event.stopPropagation()`. Reset at the start of each dispatch.
     pub(crate) static EVENT_FLAGS: RefCell<EventFlags> = const { RefCell::new(EventFlags::EMPTY) };
@@ -193,6 +199,9 @@ pub struct JsEngine {
     /// `getContext('2d')` call inserts a pixmap here. Paint reads back
     /// to composite the canvas onto the page.
     canvas_surfaces: super::CanvasSurfaces,
+    /// Per-element snapshot of resolved CSS values that the browser
+    /// fills in after every cascade. Backs `getComputedStyle()`.
+    computed_styles: Rc<RefCell<std::collections::HashMap<NodeId, Vec<(String, String)>>>>,
 }
 
 /// Outcome of an event dispatch — informs the caller whether to skip the
@@ -303,6 +312,7 @@ impl JsEngine {
         install_window_alias(&mut ctx);
         install_navigator_screen_performance(&mut ctx);
         install_location_and_history_globals(&mut ctx);
+        install_get_computed_style(&mut ctx);
         super::xhr::install(&mut ctx);
         super::web_classes::install(&mut ctx);
         super::observers::install(&mut ctx);
@@ -331,6 +341,9 @@ impl JsEngine {
             Rc::new(RefCell::new(std::collections::HashMap::new()));
         let canvas_surfaces: super::CanvasSurfaces =
             Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let computed_styles: Rc<
+            RefCell<std::collections::HashMap<NodeId, Vec<(String, String)>>>,
+        > = Rc::new(RefCell::new(std::collections::HashMap::new()));
         let mut engine = JsEngine {
             ctx,
             listeners,
@@ -347,6 +360,7 @@ impl JsEngine {
             observers,
             bounding_rects,
             canvas_surfaces,
+            computed_styles,
         };
         if allow_inline_scripts {
             engine.run_initial_scripts(dom);
@@ -365,6 +379,20 @@ impl JsEngine {
     /// reads from this to composite canvas pixels onto the page.
     pub fn canvas_surfaces(&self) -> super::CanvasSurfaces {
         self.canvas_surfaces.clone()
+    }
+
+    /// Replace the per-element computed-style snapshot consumed by
+    /// `getComputedStyle()`. The browser calls this after every cascade
+    /// with a flat `(node, [(prop, value), ...])` mapping.
+    pub fn refresh_computed_styles<I>(&self, snapshots: I)
+    where
+        I: IntoIterator<Item = (NodeId, Vec<(String, String)>)>,
+    {
+        let mut map = self.computed_styles.borrow_mut();
+        map.clear();
+        for (id, pairs) in snapshots {
+            map.insert(id, pairs);
+        }
     }
 
     /// Refresh the per-element bounding-rect cache used by
@@ -674,6 +702,9 @@ impl JsEngine {
         super::canvas::JS_CANVAS_SURFACES.with(|slot| {
             *slot.borrow_mut() = Some(self.canvas_surfaces.clone());
         });
+        JS_COMPUTED_STYLES.with(|slot| {
+            *slot.borrow_mut() = Some(self.computed_styles.clone());
+        });
         (dom_rc, listeners_rc)
     }
 
@@ -693,6 +724,9 @@ impl JsEngine {
             slot.borrow_mut().take();
         });
         super::canvas::JS_CANVAS_SURFACES.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        JS_COMPUTED_STYLES.with(|slot| {
             slot.borrow_mut().take();
         });
         JS_NAV_REQUESTS.with(|slot| {
@@ -851,6 +885,101 @@ fn queue_microtask(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult
 /// are read-only static snapshots — no permission prompts, no live
 /// device data. Enough for code that probes `navigator.userAgent` or
 /// uses `performance.now()` to gate timings.
+fn install_get_computed_style(ctx: &mut Context) {
+    ctx.register_global_callable(
+        js_string!("getComputedStyle"),
+        1,
+        NativeFunction::from_fn_ptr(get_computed_style),
+    )
+    .ok();
+}
+
+fn get_computed_style(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let realm = ctx.realm().clone();
+    let getter = |f: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>| {
+        boa_engine::object::FunctionObjectBuilder::new(&realm, NativeFunction::from_fn_ptr(f)).build()
+    };
+
+    // Extract __nodeId from the argument.
+    let raw = args
+        .first()
+        .and_then(|v| v.as_object())
+        .and_then(|o| o.get(js_string!("__nodeId"), ctx).ok())
+        .and_then(|v| v.to_u32(ctx).ok());
+    let pairs: Vec<(String, String)> = match raw {
+        Some(idx) => {
+            let node = NodeId::from_raw(idx);
+            JS_COMPUTED_STYLES.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .and_then(|rc| rc.borrow().get(&node).cloned())
+                    .unwrap_or_default()
+            })
+        }
+        None => Vec::new(),
+    };
+
+    let mut b = ObjectInitializer::new(ctx);
+    // Stash the raw pair list so `getPropertyValue` can look it up.
+    b.property(
+        js_string!("__node_idx"),
+        JsValue::from(raw.unwrap_or(0)),
+        Attribute::READONLY,
+    );
+    // Expose each pair as a property on the returned style declaration
+    // (both kebab and the camelCase alias) so `style.color` and
+    // `style['background-color']` both work.
+    for (name, value) in pairs {
+        let camel = kebab_to_camel(&name);
+        let val = JsValue::from(js_string!(value.clone()));
+        b.property(js_string!(name.clone()), val.clone(), Attribute::READONLY);
+        if camel != name {
+            b.property(js_string!(camel), val, Attribute::READONLY);
+        }
+    }
+    b.function(
+        NativeFunction::from_fn_ptr(computed_style_get_property_value),
+        js_string!("getPropertyValue"),
+        1,
+    );
+    let _ = getter;
+    Ok(JsValue::from(b.build()))
+}
+
+fn computed_style_get_property_value(
+    this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(obj) = this.as_object() else {
+        return Ok(JsValue::from(js_string!("")));
+    };
+    let Some(name_val) = args.first() else {
+        return Ok(JsValue::from(js_string!("")));
+    };
+    let name = name_val.to_string(ctx)?.to_std_string_escaped().to_ascii_lowercase();
+    let v = obj
+        .get(js_string!(name), ctx)
+        .unwrap_or(JsValue::from(js_string!("")));
+    Ok(v)
+}
+
+fn kebab_to_camel(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut up = false;
+    for c in s.chars() {
+        if c == '-' {
+            up = true;
+        } else if up {
+            out.extend(c.to_uppercase());
+            up = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn install_navigator_screen_performance(ctx: &mut Context) {
     let realm = ctx.realm().clone();
 

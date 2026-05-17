@@ -3,6 +3,22 @@
 
 use std::collections::HashMap;
 
+/// One entry in a `filter:` declaration. Numeric arguments are
+/// percent-normalised (0.0..=1.0 for `100%`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)] // fields read by paint once visual application lands
+pub enum FilterFunction {
+    Blur(f32),
+    Brightness(f32),
+    Contrast(f32),
+    Grayscale(f32),
+    HueRotate(f32),
+    Invert(f32),
+    Opacity(f32),
+    Saturate(f32),
+    Sepia(f32),
+}
+
 /// Column-major 2D affine `(sx, kx, ky, sy, tx, ty)`. Maps the point
 /// `(x, y)` to `(sx·x + ky·y + tx, kx·x + sy·y + ty)`. Mirrors the layout
 /// of `tiny_skia::Transform` so converting at paint time is trivial.
@@ -546,6 +562,31 @@ pub enum BorderStyle {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Rtl currently only affects text-align default
+pub enum Direction {
+    Ltr,
+    Rtl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // hidden/scroll/auto parsed; clipping is layout-time work
+pub enum Overflow {
+    Visible,
+    Hidden,
+    Scroll,
+    Auto,
+    Clip,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // ellipsis/clip parsed; visual truncation is layout work
+pub enum TextOverflow {
+    Clip,
+    Ellipsis,
+    String(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WhiteSpace {
     Normal,
     Pre,
@@ -652,6 +693,24 @@ pub struct ComputedStyle {
     /// 0..=1. Multiplies the alpha of every painted pixel in this element's
     /// subtree. Not inherited.
     pub opacity: f32,
+    /// `filter:` chain. Only the `opacity(<n>)` function affects paint
+    /// today (folded into [`ComputedStyle::opacity`] equivalence at
+    /// apply time). Other functions parse but don't render yet.
+    pub filter: Vec<FilterFunction>,
+    /// Writing direction. Inherited. Affects the default value of
+    /// `text-align` (`Ltr` → `Left`, `Rtl` → `Right`); other RTL
+    /// effects (inline-direction reordering, bidi-aware caret) are
+    /// future work.
+    pub direction: Direction,
+    /// `overflow-x` / `overflow-y`. Parsed and stored but layout
+    /// doesn't actually clip yet — see the deferred work in
+    /// `text-overflow: ellipsis` below.
+    pub overflow_x: Overflow,
+    pub overflow_y: Overflow,
+    /// `text-overflow`. Currently parse-only; visual truncation
+    /// requires width-aware glyph clipping in the inline formatting
+    /// context.
+    pub text_overflow: TextOverflow,
     /// One drop shadow. Not inherited.
     pub box_shadow: Option<BoxShadow>,
     /// `transform: translate(...)` only — `(dx_px, dy_px)`. Not inherited
@@ -747,6 +806,11 @@ impl ComputedStyle {
             background_image: None,
             border_radius: 0.0,
             opacity: 1.0,
+            filter: Vec::new(),
+            direction: Direction::Ltr,
+            overflow_x: Overflow::Visible,
+            overflow_y: Overflow::Visible,
+            text_overflow: TextOverflow::Clip,
             box_shadow: None,
             transform_translate: None,
             transform: None,
@@ -792,6 +856,13 @@ impl ComputedStyle {
         s.white_space = parent.white_space;
         s.border_spacing = parent.border_spacing; // inherited
         s.text_decoration = parent.text_decoration; // inherited
+        s.direction = parent.direction; // inherited
+        // Default text-align follows direction.
+        if matches!(parent.direction, Direction::Rtl)
+            && matches!(parent.text_align, TextAlign::Left)
+        {
+            s.text_align = TextAlign::Right;
+        }
         // table_layout, background_image, border_radius, opacity, box_shadow,
         // and transform are NOT inherited per CSS spec.
         s.custom_properties = parent.custom_properties.clone();

@@ -33,12 +33,18 @@ pub enum ImageSlot {
 pub type ImageCache = HashMap<(NodeId, ImageSlot), ImageInfo>;
 
 /// Decode an image from its raw bytes. Recognises PNG, JPEG, WebP, GIF,
-/// BMP, and SVG (via `resvg`). Returns `None` for unknown formats,
-/// decode errors, or oversized images.
+/// BMP, SVG (via `resvg`), and AVIF (via `avif-decode`). Returns
+/// `None` for unknown formats, decode errors, or oversized images.
 pub fn decode_image(bytes: &[u8]) -> Option<ImageInfo> {
     // Try SVG first when the bytes look textual + match the SVG sniff.
     if looks_like_svg(bytes) {
         if let Some(info) = decode_svg(bytes) {
+            return Some(info);
+        }
+    }
+    // AVIF magic: "ftypavif" / "ftypavis" inside the first 32 bytes.
+    if looks_like_avif(bytes) {
+        if let Some(info) = decode_avif(bytes) {
             return Some(info);
         }
     }
@@ -58,6 +64,98 @@ pub fn decode_image(bytes: &[u8]) -> Option<ImageInfo> {
         width,
         height,
         rgba: rgba.into_raw(),
+    })
+}
+
+fn looks_like_avif(bytes: &[u8]) -> bool {
+    if bytes.len() < 16 {
+        return false;
+    }
+    let head = &bytes[..bytes.len().min(64)];
+    // Look for "ftypavi" inside the box header — covers `avif`, `avis`,
+    // and the `mif1` major brand with `avif` compatible-brand tagging.
+    head.windows(7).any(|w| w == b"ftypavi")
+}
+
+fn decode_avif(bytes: &[u8]) -> Option<ImageInfo> {
+    let img = avif_decode::Decoder::from_avif(bytes).ok()?.to_image().ok()?;
+    let (rgba, width, height) = match img {
+        avif_decode::Image::Rgba8(buf) => {
+            let (w, h) = (buf.width() as u32, buf.height() as u32);
+            let pixels = buf.buf().iter().flat_map(|p| [p.r, p.g, p.b, p.a]).collect();
+            (pixels, w, h)
+        }
+        avif_decode::Image::Rgb8(buf) => {
+            let (w, h) = (buf.width() as u32, buf.height() as u32);
+            let pixels = buf
+                .buf()
+                .iter()
+                .flat_map(|p| [p.r, p.g, p.b, 255])
+                .collect();
+            (pixels, w, h)
+        }
+        avif_decode::Image::Gray8(buf) => {
+            let (w, h) = (buf.width() as u32, buf.height() as u32);
+            let pixels = buf
+                .buf()
+                .iter()
+                .flat_map(|p| {
+                    let v = p.value();
+                    [v, v, v, 255]
+                })
+                .collect();
+            (pixels, w, h)
+        }
+        // 16-bit variants: downsample to 8-bit. Rare in practice for
+        // web AVIF, so the lossy approximation is fine here.
+        avif_decode::Image::Rgba16(buf) => {
+            let (w, h) = (buf.width() as u32, buf.height() as u32);
+            let pixels = buf
+                .buf()
+                .iter()
+                .flat_map(|p| {
+                    [
+                        (p.r >> 8) as u8,
+                        (p.g >> 8) as u8,
+                        (p.b >> 8) as u8,
+                        (p.a >> 8) as u8,
+                    ]
+                })
+                .collect();
+            (pixels, w, h)
+        }
+        avif_decode::Image::Rgb16(buf) => {
+            let (w, h) = (buf.width() as u32, buf.height() as u32);
+            let pixels = buf
+                .buf()
+                .iter()
+                .flat_map(|p| [(p.r >> 8) as u8, (p.g >> 8) as u8, (p.b >> 8) as u8, 255])
+                .collect();
+            (pixels, w, h)
+        }
+        avif_decode::Image::Gray16(buf) => {
+            let (w, h) = (buf.width() as u32, buf.height() as u32);
+            let pixels = buf
+                .buf()
+                .iter()
+                .flat_map(|p| {
+                    let v = (p.value() >> 8) as u8;
+                    [v, v, v, 255]
+                })
+                .collect();
+            (pixels, w, h)
+        }
+    };
+    if width == 0 || height == 0 {
+        return None;
+    }
+    if width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION {
+        return None;
+    }
+    Some(ImageInfo {
+        width,
+        height,
+        rgba,
     })
 }
 

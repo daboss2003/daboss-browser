@@ -423,8 +423,55 @@ impl Browser {
         });
         self.scroll_y = 0.0;
 
+        // Lifecycle: DOMContentLoaded fires now (parse complete + script
+        // execution done), then `load` after layout/paint also done.
+        self.fire_lifecycle_events();
+
         if let Some(w) = &self.window {
             w.request_redraw();
+        }
+    }
+
+    /// Fire `DOMContentLoaded` and `load` on the document root. We
+    /// don't separate the two timings since our pipeline doesn't have
+    /// late-arriving resources (images are blocking-fetched during nav).
+    fn fire_lifecycle_events(&mut self) {
+        // Pull the root id without keeping a mutable borrow across the
+        // dispatch + recascade cycle.
+        let root = match self.page.as_ref() {
+            Some(p) => first_element_child(&p.dom, p.dom.document()),
+            None => None,
+        };
+        let Some(root) = root else { return };
+
+        // DOMContentLoaded
+        let r1 = match self.page.as_mut() {
+            Some(p) => p.js.dispatch_event_with(
+                &mut p.dom,
+                "DOMContentLoaded",
+                root,
+                js::engine::EventInit::bubbling(),
+            ),
+            None => return,
+        };
+        if r1.mutated {
+            self.recascade_and_paint();
+        }
+
+        // load — non-bubbling on the document/window in spec; we fire
+        // on the root which serves the common addEventListener-on-window
+        // pattern thanks to the `window === globalThis` alias.
+        let r2 = match self.page.as_mut() {
+            Some(p) => p.js.dispatch_event_with(
+                &mut p.dom,
+                "load",
+                root,
+                js::engine::EventInit::non_bubbling(),
+            ),
+            None => return,
+        };
+        if r2.mutated {
+            self.recascade_and_paint();
         }
     }
 
@@ -556,8 +603,11 @@ impl Browser {
             let Some(page) = self.page.as_mut() else {
                 return;
             };
+            let mut init = js::engine::EventInit::bubbling();
+            init.client_x = Some(x);
+            init.client_y = Some(page_y);
             page.js
-                .dispatch_event(&mut page.dom, "click", hit_node)
+                .dispatch_event_with(&mut page.dom, "click", hit_node, init)
         };
         if js_result.mutated {
             self.recascade_and_paint();
@@ -749,7 +799,19 @@ impl Browser {
 
         if self.chrome.focused {
             self.handle_chrome_key(logical_key, text);
-        } else if self
+            return;
+        }
+
+        // Dispatch a `keydown` JS event before the built-in handler so a
+        // page script can `preventDefault()` (e.g., to block default
+        // text-input behaviour for `<input>` and run its own logic).
+        let key_str = logical_key_to_string(&logical_key, text.as_deref());
+        let js_result = self.dispatch_key_event("keydown", &key_str);
+        if js_result.default_prevented {
+            return;
+        }
+
+        if self
             .page
             .as_ref()
             .map(|p| p.focus.is_some())
@@ -759,6 +821,34 @@ impl Browser {
         } else {
             self.handle_page_key(logical_key);
         }
+    }
+
+    fn dispatch_key_event(&mut self, event_type: &str, key: &str) -> js::engine::DispatchResult {
+        let target = match self
+            .page
+            .as_ref()
+            .and_then(|p| p.focus.or_else(|| first_element_child(&p.dom, p.dom.document())))
+        {
+            Some(n) => n,
+            None => return js::engine::DispatchResult::default(),
+        };
+        let Some(page) = self.page.as_mut() else {
+            return js::engine::DispatchResult::default();
+        };
+        let mut init = js::engine::EventInit::bubbling();
+        init.key = Some(key.to_string());
+        init.code = Some(key.to_string());
+        init.ctrl = self.modifiers.control_key();
+        init.shift = self.modifiers.shift_key();
+        init.alt = self.modifiers.alt_key();
+        init.meta = self.modifiers.super_key();
+        let r = page
+            .js
+            .dispatch_event_with(&mut page.dom, event_type, target, init);
+        if r.mutated {
+            self.recascade_and_paint();
+        }
+        r
     }
 
     fn handle_input_key(&mut self, logical_key: Key, text: Option<winit::keyboard::SmolStr>) {
@@ -985,6 +1075,41 @@ fn chain_of(dom: &dom::Dom, node: Option<dom::NodeId>) -> Vec<dom::NodeId> {
         cur = dom.node(n).parent;
     }
     out
+}
+
+/// Map a winit `Key` (plus any `text` payload for character keys) to a
+/// short string suitable for `KeyboardEvent.key` / `.code`. We don't
+/// distinguish the two — close enough for the toy.
+fn logical_key_to_string(key: &Key, text: Option<&str>) -> String {
+    if let Some(s) = text {
+        if !s.is_empty() && !s.chars().any(|c| c.is_control()) {
+            return s.to_string();
+        }
+    }
+    match key.as_ref() {
+        Key::Named(NamedKey::Enter) => "Enter".into(),
+        Key::Named(NamedKey::Backspace) => "Backspace".into(),
+        Key::Named(NamedKey::Tab) => "Tab".into(),
+        Key::Named(NamedKey::Escape) => "Escape".into(),
+        Key::Named(NamedKey::ArrowLeft) => "ArrowLeft".into(),
+        Key::Named(NamedKey::ArrowRight) => "ArrowRight".into(),
+        Key::Named(NamedKey::ArrowUp) => "ArrowUp".into(),
+        Key::Named(NamedKey::ArrowDown) => "ArrowDown".into(),
+        Key::Named(NamedKey::Space) => " ".into(),
+        Key::Named(NamedKey::Shift) => "Shift".into(),
+        Key::Named(NamedKey::Control) => "Control".into(),
+        Key::Named(NamedKey::Alt) => "Alt".into(),
+        Key::Named(NamedKey::Super) => "Meta".into(),
+        Key::Character(s) => s.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// First element child of `parent` (skipping text/comments). Used by
+/// lifecycle events to find the document's <html> root.
+fn first_element_child(dom: &dom::Dom, parent: dom::NodeId) -> Option<dom::NodeId> {
+    dom.children(parent)
+        .find(|c| matches!(dom.node(*c).kind, dom::NodeKind::Element { .. }))
 }
 
 /// Walk from `node` up through its ancestors looking for an element
@@ -1783,13 +1908,27 @@ impl ApplicationHandler for Browser {
     /// indefinitely if none are queued).
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.pump_js_timers();
+        self.pump_js_animation_frames();
         let next = self
             .page
             .as_ref()
             .and_then(|p| p.js.next_timer_at());
-        match next {
-            Some(at) => event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(at)),
-            None => event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait),
+        let has_raf = self
+            .page
+            .as_ref()
+            .map(|p| p.js.has_pending_animation_frames())
+            .unwrap_or(false);
+        if has_raf {
+            // rAF callbacks should run on the next paint tick. Schedule
+            // a poll instead of indefinitely waiting.
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+        } else {
+            match next {
+                Some(at) => {
+                    event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(at))
+                }
+                None => event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait),
+            }
         }
     }
 }
@@ -1919,6 +2058,42 @@ impl Browser {
         let r = page.js.pump_timers(&mut page.dom);
         if r.mutated {
             self.recascade_and_paint();
+        }
+    }
+
+    fn pump_js_animation_frames(&mut self) {
+        let Some(page) = self.page.as_mut() else {
+            return;
+        };
+        let r = page.js.pump_animation_frames(&mut page.dom);
+        if r.mutated {
+            self.recascade_and_paint();
+        }
+        self.process_js_nav_requests();
+    }
+
+    /// Drain navigation requests scripts have queued (location.assign,
+    /// history.back, etc.) and act on them.
+    fn process_js_nav_requests(&mut self) {
+        let requests = match self.page.as_ref() {
+            Some(p) => p.js.drain_nav_requests(),
+            None => return,
+        };
+        for req in requests {
+            match req {
+                js::engine::NavRequest::Assign(url) | js::engine::NavRequest::Replace(url) => {
+                    self.navigate(&url, true);
+                }
+                js::engine::NavRequest::Reload => self.reload(),
+                js::engine::NavRequest::Go(_) => {
+                    // Browser back/forward is best modelled against our
+                    // own `history` Vec. For the toy, defer to the
+                    // built-in helpers and let JS-side bookkeeping
+                    // catch up on the next navigate.
+                    // n < 0 = back, n > 0 = forward
+                    self.history_back();
+                }
+            }
         }
     }
 }

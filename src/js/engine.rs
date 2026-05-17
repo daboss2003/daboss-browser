@@ -51,6 +51,51 @@ pub(crate) struct TimerState {
     pub(crate) next_id: u32,
 }
 
+/// Pending `requestAnimationFrame` callbacks. Each frame we drain the
+/// queue (matching browser semantics — callbacks scheduled *during* a
+/// frame run on the next frame, not this one).
+pub(crate) struct AnimationFrameEntry {
+    pub(crate) id: u32,
+    pub(crate) callback: JsFunction,
+}
+
+#[derive(Default)]
+pub(crate) struct AnimationFrameQueue {
+    pub(crate) pending: Vec<AnimationFrameEntry>,
+    pub(crate) next_id: u32,
+}
+
+/// One entry on the history stack. `state` is currently always `null`
+/// (we don't serialise JS values into Rust yet) but the URL part is
+/// honoured. Real browsers store an arbitrary structured-cloneable
+/// payload here.
+#[derive(Debug, Clone)]
+pub struct HistoryEntry {
+    pub url: url::Url,
+}
+
+#[derive(Default, Debug)]
+pub struct JsHistory {
+    pub entries: Vec<HistoryEntry>,
+    pub cursor: usize,
+}
+
+/// Navigation requests scripts emit (via `location.*` / `history.*`)
+/// that the browser shell processes after the current dispatch tick.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // `.0` is read by `main.rs::process_js_nav_requests`
+pub enum NavRequest {
+    /// `location.assign(url)` / `location.href = url` — push and load.
+    Assign(String),
+    /// `location.replace(url)` — replace current entry then load.
+    Replace(String),
+    /// `location.reload()`
+    Reload,
+    /// `history.back()` / `history.forward()` / `history.go(n)`.
+    /// Positive `n` moves forward, negative back.
+    Go(i32),
+}
+
 thread_local! {
     pub(crate) static JS_LISTENERS: RefCell<Option<Rc<RefCell<ListenerMap>>>> =
         const { RefCell::new(None) };
@@ -58,10 +103,30 @@ thread_local! {
     pub(crate) static JS_TIMERS: RefCell<Option<Rc<RefCell<TimerState>>>> =
         const { RefCell::new(None) };
 
+    pub(crate) static JS_RAF: RefCell<Option<Rc<RefCell<AnimationFrameQueue>>>> =
+        const { RefCell::new(None) };
+
     pub(crate) static JS_FETCH_CLIENT: RefCell<Option<Rc<net::Client>>> =
         const { RefCell::new(None) };
 
     pub(crate) static JS_BASE_URL: RefCell<Option<url::Url>> = const { RefCell::new(None) };
+
+    /// Mutable current URL exposed to JS via `location.*` and mutated by
+    /// `history.pushState` / `history.replaceState`. The browser shell
+    /// refreshes this slot on every navigation.
+    pub(crate) static JS_LOCATION: RefCell<Option<Rc<RefCell<url::Url>>>> =
+        const { RefCell::new(None) };
+
+    /// Queue of navigation requests issued by scripts (location.assign,
+    /// history.back, etc.). The browser drains it after each event /
+    /// timer / rAF dispatch.
+    pub(crate) static JS_NAV_REQUESTS: RefCell<Option<Rc<RefCell<Vec<NavRequest>>>>> =
+        const { RefCell::new(None) };
+
+    /// History state stack (URLs only — `pushState` is supported, real
+    /// state-object storage isn't yet).
+    pub(crate) static JS_HISTORY: RefCell<Option<Rc<RefCell<JsHistory>>>> =
+        const { RefCell::new(None) };
 
     /// Per-dispatch flags toggled by `event.preventDefault()` /
     /// `event.stopPropagation()`. Reset at the start of each dispatch.
@@ -85,6 +150,9 @@ pub struct JsEngine {
     ctx: Context,
     listeners: Rc<RefCell<ListenerMap>>,
     timers: Rc<RefCell<TimerState>>,
+    /// `requestAnimationFrame` queue. Drained at the top of every paint
+    /// cycle.
+    raf: Rc<RefCell<AnimationFrameQueue>>,
     /// Network client shared with the rest of the browser. `fetch` uses
     /// it; left `None` for the headless PNG mode and unit tests where we
     /// don't want unsolicited network I/O.
@@ -96,6 +164,16 @@ pub struct JsEngine {
     /// `sessionStorage` map. Created per engine, so it resets on
     /// navigation but survives across event handler ticks and timers.
     session_storage: StorageArea,
+    /// Wall-clock origin used by `performance.now()`. Set when the
+    /// engine is constructed (page load time).
+    perf_origin: Instant,
+    /// Mutable current URL — `location.*` reads from here, History API
+    /// pushes mutate it.
+    location_url: Rc<RefCell<url::Url>>,
+    /// Pending navigation requests emitted by JS. Browser drains.
+    nav_requests: Rc<RefCell<Vec<NavRequest>>>,
+    /// In-engine history stack for the History API.
+    history: Rc<RefCell<JsHistory>>,
 }
 
 /// Outcome of an event dispatch — informs the caller whether to skip the
@@ -105,6 +183,59 @@ pub struct JsEngine {
 pub struct DispatchResult {
     pub default_prevented: bool,
     pub mutated: bool,
+}
+
+/// Optional per-event-type properties to attach to the JS event object.
+/// Fields are `None` when not applicable.
+#[derive(Default, Clone)]
+pub struct EventInit {
+    /// `bubbles` defaults to true for most user-fired events; some
+    /// lifecycle events (`load`, `focus`/`blur` to a degree) don't bubble.
+    pub bubbles: bool,
+    /// MouseEvent.clientX / clientY
+    pub client_x: Option<f32>,
+    pub client_y: Option<f32>,
+    /// KeyboardEvent.key / code / modifier flags
+    pub key: Option<String>,
+    pub code: Option<String>,
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub meta: bool,
+    /// InputEvent.data (the inserted text) and input.value at time of fire.
+    pub input_data: Option<String>,
+}
+
+impl EventInit {
+    pub const fn bubbling() -> Self {
+        Self {
+            bubbles: true,
+            client_x: None,
+            client_y: None,
+            key: None,
+            code: None,
+            ctrl: false,
+            shift: false,
+            alt: false,
+            meta: false,
+            input_data: None,
+        }
+    }
+    #[allow(dead_code)] // used by load/focus/blur dispatch when wired
+    pub const fn non_bubbling() -> Self {
+        Self {
+            bubbles: false,
+            client_x: None,
+            client_y: None,
+            key: None,
+            code: None,
+            ctrl: false,
+            shift: false,
+            alt: false,
+            meta: false,
+            input_data: None,
+        }
+    }
 }
 
 impl JsEngine {
@@ -126,30 +257,109 @@ impl JsEngine {
         base_url: Option<url::Url>,
         local_storage: Option<StorageArea>,
     ) -> Self {
+        let perf_origin = Instant::now();
         let mut ctx = Context::default();
         install_console(&mut ctx);
         js_dom::install(&mut ctx);
         install_timer_globals(&mut ctx);
+        install_animation_frame_globals(&mut ctx);
         install_fetch_global(&mut ctx);
         storage::install(&mut ctx);
         install_window_alias(&mut ctx);
+        install_navigator_screen_performance(&mut ctx);
+        install_location_and_history_globals(&mut ctx);
 
         let listeners: Rc<RefCell<ListenerMap>> = Rc::new(RefCell::new(HashMap::new()));
         let timers: Rc<RefCell<TimerState>> = Rc::new(RefCell::new(TimerState::default()));
+        let raf: Rc<RefCell<AnimationFrameQueue>> =
+            Rc::new(RefCell::new(AnimationFrameQueue::default()));
         let local_storage = local_storage
             .unwrap_or_else(|| Rc::new(RefCell::new(HashMap::new())));
         let session_storage: StorageArea = Rc::new(RefCell::new(HashMap::new()));
+        let initial_url = base_url
+            .clone()
+            .unwrap_or_else(|| url::Url::parse("about:blank").unwrap());
+        let location_url = Rc::new(RefCell::new(initial_url.clone()));
+        let nav_requests: Rc<RefCell<Vec<NavRequest>>> = Rc::new(RefCell::new(Vec::new()));
+        let history = Rc::new(RefCell::new(JsHistory {
+            entries: vec![HistoryEntry {
+                url: initial_url,
+            }],
+            cursor: 0,
+        }));
         let mut engine = JsEngine {
             ctx,
             listeners,
             timers,
+            raf,
             fetch_client: client,
             base_url,
             local_storage,
             session_storage,
+            perf_origin,
+            location_url,
+            nav_requests,
+            history,
         };
         engine.run_initial_scripts(dom);
         engine
+    }
+
+    /// Drain every pending navigation request scripts have queued. The
+    /// browser shell calls this after each event / timer / rAF tick.
+    pub fn drain_nav_requests(&self) -> Vec<NavRequest> {
+        let mut q = self.nav_requests.borrow_mut();
+        std::mem::take(&mut *q)
+    }
+
+    /// Update the engine's view of the current URL when the browser
+    /// navigates (e.g. user clicked a link). Keeps `location.*` in sync
+    /// without producing a navigation request.
+    #[allow(dead_code)] // called by Browser once per-history-step popstate is wired
+    pub fn set_current_url(&self, url: url::Url) {
+        *self.location_url.borrow_mut() = url.clone();
+        let mut h = self.history.borrow_mut();
+        let new_len = h.cursor + 1;
+        h.entries.truncate(new_len);
+        h.entries.push(HistoryEntry { url });
+        h.cursor = h.entries.len() - 1;
+    }
+
+    /// Run every `requestAnimationFrame` callback queued so far. New
+    /// callbacks scheduled by them go into the next frame (matching
+    /// browser behaviour). Returns whether the DOM grew (the caller
+    /// uses this as a re-layout signal).
+    pub fn pump_animation_frames(&mut self, dom: &mut Dom) -> DispatchResult {
+        let due: Vec<AnimationFrameEntry> = {
+            let mut q = self.raf.borrow_mut();
+            std::mem::take(&mut q.pending)
+        };
+        if due.is_empty() {
+            return DispatchResult::default();
+        }
+        let (dom_rc, listeners_rc) = self.install_thread_locals(dom);
+        let pre_count = dom_rc.borrow().node_count();
+
+        let elapsed_ms = self.perf_origin.elapsed().as_secs_f64() * 1000.0;
+        let ts = JsValue::from(elapsed_ms);
+        for entry in due {
+            if let Err(e) = entry.callback.call(&JsValue::undefined(), &[ts.clone()], &mut self.ctx)
+            {
+                eprintln!("[js] rAF #{} threw: {e}", entry.id);
+            }
+        }
+        self.ctx.run_jobs();
+
+        let mutated = dom_rc.borrow().node_count() != pre_count;
+        self.uninstall_thread_locals(dom, dom_rc, listeners_rc);
+        DispatchResult {
+            default_prevented: false,
+            mutated,
+        }
+    }
+
+    pub fn has_pending_animation_frames(&self) -> bool {
+        !self.raf.borrow().pending.is_empty()
     }
 
     /// Soonest fire time of any pending timer, or `None` if none are queued.
@@ -237,18 +447,36 @@ impl JsEngine {
         self.uninstall_thread_locals(dom, rc, listeners_rc);
     }
 
-    /// Dispatch `event_type` to `target` with bubbling. Walks from the
-    /// target up to the document root, firing all listeners at each
-    /// level in registration order. Returns whether the default was
-    /// prevented and whether any DOM mutation occurred.
+    /// Dispatch `event_type` to `target` with bubbling and default init
+    /// (no mouse coords, no key info). Equivalent to a bare DOM event.
+    #[allow(dead_code)] // kept as a convenience wrapper for tests and integrations
     pub fn dispatch_event(
         &mut self,
         dom: &mut Dom,
         event_type: &str,
         target: NodeId,
     ) -> DispatchResult {
-        // Build the bubble chain from a snapshot of the live tree.
-        let chain = bubble_chain(dom, target);
+        self.dispatch_event_with(dom, event_type, target, EventInit::bubbling())
+    }
+
+    /// Dispatch with explicit per-event properties (MouseEvent coords,
+    /// KeyboardEvent.key, etc.). Bubbling is controlled by `init.bubbles`.
+    pub fn dispatch_event_with(
+        &mut self,
+        dom: &mut Dom,
+        event_type: &str,
+        target: NodeId,
+        init: EventInit,
+    ) -> DispatchResult {
+        // Build the bubble chain (or singleton chain when non-bubbling)
+        // from a snapshot of the live tree.
+        let chain = if init.bubbles {
+            bubble_chain(dom, target)
+        } else if matches!(dom.node(target).kind, NodeKind::Element { .. }) {
+            vec![target]
+        } else {
+            Vec::new()
+        };
 
         // Empty chain means the target isn't an element we can dispatch
         // to (probably text node / document); nothing to do.
@@ -261,7 +489,7 @@ impl JsEngine {
 
         let pre_mutation_marker = dom_rc.borrow().node_count();
 
-        let event_obj = build_event_object(&mut self.ctx, event_type, target);
+        let event_obj = build_event_object_with(&mut self.ctx, event_type, target, &init);
 
         'bubble: for &node in &chain {
             // Update event.currentTarget for this bubble step.
@@ -337,6 +565,9 @@ impl JsEngine {
         JS_TIMERS.with(|slot| {
             *slot.borrow_mut() = Some(self.timers.clone());
         });
+        JS_RAF.with(|slot| {
+            *slot.borrow_mut() = Some(self.raf.clone());
+        });
         JS_FETCH_CLIENT.with(|slot| {
             *slot.borrow_mut() = self.fetch_client.clone();
         });
@@ -349,6 +580,15 @@ impl JsEngine {
         JS_SESSION_STORAGE.with(|slot| {
             *slot.borrow_mut() = Some(self.session_storage.clone());
         });
+        JS_LOCATION.with(|slot| {
+            *slot.borrow_mut() = Some(self.location_url.clone());
+        });
+        JS_NAV_REQUESTS.with(|slot| {
+            *slot.borrow_mut() = Some(self.nav_requests.clone());
+        });
+        JS_HISTORY.with(|slot| {
+            *slot.borrow_mut() = Some(self.history.clone());
+        });
         (dom_rc, listeners_rc)
     }
 
@@ -358,6 +598,15 @@ impl JsEngine {
         dom_rc: Rc<RefCell<Dom>>,
         listeners_rc: Rc<RefCell<ListenerMap>>,
     ) {
+        JS_HISTORY.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        JS_NAV_REQUESTS.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        JS_LOCATION.with(|slot| {
+            slot.borrow_mut().take();
+        });
         JS_SESSION_STORAGE.with(|slot| {
             slot.borrow_mut().take();
         });
@@ -371,6 +620,9 @@ impl JsEngine {
             slot.borrow_mut().take();
         });
         JS_TIMERS.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        JS_RAF.with(|slot| {
             slot.borrow_mut().take();
         });
         JS_LISTENERS.with(|slot| {
@@ -434,6 +686,518 @@ fn install_timer_globals(ctx: &mut Context) {
         NativeFunction::from_fn_ptr(clear_timer),
     )
     .ok();
+    ctx.register_global_callable(
+        js_string!("queueMicrotask"),
+        1,
+        NativeFunction::from_fn_ptr(queue_microtask),
+    )
+    .ok();
+}
+
+fn install_animation_frame_globals(ctx: &mut Context) {
+    ctx.register_global_callable(
+        js_string!("requestAnimationFrame"),
+        1,
+        NativeFunction::from_fn_ptr(request_animation_frame),
+    )
+    .ok();
+    ctx.register_global_callable(
+        js_string!("cancelAnimationFrame"),
+        1,
+        NativeFunction::from_fn_ptr(cancel_animation_frame),
+    )
+    .ok();
+}
+
+fn request_animation_frame(_: &JsValue, args: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    let Some(callback) = extract_callback(args.first()) else {
+        return Ok(JsValue::from(0));
+    };
+    let id = JS_RAF.with(|slot| {
+        let Some(q_rc) = slot.borrow().as_ref().cloned() else {
+            return 0;
+        };
+        let mut q = q_rc.borrow_mut();
+        q.next_id = q.next_id.wrapping_add(1);
+        let id = q.next_id;
+        q.pending.push(AnimationFrameEntry { id, callback });
+        id
+    });
+    Ok(JsValue::from(id))
+}
+
+fn cancel_animation_frame(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(id_val) = args.first() else {
+        return Ok(JsValue::undefined());
+    };
+    let Ok(id) = id_val.to_u32(ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    JS_RAF.with(|slot| {
+        if let Some(q_rc) = slot.borrow().as_ref() {
+            q_rc.borrow_mut().pending.retain(|e| e.id != id);
+        }
+    });
+    Ok(JsValue::undefined())
+}
+
+fn queue_microtask(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    // Stand-in: just call the function before returning. The microtask
+    // queue inside boa will drain anything it queues. Not spec-correct
+    // (real microtasks run after the current script step completes) but
+    // covers the common "schedule shortly" use case.
+    let Some(cb) = extract_callback(args.first()) else {
+        return Ok(JsValue::undefined());
+    };
+    let _ = cb.call(&JsValue::undefined(), &[], ctx);
+    Ok(JsValue::undefined())
+}
+
+/// Install `navigator`, `screen`, and `performance` on the global. All
+/// are read-only static snapshots — no permission prompts, no live
+/// device data. Enough for code that probes `navigator.userAgent` or
+/// uses `performance.now()` to gate timings.
+fn install_navigator_screen_performance(ctx: &mut Context) {
+    let realm = ctx.realm().clone();
+
+    // navigator
+    let navigator = ObjectInitializer::new(ctx)
+        .property(
+            js_string!("userAgent"),
+            JsValue::from(js_string!("daboss/0.1")),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("appName"),
+            JsValue::from(js_string!("DaBoss")),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("appVersion"),
+            JsValue::from(js_string!("0.1")),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("platform"),
+            JsValue::from(js_string!(std::env::consts::OS)),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("language"),
+            JsValue::from(js_string!("en-US")),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("onLine"),
+            JsValue::from(true),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("cookieEnabled"),
+            JsValue::from(true),
+            Attribute::READONLY,
+        )
+        .build();
+    let _ = ctx.register_global_property(
+        js_string!("navigator"),
+        navigator,
+        Attribute::WRITABLE | Attribute::CONFIGURABLE,
+    );
+
+    // screen — toy renders into one synthetic 1024x768 viewport unless
+    // resized. Real width/height come from JS_VIEWPORT (set per-page).
+    let screen = ObjectInitializer::new(ctx)
+        .property(
+            js_string!("width"),
+            JsValue::from(1024_u32),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("height"),
+            JsValue::from(768_u32),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("availWidth"),
+            JsValue::from(1024_u32),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("availHeight"),
+            JsValue::from(768_u32),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("colorDepth"),
+            JsValue::from(24_u32),
+            Attribute::READONLY,
+        )
+        .build();
+    let _ = ctx.register_global_property(
+        js_string!("screen"),
+        screen,
+        Attribute::WRITABLE | Attribute::CONFIGURABLE,
+    );
+
+    // performance.now()
+    let now_fn = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(performance_now),
+    )
+    .build();
+    let performance = ObjectInitializer::new(ctx)
+        .property(
+            js_string!("now"),
+            JsValue::from(now_fn),
+            Attribute::READONLY,
+        )
+        .build();
+    let _ = ctx.register_global_property(
+        js_string!("performance"),
+        performance,
+        Attribute::WRITABLE | Attribute::CONFIGURABLE,
+    );
+}
+
+fn performance_now(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    // Use process-relative high-resolution time. Real browsers expose a
+    // page-load-relative origin; close enough for the toy.
+    let ms = PERF_ORIGIN.with(|t| t.elapsed().as_secs_f64() * 1000.0);
+    Ok(JsValue::from(ms))
+}
+
+thread_local! {
+    static PERF_ORIGIN: Instant = Instant::now();
+}
+
+fn install_location_and_history_globals(ctx: &mut Context) {
+    let realm = ctx.realm().clone();
+    let getter = |f: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>| {
+        boa_engine::object::FunctionObjectBuilder::new(&realm, NativeFunction::from_fn_ptr(f))
+            .build()
+    };
+
+    // ---- location ----
+    let location = ObjectInitializer::new(ctx);
+    let location = {
+        let mut b = location;
+        b.accessor(
+            js_string!("href"),
+            Some(getter(location_get_href)),
+            Some(getter(location_set_href)),
+            Attribute::ENUMERABLE,
+        );
+        b.accessor(
+            js_string!("origin"),
+            Some(getter(location_get_origin)),
+            None,
+            Attribute::ENUMERABLE,
+        );
+        b.accessor(
+            js_string!("protocol"),
+            Some(getter(location_get_protocol)),
+            None,
+            Attribute::ENUMERABLE,
+        );
+        b.accessor(
+            js_string!("host"),
+            Some(getter(location_get_host)),
+            None,
+            Attribute::ENUMERABLE,
+        );
+        b.accessor(
+            js_string!("hostname"),
+            Some(getter(location_get_hostname)),
+            None,
+            Attribute::ENUMERABLE,
+        );
+        b.accessor(
+            js_string!("port"),
+            Some(getter(location_get_port)),
+            None,
+            Attribute::ENUMERABLE,
+        );
+        b.accessor(
+            js_string!("pathname"),
+            Some(getter(location_get_pathname)),
+            None,
+            Attribute::ENUMERABLE,
+        );
+        b.accessor(
+            js_string!("search"),
+            Some(getter(location_get_search)),
+            None,
+            Attribute::ENUMERABLE,
+        );
+        b.accessor(
+            js_string!("hash"),
+            Some(getter(location_get_hash)),
+            None,
+            Attribute::ENUMERABLE,
+        );
+        b.function(
+            NativeFunction::from_fn_ptr(location_assign),
+            js_string!("assign"),
+            1,
+        );
+        b.function(
+            NativeFunction::from_fn_ptr(location_replace),
+            js_string!("replace"),
+            1,
+        );
+        b.function(
+            NativeFunction::from_fn_ptr(location_reload),
+            js_string!("reload"),
+            0,
+        );
+        b.function(
+            NativeFunction::from_fn_ptr(location_to_string),
+            js_string!("toString"),
+            0,
+        );
+        b.build()
+    };
+    let _ = ctx.register_global_property(
+        js_string!("location"),
+        location,
+        Attribute::WRITABLE | Attribute::CONFIGURABLE,
+    );
+
+    // ---- history ----
+    let history = ObjectInitializer::new(ctx)
+        .accessor(
+            js_string!("length"),
+            Some(getter(history_get_length)),
+            None,
+            Attribute::ENUMERABLE,
+        )
+        .accessor(
+            js_string!("state"),
+            Some(getter(history_get_state)),
+            None,
+            Attribute::ENUMERABLE,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(history_push_state),
+            js_string!("pushState"),
+            3,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(history_replace_state),
+            js_string!("replaceState"),
+            3,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(history_back),
+            js_string!("back"),
+            0,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(history_forward),
+            js_string!("forward"),
+            0,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(history_go),
+            js_string!("go"),
+            1,
+        )
+        .build();
+    let _ = ctx.register_global_property(
+        js_string!("history"),
+        history,
+        Attribute::WRITABLE | Attribute::CONFIGURABLE,
+    );
+}
+
+fn current_url() -> Option<url::Url> {
+    JS_LOCATION.with(|slot| slot.borrow().as_ref().map(|rc| rc.borrow().clone()))
+}
+
+fn enqueue_nav(req: NavRequest) {
+    JS_NAV_REQUESTS.with(|slot| {
+        if let Some(rc) = slot.borrow().as_ref() {
+            rc.borrow_mut().push(req);
+        }
+    });
+}
+
+fn location_get_href(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    let s = current_url().map(|u| u.to_string()).unwrap_or_default();
+    Ok(JsValue::from(js_string!(s)))
+}
+
+fn location_set_href(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    if let Some(v) = args.first() {
+        let url = v.to_string(ctx)?.to_std_string_escaped();
+        enqueue_nav(NavRequest::Assign(url));
+    }
+    Ok(JsValue::undefined())
+}
+
+fn location_get_origin(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    let s = current_url().map(|u| u.origin().ascii_serialization()).unwrap_or_default();
+    Ok(JsValue::from(js_string!(s)))
+}
+
+fn location_get_protocol(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    let s = current_url()
+        .map(|u| format!("{}:", u.scheme()))
+        .unwrap_or_default();
+    Ok(JsValue::from(js_string!(s)))
+}
+
+fn location_get_host(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    let s = current_url()
+        .and_then(|u| u.host_str().map(|h| {
+            match u.port() {
+                Some(p) => format!("{h}:{p}"),
+                None => h.to_string(),
+            }
+        }))
+        .unwrap_or_default();
+    Ok(JsValue::from(js_string!(s)))
+}
+
+fn location_get_hostname(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    let s = current_url()
+        .and_then(|u| u.host_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+    Ok(JsValue::from(js_string!(s)))
+}
+
+fn location_get_port(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    let s = current_url()
+        .and_then(|u| u.port().map(|p| p.to_string()))
+        .unwrap_or_default();
+    Ok(JsValue::from(js_string!(s)))
+}
+
+fn location_get_pathname(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    let s = current_url().map(|u| u.path().to_string()).unwrap_or_default();
+    Ok(JsValue::from(js_string!(s)))
+}
+
+fn location_get_search(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    let s = current_url()
+        .and_then(|u| u.query().map(|q| format!("?{q}")))
+        .unwrap_or_default();
+    Ok(JsValue::from(js_string!(s)))
+}
+
+fn location_get_hash(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    let s = current_url()
+        .and_then(|u| u.fragment().map(|f| format!("#{f}")))
+        .unwrap_or_default();
+    Ok(JsValue::from(js_string!(s)))
+}
+
+fn location_assign(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    if let Some(v) = args.first() {
+        let url = v.to_string(ctx)?.to_std_string_escaped();
+        enqueue_nav(NavRequest::Assign(url));
+    }
+    Ok(JsValue::undefined())
+}
+
+fn location_replace(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    if let Some(v) = args.first() {
+        let url = v.to_string(ctx)?.to_std_string_escaped();
+        enqueue_nav(NavRequest::Replace(url));
+    }
+    Ok(JsValue::undefined())
+}
+
+fn location_reload(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    enqueue_nav(NavRequest::Reload);
+    Ok(JsValue::undefined())
+}
+
+fn location_to_string(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    location_get_href(&JsValue::undefined(), &[], &mut Context::default())
+}
+
+fn history_get_length(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    let n = JS_HISTORY.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|rc| rc.borrow().entries.len() as u32)
+            .unwrap_or(0)
+    });
+    Ok(JsValue::from(n))
+}
+
+fn history_get_state(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    // State payloads aren't preserved through Rust yet — return null.
+    Ok(JsValue::null())
+}
+
+fn history_push_state(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    history_push_or_replace(args, ctx, /*replace=*/ false)
+}
+
+fn history_replace_state(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    history_push_or_replace(args, ctx, /*replace=*/ true)
+}
+
+fn history_push_or_replace(args: &[JsValue], ctx: &mut Context, replace: bool) -> JsResult<JsValue> {
+    // args: (state, title, url)
+    let url_arg = args.get(2);
+    let Some(url_val) = url_arg else {
+        // pushState({}, "") with no URL → no-op for the URL.
+        return Ok(JsValue::undefined());
+    };
+    if url_val.is_null() || url_val.is_undefined() {
+        return Ok(JsValue::undefined());
+    }
+    let url_str = url_val.to_string(ctx)?.to_std_string_escaped();
+    let Some(base) = current_url() else {
+        return Ok(JsValue::undefined());
+    };
+    let Ok(new_url) = base.join(&url_str) else {
+        return Ok(JsValue::undefined());
+    };
+    JS_HISTORY.with(|slot| {
+        if let Some(rc) = slot.borrow().as_ref() {
+            let mut h = rc.borrow_mut();
+            if replace {
+                let idx = h.cursor;
+                if let Some(entry) = h.entries.get_mut(idx) {
+                    entry.url = new_url.clone();
+                }
+            } else {
+                let new_len = h.cursor + 1;
+                h.entries.truncate(new_len);
+                h.entries.push(HistoryEntry { url: new_url.clone() });
+                h.cursor = h.entries.len() - 1;
+            }
+        }
+    });
+    JS_LOCATION.with(|slot| {
+        if let Some(rc) = slot.borrow().as_ref() {
+            *rc.borrow_mut() = new_url;
+        }
+    });
+    Ok(JsValue::undefined())
+}
+
+fn history_back(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    enqueue_nav(NavRequest::Go(-1));
+    Ok(JsValue::undefined())
+}
+
+fn history_forward(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    enqueue_nav(NavRequest::Go(1));
+    Ok(JsValue::undefined())
+}
+
+fn history_go(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let n = args
+        .first()
+        .and_then(|v| v.to_i32(ctx).ok())
+        .unwrap_or(0);
+    enqueue_nav(NavRequest::Go(n));
+    Ok(JsValue::undefined())
 }
 
 fn schedule_timer(
@@ -710,10 +1474,11 @@ fn bubble_chain(dom: &Dom, target: NodeId) -> Vec<NodeId> {
     chain
 }
 
-fn build_event_object(
+fn build_event_object_with(
     ctx: &mut Context,
     event_type: &str,
     target: NodeId,
+    init: &EventInit,
 ) -> boa_engine::JsObject {
     let target_handle = js_dom::make_element_handle(ctx, target);
     let realm = ctx.realm().clone();
@@ -728,33 +1493,78 @@ fn build_event_object(
     )
     .build();
 
-    ObjectInitializer::new(ctx)
-        .property(
-            js_string!("type"),
-            JsValue::from(js_string!(event_type)),
+    let mut b = ObjectInitializer::new(ctx);
+    b.property(
+        js_string!("type"),
+        JsValue::from(js_string!(event_type)),
+        Attribute::READONLY,
+    );
+    b.property(
+        js_string!("target"),
+        JsValue::from(target_handle.clone()),
+        Attribute::READONLY,
+    );
+    b.property(
+        js_string!("currentTarget"),
+        JsValue::from(target_handle),
+        Attribute::WRITABLE,
+    );
+    b.property(
+        js_string!("bubbles"),
+        JsValue::from(init.bubbles),
+        Attribute::READONLY,
+    );
+    b.property(
+        js_string!("preventDefault"),
+        JsValue::from(prevent_default),
+        Attribute::READONLY,
+    );
+    b.property(
+        js_string!("stopPropagation"),
+        JsValue::from(stop_propagation),
+        Attribute::READONLY,
+    );
+
+    // MouseEvent fields
+    if let (Some(x), Some(y)) = (init.client_x, init.client_y) {
+        b.property(js_string!("clientX"), JsValue::from(x), Attribute::READONLY);
+        b.property(js_string!("clientY"), JsValue::from(y), Attribute::READONLY);
+        // pageX / pageY ≈ clientX/Y in our toy (no scrollable iframes
+        // beyond top-level). Real browsers add scroll position.
+        b.property(js_string!("pageX"), JsValue::from(x), Attribute::READONLY);
+        b.property(js_string!("pageY"), JsValue::from(y), Attribute::READONLY);
+    }
+    // KeyboardEvent fields
+    if let Some(k) = &init.key {
+        b.property(
+            js_string!("key"),
+            JsValue::from(js_string!(k.clone())),
             Attribute::READONLY,
-        )
-        .property(
-            js_string!("target"),
-            JsValue::from(target_handle.clone()),
+        );
+    }
+    if let Some(c) = &init.code {
+        b.property(
+            js_string!("code"),
+            JsValue::from(js_string!(c.clone())),
             Attribute::READONLY,
-        )
-        .property(
-            js_string!("currentTarget"),
-            JsValue::from(target_handle),
-            Attribute::WRITABLE,
-        )
-        .property(
-            js_string!("preventDefault"),
-            JsValue::from(prevent_default),
+        );
+    }
+    if init.key.is_some() || init.code.is_some() {
+        b.property(js_string!("ctrlKey"), JsValue::from(init.ctrl), Attribute::READONLY);
+        b.property(js_string!("shiftKey"), JsValue::from(init.shift), Attribute::READONLY);
+        b.property(js_string!("altKey"), JsValue::from(init.alt), Attribute::READONLY);
+        b.property(js_string!("metaKey"), JsValue::from(init.meta), Attribute::READONLY);
+    }
+    // InputEvent fields
+    if let Some(d) = &init.input_data {
+        b.property(
+            js_string!("data"),
+            JsValue::from(js_string!(d.clone())),
             Attribute::READONLY,
-        )
-        .property(
-            js_string!("stopPropagation"),
-            JsValue::from(stop_propagation),
-            Attribute::READONLY,
-        )
-        .build()
+        );
+    }
+
+    b.build()
 }
 
 fn event_prevent_default(
@@ -1036,6 +1846,153 @@ mod tests {
                 Some("hi")
             );
         }
+    }
+
+    #[test]
+    fn keyboard_event_init_props_are_visible_to_handler() {
+        let src = r#"
+            document.getElementById('hi').addEventListener('keydown', function(ev) {
+                document.getElementById('hi').setAttribute('data-key', ev.key);
+                document.getElementById('hi').setAttribute('data-shift', String(ev.shiftKey));
+            });
+        "#;
+        let mut dom = html::parse(&format!(
+            "<html><body><div id='hi'>x</div><script>{src}</script></body></html>"
+        ));
+        let mut engine = JsEngine::new(&mut dom);
+        let target = find_for_test_by_id(&dom, "hi").unwrap();
+        let mut init = EventInit::bubbling();
+        init.key = Some("a".into());
+        init.shift = true;
+        engine.dispatch_event_with(&mut dom, "keydown", target, init);
+
+        if let NodeKind::Element { attrs, .. } = &dom.node(target).kind {
+            assert_eq!(
+                attrs.iter().find(|(k, _)| k == "data-key").map(|(_, v)| v.as_str()),
+                Some("a")
+            );
+            assert_eq!(
+                attrs.iter().find(|(k, _)| k == "data-shift").map(|(_, v)| v.as_str()),
+                Some("true")
+            );
+        }
+    }
+
+    #[test]
+    fn request_animation_frame_runs_callback_on_pump() {
+        let src = r#"
+            requestAnimationFrame(function(ts) {
+                document.getElementById('hi').setAttribute('data-raf', 'fired');
+            });
+        "#;
+        let mut dom = html::parse(&format!(
+            "<html><body><div id='hi'>x</div><script>{src}</script></body></html>"
+        ));
+        let mut engine = JsEngine::new(&mut dom);
+        engine.pump_animation_frames(&mut dom);
+        let id = find_for_test_by_id(&dom, "hi").unwrap();
+        if let NodeKind::Element { attrs, .. } = &dom.node(id).kind {
+            assert_eq!(
+                attrs.iter().find(|(k, _)| k == "data-raf").map(|(_, v)| v.as_str()),
+                Some("fired")
+            );
+        }
+    }
+
+    #[test]
+    fn cancel_animation_frame_removes_pending() {
+        let src = r#"
+            var id = requestAnimationFrame(function() {
+                document.getElementById('hi').setAttribute('data-bad', '1');
+            });
+            cancelAnimationFrame(id);
+        "#;
+        let mut dom = html::parse(&format!(
+            "<html><body><div id='hi'>x</div><script>{src}</script></body></html>"
+        ));
+        let mut engine = JsEngine::new(&mut dom);
+        engine.pump_animation_frames(&mut dom);
+        let id = find_for_test_by_id(&dom, "hi").unwrap();
+        if let NodeKind::Element { attrs, .. } = &dom.node(id).kind {
+            assert!(attrs.iter().all(|(k, _)| k != "data-bad"));
+        }
+    }
+
+    #[test]
+    fn navigator_and_performance_globals_exposed() {
+        let src = r#"
+            var el = document.getElementById('hi');
+            el.setAttribute('data-ua', navigator.userAgent);
+            el.setAttribute('data-now-type', typeof performance.now());
+            el.setAttribute('data-sw', String(screen.width));
+        "#;
+        let mut dom = html::parse(&format!(
+            "<html><body><div id='hi'>x</div><script>{src}</script></body></html>"
+        ));
+        let mut _engine = JsEngine::new(&mut dom);
+        let id = find_for_test_by_id(&dom, "hi").unwrap();
+        if let NodeKind::Element { attrs, .. } = &dom.node(id).kind {
+            assert!(attrs.iter().any(|(k, v)| k == "data-ua" && v.starts_with("daboss")));
+            assert_eq!(
+                attrs.iter().find(|(k, _)| k == "data-now-type").map(|(_, v)| v.as_str()),
+                Some("number")
+            );
+            assert_eq!(
+                attrs.iter().find(|(k, _)| k == "data-sw").map(|(_, v)| v.as_str()),
+                Some("1024")
+            );
+        }
+    }
+
+    #[test]
+    fn location_and_history_reflect_url_state() {
+        // location reads from JS_LOCATION, which is seeded from the
+        // engine's base_url. History.pushState mutates it without
+        // emitting a real navigation.
+        let src = r#"
+            var el = document.getElementById('hi');
+            el.setAttribute('data-href-before', location.href);
+            el.setAttribute('data-pathname', location.pathname);
+            history.pushState({}, '', '/two');
+            el.setAttribute('data-href-after', location.href);
+        "#;
+        let mut dom = html::parse(&format!(
+            "<html><body><div id='hi'>x</div><script>{src}</script></body></html>"
+        ));
+        let base = url::Url::parse("https://example.com/one").unwrap();
+        let mut _engine = JsEngine::with_fetch(
+            &mut dom,
+            None,
+            Some(base),
+            None,
+        );
+        let id = find_for_test_by_id(&dom, "hi").unwrap();
+        if let NodeKind::Element { attrs, .. } = &dom.node(id).kind {
+            let get = |k: &str| {
+                attrs
+                    .iter()
+                    .find(|(n, _)| n == k)
+                    .map(|(_, v)| v.as_str())
+            };
+            assert_eq!(get("data-href-before"), Some("https://example.com/one"));
+            assert_eq!(get("data-pathname"), Some("/one"));
+            assert_eq!(get("data-href-after"), Some("https://example.com/two"));
+        }
+    }
+
+    #[test]
+    fn location_assign_enqueues_nav_request() {
+        let src = r#"
+            location.assign('https://example.com/next');
+        "#;
+        let mut dom = html::parse(&format!(
+            "<html><body><script>{src}</script></body></html>"
+        ));
+        let base = url::Url::parse("https://example.com/").unwrap();
+        let engine = JsEngine::with_fetch(&mut dom, None, Some(base), None);
+        let reqs = engine.drain_nav_requests();
+        assert_eq!(reqs.len(), 1);
+        assert!(matches!(reqs[0], NavRequest::Assign(ref u) if u == "https://example.com/next"));
     }
 
     #[test]

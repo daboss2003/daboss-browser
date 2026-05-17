@@ -9,7 +9,7 @@
 use super::types::{
     AttributeOp, AttributeSelector, CalcExpr, Color, Combinator, Declaration, FontFace,
     FontSource, FontStyle, KeyframeStep, KeyframesAnim, MediaBlock, MediaCondition, MediaQuery,
-    Rule, Selector, SimpleSelector, Stylesheet, Unit, Value,
+    Nth, PseudoClass, Rule, Selector, SimpleSelector, Stylesheet, Unit, Value,
 };
 
 pub fn parse(input: &str) -> Stylesheet {
@@ -196,6 +196,39 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Read the contents of a `(...)` group at the current position,
+    /// consuming the opening and closing parens. Nested parens are
+    /// tracked. Returns the inner text (no enclosing parens).
+    fn read_balanced_paren_contents(&mut self) -> String {
+        if self.peek() != Some('(') {
+            return String::new();
+        }
+        self.advance(); // '('
+        let mut depth = 1;
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            match c {
+                '(' => {
+                    depth += 1;
+                    self.advance();
+                }
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let out = self.input[start..self.pos].to_string();
+                        self.advance(); // ')'
+                        return out;
+                    }
+                    self.advance();
+                }
+                _ => {
+                    self.advance();
+                }
+            }
+        }
+        self.input[start..self.pos].to_string()
+    }
+
     fn skip_remaining_at_rule(&mut self) {
         loop {
             self.skip_ws();
@@ -331,16 +364,39 @@ impl<'a> Parser<'a> {
                         self.advance();
                     }
                     let name = self.parse_ident()?.to_ascii_lowercase();
-                    // Some pseudo-classes take an argument: :not(...), :nth-child(...).
-                    // We parse-and-discard the argument so the rest of the selector
-                    // doesn't get confused.
-                    if self.peek() == Some('(') {
-                        self.skip_balanced('(', ')');
-                    }
+
+                    // Functional pseudo-classes carry an argument list.
+                    let arg = if self.peek() == Some('(') {
+                        Some(self.read_balanced_paren_contents())
+                    } else {
+                        None
+                    };
+
                     if is_double || is_known_pseudo_element(&name) {
                         pseudo_element = Some(name);
+                    } else if let Some(arg) = arg {
+                        let arg = arg.trim();
+                        let pc = match name.as_str() {
+                            "not" => PseudoClass::Not(parse_inner_selector_list(arg)),
+                            "is" | "matches" => {
+                                PseudoClass::Is(parse_inner_selector_list(arg))
+                            }
+                            "where" => PseudoClass::Where(parse_inner_selector_list(arg)),
+                            "nth-child" => PseudoClass::NthChild(parse_nth_arg(arg)),
+                            "nth-of-type" => PseudoClass::NthOfType(parse_nth_arg(arg)),
+                            "nth-last-child" => {
+                                PseudoClass::NthLastChild(parse_nth_arg(arg))
+                            }
+                            "nth-last-of-type" => {
+                                PseudoClass::NthLastOfType(parse_nth_arg(arg))
+                            }
+                            // Unknown functional pseudo — keep the name so
+                            // specificity counts but the cascade rejects it.
+                            _ => PseudoClass::Name(name),
+                        };
+                        ss.pseudo_classes.push(pc);
                     } else {
-                        ss.pseudo_classes.push(name);
+                        ss.pseudo_classes.push(PseudoClass::Name(name));
                     }
                     had = true;
                 }
@@ -975,6 +1031,45 @@ impl<'a> Parser<'a> {
     }
 }
 
+fn parse_inner_selector_list(arg: &str) -> Vec<Selector> {
+    Parser::new(arg).parse_selector_list().unwrap_or_default()
+}
+
+/// Parse an `:nth-*()` argument. Accepts `odd`, `even`, a bare integer,
+/// or the full `An+B` form (with optional sign on A, and optional B).
+/// Anything else falls back to `0n+0`, which matches no element.
+fn parse_nth_arg(arg: &str) -> Nth {
+    let s = arg.trim().to_ascii_lowercase();
+    if s == "odd" {
+        return Nth::ODD;
+    }
+    if s == "even" {
+        return Nth::EVEN;
+    }
+    // Strip whitespace inside the expression: `2n + 1` → `2n+1`.
+    let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+
+    if let Some(idx) = s.find('n') {
+        let (a_part, rest) = s.split_at(idx);
+        let a: i32 = match a_part {
+            "" | "+" => 1,
+            "-" => -1,
+            other => other.parse().unwrap_or(0),
+        };
+        let b_part = &rest[1..]; // skip 'n'
+        let b: i32 = if b_part.is_empty() {
+            0
+        } else {
+            b_part.parse().unwrap_or(0)
+        };
+        return Nth { a, b };
+    }
+    Nth {
+        a: 0,
+        b: s.parse().unwrap_or(0),
+    }
+}
+
 /// Parse an `@media` query prelude (everything between `@media` and `{`).
 /// Comma separates alternatives; `and` joins conditions. We support
 /// media types (`screen`/`print`/`all`) and the small set of named
@@ -1388,7 +1483,39 @@ mod tests {
     fn pseudo_class_stored_not_discarded() {
         let s = parse("a:hover { color: red; }");
         let c = &s.rules[0].selectors[0].compounds[0];
-        assert_eq!(c.pseudo_classes, vec!["hover".to_string()]);
+        assert!(matches!(
+            c.pseudo_classes[0],
+            PseudoClass::Name(ref n) if n == "hover"
+        ));
+    }
+
+    #[test]
+    fn parses_not_functional_pseudo() {
+        let s = parse("p:not(.skip) { color: red; }");
+        let c = &s.rules[0].selectors[0].compounds[0];
+        assert!(matches!(c.pseudo_classes[0], PseudoClass::Not(_)));
+    }
+
+    #[test]
+    fn parses_nth_child_argument() {
+        let cases = [
+            ("p:nth-child(2n+1)", Nth { a: 2, b: 1 }),
+            ("p:nth-child(odd)", Nth::ODD),
+            ("p:nth-child(even)", Nth::EVEN),
+            ("p:nth-child(3)", Nth { a: 0, b: 3 }),
+            ("p:nth-child(-n+2)", Nth { a: -1, b: 2 }),
+        ];
+        for (src, want) in cases {
+            let s = parse(&format!("{src} {{ color: red; }}"));
+            let pc = &s.rules[0].selectors[0].compounds[0].pseudo_classes[0];
+            match pc {
+                PseudoClass::NthChild(got) => {
+                    assert_eq!(got.a, want.a, "{src} a");
+                    assert_eq!(got.b, want.b, "{src} b");
+                }
+                other => panic!("expected NthChild for {src}, got {other:?}"),
+            }
+        }
     }
 
     #[test]

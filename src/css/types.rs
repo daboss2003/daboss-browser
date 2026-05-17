@@ -3,6 +3,104 @@
 
 use std::collections::HashMap;
 
+/// Column-major 2D affine `(sx, kx, ky, sy, tx, ty)`. Maps the point
+/// `(x, y)` to `(sx·x + ky·y + tx, kx·x + sy·y + ty)`. Mirrors the layout
+/// of `tiny_skia::Transform` so converting at paint time is trivial.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Transform2D {
+    pub sx: f32,
+    pub kx: f32,
+    pub ky: f32,
+    pub sy: f32,
+    pub tx: f32,
+    pub ty: f32,
+}
+
+impl Transform2D {
+    pub const IDENTITY: Transform2D = Transform2D {
+        sx: 1.0,
+        kx: 0.0,
+        ky: 0.0,
+        sy: 1.0,
+        tx: 0.0,
+        ty: 0.0,
+    };
+
+    pub fn translate(tx: f32, ty: f32) -> Self {
+        Self {
+            sx: 1.0,
+            kx: 0.0,
+            ky: 0.0,
+            sy: 1.0,
+            tx,
+            ty,
+        }
+    }
+
+    pub fn scale(sx: f32, sy: f32) -> Self {
+        Self {
+            sx,
+            kx: 0.0,
+            ky: 0.0,
+            sy,
+            tx: 0.0,
+            ty: 0.0,
+        }
+    }
+
+    /// `angle` is in radians.
+    pub fn rotate(angle: f32) -> Self {
+        let (s, c) = angle.sin_cos();
+        Self {
+            sx: c,
+            kx: s,
+            ky: -s,
+            sy: c,
+            tx: 0.0,
+            ty: 0.0,
+        }
+    }
+
+    /// Skew in radians (CSS uses `skewX(angle)` / `skewY(angle)`).
+    pub fn skew(ax: f32, ay: f32) -> Self {
+        Self {
+            sx: 1.0,
+            kx: ay.tan(),
+            ky: ax.tan(),
+            sy: 1.0,
+            tx: 0.0,
+            ty: 0.0,
+        }
+    }
+
+    /// `self ∘ other` — apply `other` first, then `self`.
+    pub fn then(&self, other: &Self) -> Self {
+        Self {
+            sx: self.sx * other.sx + self.ky * other.kx,
+            kx: self.kx * other.sx + self.sy * other.kx,
+            ky: self.sx * other.ky + self.ky * other.sy,
+            sy: self.kx * other.ky + self.sy * other.sy,
+            tx: self.sx * other.tx + self.ky * other.ty + self.tx,
+            ty: self.kx * other.tx + self.sy * other.ty + self.ty,
+        }
+    }
+
+    /// True if the transform is a pure translation (no rotation, scale,
+    /// or skew). Lets paint take the fast offset-only path.
+    pub fn is_pure_translate(&self) -> bool {
+        (self.sx - 1.0).abs() < 1e-5
+            && (self.sy - 1.0).abs() < 1e-5
+            && self.kx.abs() < 1e-5
+            && self.ky.abs() < 1e-5
+    }
+}
+
+impl Default for Transform2D {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
 /// Snapshot of the environment that `@media` queries are evaluated
 /// against. Built from the current page viewport at cascade time.
 #[derive(Debug, Clone, Copy)]
@@ -138,7 +236,58 @@ pub struct SimpleSelector {
     pub id: Option<String>,
     pub classes: Vec<String>,
     pub attributes: Vec<AttributeSelector>,
-    pub pseudo_classes: Vec<String>,
+    pub pseudo_classes: Vec<PseudoClass>,
+}
+
+#[derive(Debug, Clone)]
+pub enum PseudoClass {
+    /// Bare pseudo-classes: `:hover`, `:focus`, `:first-child`, etc.
+    /// Lowercased name.
+    Name(String),
+    /// `:not(...)` — element matches when *no* inner selector does.
+    Not(Vec<Selector>),
+    /// `:is(...)` / `:matches(...)` — matches if any inner does.
+    Is(Vec<Selector>),
+    /// `:where(...)` — same matching as `:is()` but contributes zero
+    /// specificity. The cascade reads this variant to do that.
+    Where(Vec<Selector>),
+    /// `:nth-child(an+b)`. The element's 1-based index among its
+    /// element siblings must satisfy `idx = a·n + b` for some `n >= 0`.
+    NthChild(Nth),
+    /// `:nth-of-type(an+b)` — same, but indexes within siblings sharing
+    /// the same tag name.
+    NthOfType(Nth),
+    /// `:nth-last-child(an+b)` — index counted from the end.
+    NthLastChild(Nth),
+    /// `:nth-last-of-type(an+b)`.
+    NthLastOfType(Nth),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Nth {
+    pub a: i32,
+    pub b: i32,
+}
+
+impl Nth {
+    /// `:nth-child(odd)` ≡ `2n+1`, `:nth-child(even)` ≡ `2n`.
+    pub const ODD: Nth = Nth { a: 2, b: 1 };
+    pub const EVEN: Nth = Nth { a: 2, b: 0 };
+
+    /// True if `index` (1-based) satisfies `a·n + b = index` for some
+    /// non-negative integer `n`.
+    pub fn matches(&self, index: i32) -> bool {
+        if index < 1 {
+            return false;
+        }
+        match self.a {
+            0 => index == self.b,
+            a => {
+                let n = (index - self.b) as f32 / a as f32;
+                n.fract() == 0.0 && n >= 0.0
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -503,6 +652,11 @@ pub struct ComputedStyle {
     /// in the CSS sense but propagates to descendants via the paint
     /// translate stack.
     pub transform_translate: Option<(f32, f32)>,
+    /// Composed 2D transform (rotate / scale / skew / matrix / mixed).
+    /// When `Some`, paint uses this matrix for rects, borders, and
+    /// background-image draws; text glyphs continue painting at the
+    /// matrix's translation component only (no per-glyph rotation yet).
+    pub transform: Option<Transform2D>,
 
     // ----- Flexbox container properties -----
     pub flex_direction: FlexDirection,
@@ -589,6 +743,7 @@ impl ComputedStyle {
             opacity: 1.0,
             box_shadow: None,
             transform_translate: None,
+            transform: None,
             flex_direction: FlexDirection::Row,
             flex_wrap: FlexWrap::NoWrap,
             justify_content: JustifyContent::FlexStart,

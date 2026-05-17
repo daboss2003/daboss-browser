@@ -169,6 +169,71 @@ impl Dom {
         }
     }
 
+    /// Detach `child` from its current parent. No-op if `child` has no
+    /// parent. Used by JS-side `removeChild` / `replaceChild`.
+    pub fn detach(&mut self, child: NodeId) {
+        let parent = match self.node(child).parent {
+            Some(p) => p,
+            None => return,
+        };
+        let prev = self.node(child).prev_sibling;
+        let next = self.node(child).next_sibling;
+        match prev {
+            Some(p) => self.node_mut(p).next_sibling = next,
+            None => self.node_mut(parent).first_child = next,
+        }
+        match next {
+            Some(n) => self.node_mut(n).prev_sibling = prev,
+            None => self.node_mut(parent).last_child = prev,
+        }
+        self.node_mut(child).parent = None;
+        self.node_mut(child).prev_sibling = None;
+        self.node_mut(child).next_sibling = None;
+    }
+
+    /// Returns `true` if `ancestor` is an ancestor of `descendant`
+    /// (inclusive). Used to validate `appendChild` / `insertBefore` so
+    /// we don't make a tree cyclic.
+    pub fn contains(&self, ancestor: NodeId, descendant: NodeId) -> bool {
+        let mut cur = Some(descendant);
+        while let Some(n) = cur {
+            if n == ancestor {
+                return true;
+            }
+            cur = self.node(n).parent;
+        }
+        false
+    }
+
+    /// Recursively clone the subtree rooted at `node` into the same
+    /// arena. Returns the id of the new root. The clone is detached
+    /// (has no parent).
+    pub fn clone_subtree(&mut self, node: NodeId) -> NodeId {
+        let kind = self.node(node).kind.clone();
+        let new_root = self.alloc(kind);
+        let kids: Vec<NodeId> = self.children(node).collect();
+        for k in kids {
+            let cloned = self.clone_subtree(k);
+            self.append_child(new_root, cloned);
+        }
+        new_root
+    }
+
+    /// Copy `other_root`'s subtree from `other` into this Dom. Returns
+    /// the new root's id in this Dom. The returned node is detached.
+    /// Useful for `innerHTML =` where the right-hand side is a freshly
+    /// parsed Dom that needs to be spliced in.
+    pub fn adopt_subtree(&mut self, other: &Dom, other_root: NodeId) -> NodeId {
+        let kind = other.node(other_root).kind.clone();
+        let new_root = self.alloc(kind);
+        let kids: Vec<NodeId> = other.children(other_root).collect();
+        for k in kids {
+            let copied = self.adopt_subtree(other, k);
+            self.append_child(new_root, copied);
+        }
+        new_root
+    }
+
     /// Detach every child of `parent` and replace them with a single text
     /// node containing `text`. Equivalent to setting `textContent` on an
     /// element in the web platform.

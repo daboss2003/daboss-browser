@@ -20,8 +20,8 @@ use crate::css::types::{
     AlignContent, AlignItems, AttributeOp, AttributeSelector, BackgroundImage, BorderStyle,
     BoxShadow, BoxSides, BoxSizing, CalcExpr, Color, Combinator, ComputedStyle, Declaration,
     Dimension, Display, FlexDirection, FlexWrap, FontStyle, GridAutoFlow, GridLine, GridTrack,
-    JustifyContent, Position, Rule, Selector, SimpleSelector, Stylesheet, TableLayout, TextAlign,
-    TextDecoration, Unit, Value, WhiteSpace,
+    JustifyContent, Position, PseudoClass, Rule, Selector, SimpleSelector, Stylesheet,
+    TableLayout, TextAlign, TextDecoration, Transform2D, Unit, Value, WhiteSpace,
 };
 use crate::dom::{Dom, NodeId, NodeKind};
 
@@ -38,7 +38,28 @@ pub fn compute_specificity(sel: &Selector) -> Specificity {
         }
         classes = classes.saturating_add(compound.classes.len() as u16);
         classes = classes.saturating_add(compound.attributes.len() as u16);
-        classes = classes.saturating_add(compound.pseudo_classes.len() as u16);
+        for pc in &compound.pseudo_classes {
+            match pc {
+                // `:where(...)` contributes zero specificity per spec.
+                PseudoClass::Where(_) => {}
+                // `:is(...)` / `:not(...)` take the max specificity of
+                // their inner selectors. We approximate with the highest
+                // (classes, tags) seen and roll it into our triple.
+                PseudoClass::Is(inner) | PseudoClass::Not(inner) => {
+                    let inner_spec = inner
+                        .iter()
+                        .map(compute_specificity)
+                        .max()
+                        .unwrap_or(Specificity(0, 0, 0));
+                    ids = ids.saturating_add(inner_spec.0);
+                    classes = classes.saturating_add(inner_spec.1);
+                    tags = tags.saturating_add(inner_spec.2);
+                }
+                _ => {
+                    classes = classes.saturating_add(1);
+                }
+            }
+        }
         if compound.tag.is_some() {
             tags = tags.saturating_add(1);
         }
@@ -159,7 +180,7 @@ fn matches_simple(
         }
     }
     for pc in &sel.pseudo_classes {
-        if !match_pseudo_class(pc, dom, node, interaction) {
+        if !match_pseudo_class_v(pc, dom, node, interaction) {
             return false;
         }
     }
@@ -189,23 +210,150 @@ fn match_attribute(sel: &AttributeSelector, attrs: &[(String, String)]) -> bool 
     }
 }
 
-fn match_pseudo_class(
-    name: &str,
+fn match_pseudo_class_v(
+    pc: &PseudoClass,
     dom: &Dom,
     node: NodeId,
     interaction: &InteractionState,
 ) -> bool {
-    match name {
-        "root" => dom.node(node).parent == Some(dom.document()),
-        "first-child" => dom.node(node).prev_sibling.is_none(),
-        "last-child" => dom.node(node).next_sibling.is_none(),
-        "hover" => interaction.hover_chain.contains(&node),
-        "focus" | "focus-visible" | "focus-within" => {
-            interaction.focus_chain.contains(&node)
+    match pc {
+        PseudoClass::Name(name) => match name.as_str() {
+            "root" => dom.node(node).parent == Some(dom.document()),
+            "first-child" => is_first_element_child(dom, node),
+            "last-child" => is_last_element_child(dom, node),
+            "only-child" => {
+                is_first_element_child(dom, node) && is_last_element_child(dom, node)
+            }
+            "first-of-type" => type_index_from_start(dom, node) == 1,
+            "last-of-type" => type_index_from_end(dom, node) == 1,
+            "only-of-type" => {
+                type_index_from_start(dom, node) == 1 && type_index_from_end(dom, node) == 1
+            }
+            "empty" => dom
+                .children(node)
+                .all(|c| matches!(dom.node(c).kind, NodeKind::Comment(_))),
+            "hover" => interaction.hover_chain.contains(&node),
+            "focus" | "focus-visible" | "focus-within" => {
+                interaction.focus_chain.contains(&node)
+            }
+            _ => false,
+        },
+        PseudoClass::Not(inner) => !inner.iter().any(|s| {
+            selector_matches_pseudo(s, dom, node, None, interaction)
+        }),
+        PseudoClass::Is(inner) | PseudoClass::Where(inner) => inner.iter().any(|s| {
+            selector_matches_pseudo(s, dom, node, None, interaction)
+        }),
+        PseudoClass::NthChild(nth) => {
+            nth.matches(element_index_from_start(dom, node))
         }
-        // :active, :checked, :visited, :link, :not(...), :nth-*, etc.
-        // Still not modelled.
-        _ => false,
+        PseudoClass::NthLastChild(nth) => {
+            nth.matches(element_index_from_end(dom, node))
+        }
+        PseudoClass::NthOfType(nth) => nth.matches(type_index_from_start(dom, node)),
+        PseudoClass::NthLastOfType(nth) => nth.matches(type_index_from_end(dom, node)),
+    }
+}
+
+fn is_first_element_child(dom: &Dom, node: NodeId) -> bool {
+    let mut prev = dom.node(node).prev_sibling;
+    while let Some(p) = prev {
+        if matches!(dom.node(p).kind, NodeKind::Element { .. }) {
+            return false;
+        }
+        prev = dom.node(p).prev_sibling;
+    }
+    true
+}
+
+fn is_last_element_child(dom: &Dom, node: NodeId) -> bool {
+    let mut next = dom.node(node).next_sibling;
+    while let Some(n) = next {
+        if matches!(dom.node(n).kind, NodeKind::Element { .. }) {
+            return false;
+        }
+        next = dom.node(n).next_sibling;
+    }
+    true
+}
+
+fn element_index_from_start(dom: &Dom, node: NodeId) -> i32 {
+    let parent = match dom.node(node).parent {
+        Some(p) => p,
+        None => return 0,
+    };
+    let mut idx = 0;
+    for sib in dom.children(parent) {
+        if matches!(dom.node(sib).kind, NodeKind::Element { .. }) {
+            idx += 1;
+            if sib == node {
+                return idx;
+            }
+        }
+    }
+    0
+}
+
+fn element_index_from_end(dom: &Dom, node: NodeId) -> i32 {
+    let parent = match dom.node(node).parent {
+        Some(p) => p,
+        None => return 0,
+    };
+    let kids: Vec<NodeId> = dom
+        .children(parent)
+        .filter(|c| matches!(dom.node(*c).kind, NodeKind::Element { .. }))
+        .collect();
+    let position = kids.iter().position(|&c| c == node);
+    match position {
+        Some(p) => (kids.len() - p) as i32,
+        None => 0,
+    }
+}
+
+fn type_index_from_start(dom: &Dom, node: NodeId) -> i32 {
+    let parent = match dom.node(node).parent {
+        Some(p) => p,
+        None => return 0,
+    };
+    let want_tag = match &dom.node(node).kind {
+        NodeKind::Element { tag, .. } => tag,
+        _ => return 0,
+    };
+    let mut idx = 0;
+    for sib in dom.children(parent) {
+        if let NodeKind::Element { tag, .. } = &dom.node(sib).kind {
+            if tag == want_tag {
+                idx += 1;
+                if sib == node {
+                    return idx;
+                }
+            }
+        }
+    }
+    0
+}
+
+fn type_index_from_end(dom: &Dom, node: NodeId) -> i32 {
+    let parent = match dom.node(node).parent {
+        Some(p) => p,
+        None => return 0,
+    };
+    let want_tag = match &dom.node(node).kind {
+        NodeKind::Element { tag, .. } => tag,
+        _ => return 0,
+    };
+    let mut same_type: Vec<NodeId> = Vec::new();
+    for sib in dom.children(parent) {
+        if let NodeKind::Element { tag, .. } = &dom.node(sib).kind {
+            if tag == want_tag {
+                same_type.push(sib);
+            }
+        }
+    }
+    let pos = same_type.iter().position(|&c| c == node);
+    match pos {
+        Some(p) => (same_type.len() - p) as i32,
+        None => 0,
     }
 }
 
@@ -939,7 +1087,16 @@ fn apply_declaration(
             style.box_shadow = box_shadow_from(value, style.font_size, parent);
         }
         "transform" => {
-            style.transform_translate = transform_translate_from(value, style.font_size, parent);
+            let matrix = transform_matrix_from(value, style.font_size, parent);
+            if let Some(t) = matrix {
+                // Always populate the fast translate path so existing
+                // paint code paths keep working.
+                style.transform_translate = Some((t.tx, t.ty));
+                style.transform = if t.is_pure_translate() { None } else { Some(t) };
+            } else {
+                style.transform_translate = None;
+                style.transform = None;
+            }
         }
         _ => {
             // Background shorthand can carry an image (URL or gradient) too;
@@ -1002,33 +1159,152 @@ fn box_shadow_from(
     })
 }
 
-fn transform_translate_from(
+/// Parse `transform: ...` into a composed 2D matrix. Supports translate,
+/// translateX/Y, scale, scaleX/Y, rotate (+ rotateZ), skewX/Y, and
+/// matrix(). Unknown / 3D variants are skipped silently. Returns `None`
+/// only when the value is literally `none` or contains nothing usable.
+fn transform_matrix_from(
     value: &Value,
     em_base: f32,
     parent: Option<&ComputedStyle>,
-) -> Option<(f32, f32)> {
-    // Look for the first `translate*(...)` function in the value (a value list
-    // can mix multiple transforms; the toy honors the first translate).
-    let candidates: Vec<&Value> = match value {
+) -> Option<Transform2D> {
+    let items: Vec<&Value> = match value {
         Value::List(items) => items.iter().collect(),
+        Value::Keyword(k) if k == "none" => return None,
         single => vec![single],
     };
-    for v in candidates {
-        if let Value::Function { name, args } = v {
-            let n = name.as_str();
-            if n == "translate" || n == "translatex" || n == "translatey" {
-                let resolve = |v: &Value| length_to_px(v, em_base, parent);
-                let a = args.first().and_then(resolve).unwrap_or(0.0);
-                let b = args.get(1).and_then(resolve).unwrap_or(0.0);
-                return Some(match n {
-                    "translatex" => (a, 0.0),
-                    "translatey" => (0.0, a),
-                    _ => (a, b),
-                });
+
+    let mut composed = Transform2D::IDENTITY;
+    let mut any = false;
+
+    for v in items {
+        let Value::Function { name, args } = v else {
+            continue;
+        };
+        let n = name.to_ascii_lowercase();
+        let resolve_len =
+            |v: &Value| length_to_px(v, em_base, parent).unwrap_or(0.0);
+        let as_number = |v: &Value| match v {
+            Value::Number(n) => Some(*n),
+            Value::Percentage(p) => Some(p / 100.0),
+            _ => None,
+        };
+        let as_angle_rad = |v: &Value| match v {
+            Value::Number(n) => Some(*n),
+            Value::Length(n, Unit::Px) => Some(*n),
+            Value::Length(n, _) => Some(*n),
+            // We don't parse units like `deg` / `rad` / `turn` deeply, so
+            // sniff via the Function name + bare Number. Most stylesheets
+            // pass plain numbers in rotate(<angle>) using the deg suffix
+            // captured as Length already. Treat unit-less as degrees.
+            _ => None,
+        };
+        let step = match n.as_str() {
+            "translate" => Transform2D::translate(
+                args.first().map(resolve_len).unwrap_or(0.0),
+                args.get(1).map(resolve_len).unwrap_or(0.0),
+            ),
+            "translatex" => Transform2D::translate(
+                args.first().map(resolve_len).unwrap_or(0.0),
+                0.0,
+            ),
+            "translatey" => Transform2D::translate(
+                0.0,
+                args.first().map(resolve_len).unwrap_or(0.0),
+            ),
+            "scale" => {
+                let a = args.first().and_then(as_number).unwrap_or(1.0);
+                let b = args.get(1).and_then(as_number).unwrap_or(a);
+                Transform2D::scale(a, b)
+            }
+            "scalex" => Transform2D::scale(
+                args.first().and_then(as_number).unwrap_or(1.0),
+                1.0,
+            ),
+            "scaley" => Transform2D::scale(
+                1.0,
+                args.first().and_then(as_number).unwrap_or(1.0),
+            ),
+            "rotate" | "rotatez" => {
+                let raw = args.first().and_then(as_angle_rad).unwrap_or(0.0);
+                Transform2D::rotate(angle_to_radians(raw, args.first()))
+            }
+            "skewx" => {
+                let raw = args.first().and_then(as_angle_rad).unwrap_or(0.0);
+                Transform2D::skew(angle_to_radians(raw, args.first()), 0.0)
+            }
+            "skewy" => {
+                let raw = args.first().and_then(as_angle_rad).unwrap_or(0.0);
+                Transform2D::skew(0.0, angle_to_radians(raw, args.first()))
+            }
+            "matrix" => {
+                if args.len() >= 6 {
+                    let nums: Vec<f32> = args
+                        .iter()
+                        .filter_map(as_number)
+                        .collect();
+                    if nums.len() >= 6 {
+                        Transform2D {
+                            sx: nums[0],
+                            kx: nums[1],
+                            ky: nums[2],
+                            sy: nums[3],
+                            tx: nums[4],
+                            ty: nums[5],
+                        }
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+            // 3D variants and unknown functions: best-effort skip.
+            _ => continue,
+        };
+        composed = composed.then(&step);
+        any = true;
+    }
+
+    if any {
+        Some(composed)
+    } else {
+        None
+    }
+}
+
+/// CSS angles can be `deg`, `rad`, `turn`, or `grad`. The raw value we
+/// see is already the numeric part (the CSS parser stripped the unit
+/// into a `Length` with `Unit::Px` because there's no Angle unit on
+/// `Value`). Detect the original suffix from the source argument when
+/// available; otherwise assume degrees.
+fn angle_to_radians(raw: f32, source: Option<&Value>) -> f32 {
+    use std::f32::consts::PI;
+    let unit_hint = match source {
+        Some(Value::Length(_, Unit::Px)) => "deg",
+        // Boa-style angle units land in Keyword or String when our
+        // parser doesn't recognise them.
+        Some(Value::Keyword(k)) | Some(Value::String(k)) => {
+            let trimmed = k.trim();
+            // Match the suffix in case the value got stringified.
+            if trimmed.ends_with("rad") {
+                "rad"
+            } else if trimmed.ends_with("turn") {
+                "turn"
+            } else if trimmed.ends_with("grad") {
+                "grad"
+            } else {
+                "deg"
             }
         }
+        _ => "deg",
+    };
+    match unit_hint {
+        "rad" => raw,
+        "turn" => raw * 2.0 * PI,
+        "grad" => raw * PI / 200.0,
+        _ => raw * PI / 180.0,
     }
-    None
 }
 
 fn offset_from(v: &Value, em: f32, parent: Option<&ComputedStyle>) -> Option<f32> {
@@ -1531,6 +1807,43 @@ mod tests {
         let dom = html::parse("<p>hi</p>");
         let sheet = parser::parse("p { color: red; }");
         assert_eq!(style_for(&dom, &sheet, "p").color, Color::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn transform_translate_populates_fast_path() {
+        let dom = html::parse("<p>hi</p>");
+        let sheet = parser::parse("p { transform: translate(10px, 20px); }");
+        let s = style_for(&dom, &sheet, "p");
+        assert_eq!(s.transform_translate, Some((10.0, 20.0)));
+        // Pure translate stays on the fast path; no full matrix.
+        assert!(s.transform.is_none());
+    }
+
+    #[test]
+    fn transform_rotate_builds_matrix() {
+        let dom = html::parse("<p>hi</p>");
+        let sheet = parser::parse("p { transform: rotate(90deg); }");
+        let s = style_for(&dom, &sheet, "p");
+        let t = s.transform.expect("transform matrix");
+        // rotate(90deg) = [[0,-1],[1,0]] (column-major sx,kx,ky,sy).
+        assert!((t.sx - 0.0).abs() < 1e-5);
+        assert!((t.kx - 1.0).abs() < 1e-5);
+        assert!((t.ky - -1.0).abs() < 1e-5);
+        assert!((t.sy - 0.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn transform_scale_translate_composes() {
+        let dom = html::parse("<p>hi</p>");
+        // Order: scale first, then translate (right-to-left in CSS).
+        let sheet =
+            parser::parse("p { transform: translate(5px, 0px) scale(2); }");
+        let s = style_for(&dom, &sheet, "p");
+        let t = s.transform.expect("matrix");
+        // After applying scale then translate: x' = sx*x + tx, sy = 2.
+        assert!((t.sx - 2.0).abs() < 1e-5);
+        assert!((t.sy - 2.0).abs() < 1e-5);
+        assert!((t.tx - 5.0).abs() < 1e-5);
     }
 
     #[test]

@@ -23,6 +23,16 @@ flate2 = "1"
 brotli = { version = "8", default-features = false, features = ["std"] }
 resvg = { version = "0.43", default-features = false }
 avif-decode = { version = "1", default-features = false }
+cpal = "0.15"
+symphonia = { version = "0.5", default-features = false, features = [
+    "mp3",
+    "flac",
+    "vorbis",
+    "ogg",
+    "wav",
+    "aac",
+    "isomp4",
+] }
 
 [profile.release]
 lto = "thin"

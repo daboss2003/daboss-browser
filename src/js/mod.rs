@@ -51,6 +51,13 @@ pub(crate) mod xhr;
 
 pub use canvas::CanvasSurfaces;
 
+/// Shared registry of `<audio>` elements per page. The browser
+/// pre-decodes each audio source during navigate and stashes the
+/// resulting `AudioElement` here; the JS shims for `play()` /
+/// `pause()` / `currentTime` etc. look up by `NodeId`.
+pub type AudioElements =
+    std::rc::Rc<std::cell::RefCell<std::collections::HashMap<crate::dom::NodeId, crate::audio::AudioElement>>>;
+
 pub use engine::JsEngine;
 pub use storage::StorageArea;
 

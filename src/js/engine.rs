@@ -140,6 +140,11 @@ thread_local! {
         Option<Rc<RefCell<std::collections::HashMap<NodeId, Vec<(String, String)>>>>>,
     > = const { RefCell::new(None) };
 
+    /// Audio elements installed for the duration of script execution
+    /// so `<audio>.play()` / `.pause()` shims can find their target.
+    pub(crate) static JS_AUDIO_ELEMENTS: RefCell<Option<super::AudioElements>> =
+        const { RefCell::new(None) };
+
     /// Per-dispatch flags toggled by `event.preventDefault()` /
     /// `event.stopPropagation()`. Reset at the start of each dispatch.
     pub(crate) static EVENT_FLAGS: RefCell<EventFlags> = const { RefCell::new(EventFlags::EMPTY) };
@@ -202,6 +207,10 @@ pub struct JsEngine {
     /// Per-element snapshot of resolved CSS values that the browser
     /// fills in after every cascade. Backs `getComputedStyle()`.
     computed_styles: Rc<RefCell<std::collections::HashMap<NodeId, Vec<(String, String)>>>>,
+    /// Audio elements keyed by NodeId. Populated by the browser at
+    /// navigation time (audio bytes are decoded once and persist on
+    /// the page).
+    audio_elements: super::AudioElements,
 }
 
 /// Outcome of an event dispatch — informs the caller whether to skip the
@@ -344,6 +353,8 @@ impl JsEngine {
         let computed_styles: Rc<
             RefCell<std::collections::HashMap<NodeId, Vec<(String, String)>>>,
         > = Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let audio_elements: super::AudioElements =
+            Rc::new(RefCell::new(std::collections::HashMap::new()));
         let mut engine = JsEngine {
             ctx,
             listeners,
@@ -361,6 +372,7 @@ impl JsEngine {
             bounding_rects,
             canvas_surfaces,
             computed_styles,
+            audio_elements,
         };
         if allow_inline_scripts {
             engine.run_initial_scripts(dom);
@@ -379,6 +391,13 @@ impl JsEngine {
     /// reads from this to composite canvas pixels onto the page.
     pub fn canvas_surfaces(&self) -> super::CanvasSurfaces {
         self.canvas_surfaces.clone()
+    }
+
+    /// Shared handle to the page's prefetched `<audio>` instances.
+    /// The browser populates this during navigation; JS shims read /
+    /// drive playback.
+    pub fn audio_elements(&self) -> super::AudioElements {
+        self.audio_elements.clone()
     }
 
     /// Replace the per-element computed-style snapshot consumed by
@@ -705,6 +724,9 @@ impl JsEngine {
         JS_COMPUTED_STYLES.with(|slot| {
             *slot.borrow_mut() = Some(self.computed_styles.clone());
         });
+        JS_AUDIO_ELEMENTS.with(|slot| {
+            *slot.borrow_mut() = Some(self.audio_elements.clone());
+        });
         (dom_rc, listeners_rc)
     }
 
@@ -727,6 +749,9 @@ impl JsEngine {
             slot.borrow_mut().take();
         });
         JS_COMPUTED_STYLES.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        JS_AUDIO_ELEMENTS.with(|slot| {
             slot.borrow_mut().take();
         });
         JS_NAV_REQUESTS.with(|slot| {

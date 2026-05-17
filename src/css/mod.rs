@@ -9,9 +9,10 @@ pub use parser::{parse, parse_selector_list_str};
 #[allow(unused_imports)]
 pub use types::{
     AlignContent, AlignItems, BackgroundImage, BorderStyle, BoxShadow, BoxSides, BoxSizing, Color,
-    ComputedStyle, Dimension, Display, FlexDirection, FlexWrap, FontStyle, GridAutoFlow, GridLine,
-    GridPlacement, GridTrack, JustifyContent, MediaCondition, MediaQuery, Position, Selector,
-    Stylesheet, TableLayout, TextAlign, TextDecoration, Viewport, WhiteSpace,
+    ComputedStyle, Dimension, Direction, Display, FilterFunction, FlexDirection, FlexWrap,
+    FontStyle, GridAutoFlow, GridLine, GridPlacement, GridTrack, JustifyContent, MediaCondition,
+    MediaQuery, Overflow, Position, Selector, Stylesheet, TableLayout, TextAlign, TextDecoration,
+    TextOverflow, Viewport, WhiteSpace,
 };
 
 use crate::dom::{Dom, NodeId, NodeKind};

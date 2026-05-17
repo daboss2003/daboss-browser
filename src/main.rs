@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod audio;
 mod css;
 mod dom;
 mod html;
@@ -31,6 +32,9 @@ const PAINT_HEIGHT_CEILING: u32 = 65_535;
 /// Height (px) of the browser chrome strip at the top of the window —
 /// holds the URL bar.
 const CHROME_HEIGHT: u32 = 36;
+
+/// Maximum number of preserved Pages in the back-forward cache.
+const BFCACHE_CAP: usize = 5;
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -176,6 +180,10 @@ struct Page {
     inputs: std::collections::HashMap<dom::NodeId, String>,
     /// Rendered iframe contents, keyed by the iframe's NodeId in this page.
     iframes: std::collections::HashMap<dom::NodeId, IframeContent>,
+    /// Audio elements keyed by their `<audio>` element id, prefetched
+    /// during navigation. Held in a shared `Rc<RefCell>` so JS shims
+    /// can grab the same map via a thread-local.
+    audio: js::AudioElements,
     /// Page-scoped JS context. Owns the long-lived `boa::Context` plus the
     /// addEventListener registry, so click handlers registered by inline
     /// scripts can fire on subsequent user input.
@@ -239,6 +247,13 @@ struct Browser {
     /// `history` indicating where in the back-stack we currently are.
     /// `None` means we're at the live tip (no back-navigation active).
     history_cursor: Option<usize>,
+
+    /// Back-forward cache. Each entry preserves a fully-rendered Page
+    /// keyed by URL so Back / Forward can restore without refetching
+    /// (no network round-trip, no JS re-execution, scroll position
+    /// preserved). Capped at `BFCACHE_CAP` entries — evicted oldest
+    /// first.
+    bfcache: Vec<(url::Url, Page, f32)>,
 }
 
 impl Browser {
@@ -265,6 +280,7 @@ impl Browser {
             page: None,
             history: Vec::new(),
             history_cursor: None,
+            bfcache: Vec::new(),
         }
     }
 
@@ -282,6 +298,39 @@ impl Browser {
             }
         };
         eprintln!("[nav] → {parsed}");
+
+        // BFCache: if a previously-rendered Page for this URL is
+        // sitting in the cache, restore it instead of refetching.
+        // `record_history` is false when we got here via Back/Forward
+        // so the typical hit path is exactly that case.
+        if !record_history {
+            if let Some((parsed_match, page, scroll_y)) = self.bfcache_take(&parsed) {
+                eprintln!("[bfcache] restored {parsed_match}");
+                if let Some(prev) = self.page.take() {
+                    self.bfcache_push(prev, self.scroll_y);
+                }
+                self.page = Some(page);
+                self.scroll_y = scroll_y;
+                self.chrome.text = parsed.to_string();
+                self.chrome.focused = false;
+                self.refresh_js_bounding_rects();
+                self.refresh_js_computed_styles();
+                if let Some(p) = self.page.as_mut() {
+                    if let Some(root) = first_element_child(&p.dom, p.dom.document()) {
+                        let _ = p.js.dispatch_event_with(
+                            &mut p.dom,
+                            "pageshow",
+                            root,
+                            js::engine::EventInit::non_bubbling(),
+                        );
+                    }
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+                return;
+            }
+        }
 
         let response = match self.client.get(url_str) {
             Ok(r) => r,
@@ -425,9 +474,13 @@ impl Browser {
         composite_iframes(&mut pixmap, &box_tree, &iframes);
 
         if record_history {
-            if let Some(prev) = &self.page {
+            if let Some(prev) = self.page.take() {
                 self.history.push(prev.url.clone());
                 self.history_cursor = None;
+                // Store the outgoing page into BFCache so a Back hit
+                // restores it instantly. Skips evicting matching URL
+                // (so reload-then-back works).
+                self.bfcache_push(prev, self.scroll_y);
             }
         }
 
@@ -441,6 +494,7 @@ impl Browser {
             std::collections::HashMap::new();
         seed_input_values(&dom, dom.document(), &mut inputs);
 
+        let audio_map = js_engine.audio_elements();
         self.page = Some(Page {
             url: parsed,
             dom,
@@ -453,12 +507,14 @@ impl Browser {
             focus: None,
             inputs,
             iframes,
+            audio: audio_map,
             js: js_engine,
         });
         self.scroll_y = 0.0;
 
         self.refresh_js_bounding_rects();
         self.refresh_js_computed_styles();
+        self.prefetch_audio_elements();
 
         // Lifecycle: DOMContentLoaded fires now (parse complete + script
         // execution done), then `load` after layout/paint also done.
@@ -512,9 +568,33 @@ impl Browser {
         }
     }
 
+    /// Push a Page into BFCache, evicting an existing entry for the
+    /// same URL (so duplicate URLs in history don't bloat the cache)
+    /// and the oldest entry if we'd exceed `BFCACHE_CAP`.
+    fn bfcache_push(&mut self, page: Page, scroll_y: f32) {
+        let url = page.url.clone();
+        // Drop any existing entry for this URL so the newer state wins.
+        self.bfcache.retain(|(u, _, _)| u != &url);
+        self.bfcache.push((url, page, scroll_y));
+        while self.bfcache.len() > BFCACHE_CAP {
+            self.bfcache.remove(0);
+        }
+    }
+
+    /// Take a cached Page for `url`, if any. Returns `(url, page,
+    /// scroll_y)`.
+    fn bfcache_take(&mut self, url: &url::Url) -> Option<(url::Url, Page, f32)> {
+        let idx = self.bfcache.iter().position(|(u, _, _)| u == url)?;
+        Some(self.bfcache.remove(idx))
+    }
+
     fn reload(&mut self) {
-        if let Some(url) = self.page.as_ref().map(|p| p.url.to_string()) {
-            self.navigate(&url, false);
+        if let Some(url_str) = self.page.as_ref().map(|p| p.url.to_string()) {
+            // Reload bypasses BFCache for that URL — spec behaviour.
+            if let Ok(u) = url::Url::parse(&url_str) {
+                self.bfcache.retain(|(cached, _, _)| cached != &u);
+            }
+            self.navigate(&url_str, false);
         }
     }
 
@@ -1170,6 +1250,46 @@ fn logical_key_to_string(key: &Key, text: Option<&str>) -> String {
         Key::Named(NamedKey::Super) => "Meta".into(),
         Key::Character(s) => s.to_string(),
         _ => String::new(),
+    }
+}
+
+fn collect_audio_sources(
+    dom: &dom::Dom,
+    node: dom::NodeId,
+    out: &mut Vec<(dom::NodeId, String, bool, bool, f32)>,
+) {
+    if let dom::NodeKind::Element { tag, attrs } = &dom.node(node).kind {
+        if tag == "audio" {
+            let src = attrs
+                .iter()
+                .find(|(k, _)| k == "src")
+                .map(|(_, v)| v.clone());
+            let src = src.or_else(|| {
+                // <audio><source src="..."></audio> — pick the first child source.
+                dom.children(node).find_map(|c| {
+                    if let dom::NodeKind::Element { tag: t, attrs: a } = &dom.node(c).kind {
+                        if t == "source" {
+                            return a.iter().find(|(k, _)| k == "src").map(|(_, v)| v.clone());
+                        }
+                    }
+                    None
+                })
+            });
+            if let Some(src) = src.filter(|s| !s.is_empty()) {
+                let autoplay = attrs.iter().any(|(k, _)| k == "autoplay");
+                let loop_ = attrs.iter().any(|(k, _)| k == "loop");
+                let volume = attrs
+                    .iter()
+                    .find(|(k, _)| k == "volume")
+                    .and_then(|(_, v)| v.parse::<f32>().ok())
+                    .unwrap_or(1.0)
+                    .clamp(0.0, 1.0);
+                out.push((node, src, autoplay, loop_, volume));
+            }
+        }
+    }
+    for c in dom.children(node).collect::<Vec<_>>() {
+        collect_audio_sources(dom, c, out);
     }
 }
 
@@ -2291,6 +2411,42 @@ impl Browser {
             Some((id, [b.rect.x, b.rect.y, b.rect.width, b.rect.height]))
         });
         page.js.refresh_bounding_rects(entries);
+    }
+
+    /// Walk the page DOM for `<audio>` elements, fetch + decode each
+    /// `src` (WAV only for now), and stash an `AudioElement` keyed by
+    /// the audio element's NodeId. Honours `autoplay`.
+    fn prefetch_audio_elements(&mut self) {
+        let Some(page) = self.page.as_mut() else {
+            return;
+        };
+        let mut to_prefetch: Vec<(dom::NodeId, String, bool, bool, f32)> = Vec::new();
+        collect_audio_sources(&page.dom, page.dom.document(), &mut to_prefetch);
+        let base = page.url.clone();
+        let elements = page.audio.clone();
+        for (id, src, autoplay, loop_, volume) in to_prefetch {
+            let Ok(abs) = base.join(&src) else { continue };
+            let url_str = abs.to_string();
+            let ctx = net::RequestContext::new().with_initiator(base.clone());
+            let Ok(resp) = self.client.get_with(&url_str, ctx) else { continue };
+            if !(200..300).contains(&resp.status) {
+                continue;
+            }
+            let Some(wav) = audio::decode_any(&resp.body) else {
+                eprintln!("[audio] unrecognised audio format at {url_str}");
+                continue;
+            };
+            let Some(element) = audio::AudioElement::from_wav(wav) else {
+                eprintln!("[audio] could not open output stream for {url_str}");
+                continue;
+            };
+            element.set_volume(volume);
+            element.set_loop(loop_);
+            if autoplay {
+                element.play();
+            }
+            elements.borrow_mut().insert(id, element);
+        }
     }
 
     /// Build the `getComputedStyle` snapshot for the currently styled

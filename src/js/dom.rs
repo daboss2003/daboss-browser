@@ -228,6 +228,19 @@ pub(crate) fn make_element_handle(ctx: &mut Context, id: NodeId) -> JsObject {
         js_string!("getContext"),
         1,
     );
+    // <audio> playback methods. Safe to install on every element —
+    // the implementations no-op when the target isn't a registered
+    // audio element.
+    init.function(
+        NativeFunction::from_fn_ptr(audio_play),
+        js_string!("play"),
+        0,
+    );
+    init.function(
+        NativeFunction::from_fn_ptr(audio_pause),
+        js_string!("pause"),
+        0,
+    );
     init.function(
         NativeFunction::from_fn_ptr(element_append_child),
         js_string!("appendChild"),
@@ -1671,6 +1684,32 @@ fn element_get_bounding_client_rect(
         .property(js_string!("bottom"), f(y + h), Attribute::READONLY)
         .build();
     Ok(JsValue::from(obj))
+}
+
+fn audio_play(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    if let Some(id) = read_self_node_id(this, ctx) {
+        super::engine::JS_AUDIO_ELEMENTS.with(|slot| {
+            if let Some(rc) = slot.borrow().as_ref() {
+                if let Some(el) = rc.borrow().get(&id) {
+                    el.play();
+                }
+            }
+        });
+    }
+    Ok(JsValue::undefined())
+}
+
+fn audio_pause(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    if let Some(id) = read_self_node_id(this, ctx) {
+        super::engine::JS_AUDIO_ELEMENTS.with(|slot| {
+            if let Some(rc) = slot.borrow().as_ref() {
+                if let Some(el) = rc.borrow().get(&id) {
+                    el.pause();
+                }
+            }
+        });
+    }
+    Ok(JsValue::undefined())
 }
 
 fn element_get_context(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {

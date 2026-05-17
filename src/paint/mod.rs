@@ -29,7 +29,8 @@ use tiny_skia::{
 };
 
 use crate::css::{
-    BackgroundImage, BorderStyle, Color, ComputedStyle, FontStyle, StyleTree, TextDecoration,
+    BackgroundImage, BorderStyle, Color, ComputedStyle, FilterFunction, FontStyle, StyleTree,
+    TextDecoration,
 };
 use crate::dom::{Dom, NodeId, NodeKind};
 use crate::layout::{BoxTree, ImageCache, ImageInfo, ImageSlot, LayoutBox, PseudoKind, Rect};
@@ -104,6 +105,33 @@ impl Painter {
     }
 
     fn paint_subtree(
+        &mut self,
+        dom: &Dom,
+        styles: &StyleTree,
+        tree: &BoxTree,
+        images: &ImageCache,
+        node: NodeId,
+        parent_ctx: PaintCtx,
+    ) {
+        let style = styles.get(node);
+
+        // If the element has a visual filter (anything beyond opacity,
+        // which is already folded into the alpha stack), paint the
+        // subtree into an offscreen pixmap, apply the filter pixel-by-
+        // pixel, then composite back. This is the only place a child
+        // can "see" the post-filter pixels of its parent.
+        if has_visual_filter(&style.filter) {
+            if let Some(b) = tree.get(node) {
+                self.paint_subtree_with_filter(
+                    dom, styles, tree, images, node, parent_ctx, b.rect,
+                );
+                return;
+            }
+        }
+        self.paint_subtree_inner(dom, styles, tree, images, node, parent_ctx)
+    }
+
+    fn paint_subtree_inner(
         &mut self,
         dom: &Dom,
         styles: &StyleTree,
@@ -367,6 +395,60 @@ impl Painter {
         }
     }
 
+    /// Paint a filtered subtree by redirecting its drawing into an
+    /// offscreen pixmap, applying the filter pixel pass, then drawing
+    /// the result back at the element's screen position. `box_rect` is
+    /// the element's rect in screen coordinates (before this scope's
+    /// transform).
+    #[allow(clippy::too_many_arguments)]
+    fn paint_subtree_with_filter(
+        &mut self,
+        dom: &Dom,
+        styles: &StyleTree,
+        tree: &BoxTree,
+        images: &ImageCache,
+        node: NodeId,
+        parent_ctx: PaintCtx,
+        box_rect: Rect,
+    ) {
+        let style = styles.get(node);
+        let ctx = parent_ctx.with(style);
+        // Translate everything inside the filtered subtree so the
+        // element's box origin maps to (0, 0) of the offscreen pixmap.
+        let dest_x = (box_rect.x + ctx.tx).round();
+        let dest_y = (box_rect.y + ctx.ty).round();
+        let off_w = box_rect.width.ceil().max(1.0) as u32;
+        let off_h = box_rect.height.ceil().max(1.0) as u32;
+        let Some(offscreen) = Pixmap::new(off_w, off_h) else {
+            // Fallback to unfiltered paint if the offscreen alloc fails.
+            self.paint_subtree_inner(dom, styles, tree, images, node, parent_ctx);
+            return;
+        };
+        let saved = std::mem::replace(&mut self.pixmap, offscreen);
+        let inner_ctx = PaintCtx {
+            alpha: parent_ctx.alpha, // pre-element alpha; filter handles the rest
+            tx: -box_rect.x,
+            ty: -box_rect.y,
+        };
+        self.paint_subtree_inner(dom, styles, tree, images, node, inner_ctx);
+        let filtered = std::mem::replace(&mut self.pixmap, saved);
+        // Apply each filter function in declaration order.
+        let mut data = filtered.data().to_vec();
+        for f in &style.filter {
+            apply_filter_pixels(*f, &mut data);
+        }
+        let mut composed = match Pixmap::new(off_w, off_h) {
+            Some(p) => p,
+            None => return,
+        };
+        composed.data_mut().copy_from_slice(&data);
+        let transform = Transform::from_translate(dest_x, dest_y);
+        let mut paint = PixmapPaint::default();
+        paint.opacity = ctx.alpha;
+        self.pixmap
+            .draw_pixmap(0, 0, composed.as_ref(), &paint, transform, None);
+    }
+
     /// Composite a `<canvas>` element's pixmap into the page. Pulled
     /// from the `PAINT_CANVAS_SURFACES` thread-local that the browser
     /// installs around each paint pass.
@@ -525,6 +607,120 @@ impl Painter {
     }
 }
 
+/// `true` when the `filter:` chain contains anything beyond the
+/// opacity function (which the cascade already folds into the alpha
+/// stack). Triggers offscreen rendering for the subtree.
+fn has_visual_filter(chain: &[FilterFunction]) -> bool {
+    chain
+        .iter()
+        .any(|f| !matches!(f, FilterFunction::Opacity(_)))
+}
+
+/// Per-pixel application of a single filter function on a
+/// premultiplied-RGBA byte buffer.
+fn apply_filter_pixels(filter: FilterFunction, data: &mut [u8]) {
+    match filter {
+        FilterFunction::Opacity(_) => { /* already folded by cascade */ }
+        FilterFunction::Brightness(factor) => apply_brightness(data, factor),
+        FilterFunction::Contrast(factor) => apply_contrast(data, factor),
+        FilterFunction::Grayscale(amount) => apply_grayscale(data, amount),
+        FilterFunction::Invert(amount) => apply_invert(data, amount),
+        FilterFunction::Saturate(factor) => apply_saturate(data, factor),
+        FilterFunction::Sepia(amount) => apply_sepia(data, amount),
+        FilterFunction::HueRotate(_) | FilterFunction::Blur(_) => {
+            // Hue rotation needs an HSL roundtrip; blur needs a Gaussian
+            // convolution. Both are real work but well-isolated — the
+            // cascade still records them, paint just doesn't render
+            // them yet. Documented limitation.
+        }
+    }
+}
+
+fn each_rgba_unpremultiplied(data: &mut [u8], mut apply: impl FnMut(&mut u8, &mut u8, &mut u8)) {
+    for chunk in data.chunks_exact_mut(4) {
+        let a = chunk[3];
+        if a == 0 {
+            continue;
+        }
+        // Un-premultiply to operate in linear color space, then re-multiply.
+        let inv = 255.0 / a as f32;
+        let mut r = (chunk[0] as f32 * inv).clamp(0.0, 255.0);
+        let mut g = (chunk[1] as f32 * inv).clamp(0.0, 255.0);
+        let mut b = (chunk[2] as f32 * inv).clamp(0.0, 255.0);
+        let (mut r8, mut g8, mut b8) = (r as u8, g as u8, b as u8);
+        apply(&mut r8, &mut g8, &mut b8);
+        r = r8 as f32;
+        g = g8 as f32;
+        b = b8 as f32;
+        let af = a as f32 / 255.0;
+        chunk[0] = (r * af).clamp(0.0, 255.0) as u8;
+        chunk[1] = (g * af).clamp(0.0, 255.0) as u8;
+        chunk[2] = (b * af).clamp(0.0, 255.0) as u8;
+    }
+}
+
+fn apply_brightness(data: &mut [u8], factor: f32) {
+    let f = factor.max(0.0);
+    each_rgba_unpremultiplied(data, |r, g, b| {
+        *r = (*r as f32 * f).clamp(0.0, 255.0) as u8;
+        *g = (*g as f32 * f).clamp(0.0, 255.0) as u8;
+        *b = (*b as f32 * f).clamp(0.0, 255.0) as u8;
+    });
+}
+
+fn apply_contrast(data: &mut [u8], factor: f32) {
+    let f = factor.max(0.0);
+    each_rgba_unpremultiplied(data, |r, g, b| {
+        for c in [r, g, b] {
+            let v = (*c as f32 - 128.0) * f + 128.0;
+            *c = v.clamp(0.0, 255.0) as u8;
+        }
+    });
+}
+
+fn apply_grayscale(data: &mut [u8], amount: f32) {
+    let a = amount.clamp(0.0, 1.0);
+    each_rgba_unpremultiplied(data, |r, g, b| {
+        // ITU-R BT.601 luminance approximation.
+        let lum = 0.299 * *r as f32 + 0.587 * *g as f32 + 0.114 * *b as f32;
+        *r = (*r as f32 * (1.0 - a) + lum * a) as u8;
+        *g = (*g as f32 * (1.0 - a) + lum * a) as u8;
+        *b = (*b as f32 * (1.0 - a) + lum * a) as u8;
+    });
+}
+
+fn apply_invert(data: &mut [u8], amount: f32) {
+    let a = amount.clamp(0.0, 1.0);
+    each_rgba_unpremultiplied(data, |r, g, b| {
+        for c in [r, g, b] {
+            let inv = 255.0 - *c as f32;
+            *c = (*c as f32 * (1.0 - a) + inv * a) as u8;
+        }
+    });
+}
+
+fn apply_saturate(data: &mut [u8], factor: f32) {
+    let f = factor.max(0.0);
+    each_rgba_unpremultiplied(data, |r, g, b| {
+        let lum = 0.299 * *r as f32 + 0.587 * *g as f32 + 0.114 * *b as f32;
+        *r = (lum + (*r as f32 - lum) * f).clamp(0.0, 255.0) as u8;
+        *g = (lum + (*g as f32 - lum) * f).clamp(0.0, 255.0) as u8;
+        *b = (lum + (*b as f32 - lum) * f).clamp(0.0, 255.0) as u8;
+    });
+}
+
+fn apply_sepia(data: &mut [u8], amount: f32) {
+    let a = amount.clamp(0.0, 1.0);
+    each_rgba_unpremultiplied(data, |r, g, b| {
+        let nr = (0.393 * *r as f32 + 0.769 * *g as f32 + 0.189 * *b as f32).clamp(0.0, 255.0);
+        let ng = (0.349 * *r as f32 + 0.686 * *g as f32 + 0.168 * *b as f32).clamp(0.0, 255.0);
+        let nb = (0.272 * *r as f32 + 0.534 * *g as f32 + 0.131 * *b as f32).clamp(0.0, 255.0);
+        *r = (*r as f32 * (1.0 - a) + nr * a) as u8;
+        *g = (*g as f32 * (1.0 - a) + ng * a) as u8;
+        *b = (*b as f32 * (1.0 - a) + nb * a) as u8;
+    });
+}
+
 fn color_to_sk(c: Color) -> SkColor {
     SkColor::from_rgba8(c.r, c.g, c.b, c.a)
 }
@@ -621,6 +817,47 @@ mod tests {
             r < 250 && g < 250 && b < 250
         });
         assert!(any_non_white);
+    }
+
+    #[test]
+    fn grayscale_filter_collapses_red_channel() {
+        let pixmap = render(
+            "<style>body { margin: 0; } \
+             .x { background: rgb(255, 0, 0); filter: grayscale(1); \
+                  height: 20px; }</style>\
+             <div class=x></div>",
+            10,
+            10,
+        );
+        let data = pixmap.data();
+        let idx = (5 * 10 + 5) * 4;
+        let r = data[idx];
+        let g = data[idx + 1];
+        let b = data[idx + 2];
+        // Fully-saturated red under grayscale → BT.601 luminance ≈ 76
+        // for all three channels. Tolerate ±15 for rounding /
+        // premultiplied math.
+        assert!(
+            (r as i32 - g as i32).abs() < 15 && (g as i32 - b as i32).abs() < 15,
+            "expected r==g==b after grayscale, got rgb=({r},{g},{b})"
+        );
+    }
+
+    #[test]
+    fn invert_filter_flips_white_to_dark() {
+        let pixmap = render(
+            "<style>body { margin: 0; } \
+             .x { background: white; filter: invert(1); \
+                  height: 20px; }</style>\
+             <div class=x></div>",
+            10,
+            10,
+        );
+        let data = pixmap.data();
+        let idx = (5 * 10 + 5) * 4;
+        let r = data[idx];
+        // White (255) inverts to black (0). Allow for premultiply rounding.
+        assert!(r < 20, "expected dark after invert, got r = {r}");
     }
 
     #[test]

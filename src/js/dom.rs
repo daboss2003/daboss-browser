@@ -1735,6 +1735,20 @@ fn element_get_context(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> J
         .map(|v| v.to_string(ctx).map(|s| s.to_std_string_escaped()))
         .transpose()?
         .unwrap_or_default();
+    // Route to the right context backend by `type`.
+    if ty == "webgl" || ty == "webgl2" || ty == "experimental-webgl" {
+        let is_canvas = with_dom(|dom| {
+            matches!(
+                &dom.node(id).kind,
+                NodeKind::Element { tag, .. } if tag == "canvas"
+            )
+        })
+        .unwrap_or(false);
+        if !is_canvas {
+            return Ok(JsValue::null());
+        }
+        return Ok(super::webgl::get_or_create_context(ctx, id));
+    }
     if ty != "2d" {
         return Ok(JsValue::null());
     }

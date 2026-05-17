@@ -122,16 +122,11 @@ fn request_set_onsuccess(this: &JsValue, args: &[JsValue], ctx: &mut Context) ->
         .as_object()
         .and_then(|o| o.get(js_string!("result"), ctx).ok())
         .unwrap_or(JsValue::undefined());
+    let target_obj = ObjectInitializer::new(ctx)
+        .property(js_string!("result"), result, Attribute::READONLY)
+        .build();
     let event_obj = ObjectInitializer::new(ctx)
-        .property(
-            js_string!("target"),
-            JsValue::from(
-                ObjectInitializer::new(ctx)
-                    .property(js_string!("result"), result, Attribute::READONLY)
-                    .build(),
-            ),
-            Attribute::READONLY,
-        )
+        .property(js_string!("target"), JsValue::from(target_obj), Attribute::READONLY)
         .build();
     let _ = cb.call(&JsValue::undefined(), &[JsValue::from(event_obj)], ctx);
     Ok(JsValue::undefined())

@@ -229,6 +229,14 @@ pub struct JsEngine {
     ws_registry: super::websocket::WsRegistry,
     /// IndexedDB storage, origin-scoped via Browser.
     idb: super::idb::IdbState,
+    /// Live workers — each entry owns a thread + boa Context.
+    workers: super::worker::WorkerRegistry,
+    /// Per-canvas WebGL contexts. Routes alongside `canvas_surfaces`
+    /// (which carries the 2D bitmap WebGL also writes into).
+    webgl_contexts: super::webgl::WebGlContexts,
+    /// Cache API storage shared across the page (per-origin in
+    /// future).
+    caches: super::sw::Caches,
 }
 
 /// Outcome of an event dispatch — informs the caller whether to skip the
@@ -346,6 +354,9 @@ impl JsEngine {
         super::rtc::install(&mut ctx);
         super::websocket::install(&mut ctx);
         super::idb::install(&mut ctx);
+        super::worker::install(&mut ctx);
+        super::media::install(&mut ctx);
+        super::sw::install(&mut ctx);
 
         let listeners: Rc<RefCell<ListenerMap>> = Rc::new(RefCell::new(HashMap::new()));
         let timers: Rc<RefCell<TimerState>> = Rc::new(RefCell::new(TimerState::default()));
@@ -383,6 +394,11 @@ impl JsEngine {
         let ws_registry: super::websocket::WsRegistry = Rc::new(RefCell::new(Vec::new()));
         let idb: super::idb::IdbState =
             Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let workers: super::worker::WorkerRegistry = Rc::new(RefCell::new(Vec::new()));
+        let webgl_contexts: super::webgl::WebGlContexts =
+            Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let caches: super::sw::Caches =
+            Rc::new(RefCell::new(std::collections::HashMap::new()));
         let mut engine = JsEngine {
             ctx,
             listeners,
@@ -405,6 +421,10 @@ impl JsEngine {
             rtc_registry,
             rtc_runtime,
             ws_registry,
+            idb,
+            workers,
+            webgl_contexts,
+            caches,
         };
         if allow_inline_scripts {
             engine.run_initial_scripts(dom);
@@ -562,6 +582,7 @@ impl JsEngine {
         super::observers::drain_mutation_records(&mut self.ctx);
         super::rtc::drain_rtc_events(&mut self.ctx);
         super::websocket::drain_ws_inbound(&mut self.ctx);
+        super::worker::drain_worker_messages(&mut self.ctx);
         self.ctx.run_jobs();
 
         let post_count = dom_rc.borrow().node_count();
@@ -605,6 +626,7 @@ impl JsEngine {
         super::observers::drain_mutation_records(&mut self.ctx);
         super::rtc::drain_rtc_events(&mut self.ctx);
         super::websocket::drain_ws_inbound(&mut self.ctx);
+        super::worker::drain_worker_messages(&mut self.ctx);
         self.ctx.run_jobs();
         self.uninstall_thread_locals(dom, rc, listeners_rc);
     }
@@ -696,6 +718,7 @@ impl JsEngine {
         super::observers::drain_mutation_records(&mut self.ctx);
         super::rtc::drain_rtc_events(&mut self.ctx);
         super::websocket::drain_ws_inbound(&mut self.ctx);
+        super::worker::drain_worker_messages(&mut self.ctx);
         self.ctx.run_jobs();
 
         let flags = EVENT_FLAGS.with(|f| *f.borrow());
@@ -782,6 +805,18 @@ impl JsEngine {
         super::websocket::JS_WS_REGISTRY.with(|slot| {
             *slot.borrow_mut() = Some(self.ws_registry.clone());
         });
+        super::idb::JS_IDB.with(|slot| {
+            *slot.borrow_mut() = Some(self.idb.clone());
+        });
+        super::worker::JS_WORKERS.with(|slot| {
+            *slot.borrow_mut() = Some(self.workers.clone());
+        });
+        super::webgl::JS_WEBGL.with(|slot| {
+            *slot.borrow_mut() = Some(self.webgl_contexts.clone());
+        });
+        super::sw::JS_CACHES.with(|slot| {
+            *slot.borrow_mut() = Some(self.caches.clone());
+        });
         (dom_rc, listeners_rc)
     }
 
@@ -819,6 +854,18 @@ impl JsEngine {
             slot.borrow_mut().take();
         });
         super::websocket::JS_WS_REGISTRY.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        super::idb::JS_IDB.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        super::worker::JS_WORKERS.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        super::webgl::JS_WEBGL.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        super::sw::JS_CACHES.with(|slot| {
             slot.borrow_mut().take();
         });
         JS_NAV_REQUESTS.with(|slot| {

@@ -43,6 +43,9 @@ pub struct VideoElement {
     /// Process handle so we can kill ffmpeg on drop.
     child: Arc<Mutex<Option<Child>>>,
     _decoder_thread: JoinHandle<()>,
+    /// Audio player driving the parallel-decoded audio track. Held
+    /// here so dropping the video also drops the audio.
+    _audio: Option<crate::audio::AudioElement>,
     #[allow(dead_code)] // exposed for the upcoming `videoWidth` JS prop
     pub intrinsic_width: u32,
     #[allow(dead_code)] // exposed for the upcoming `videoHeight` JS prop
@@ -148,11 +151,17 @@ impl VideoElement {
             let _ = std::fs::remove_file(&path_for_thread);
         });
 
+        // Parallel-decode the audio track to PCM via a second ffmpeg
+        // pass and pipe it through cpal. No clock-based A/V sync —
+        // we accept whatever drift accumulates over a clip.
+        let audio_element = decode_audio_via_ffmpeg(&path, autoplay, loop_playback);
+
         Some(Self {
             state,
             stop,
             child: child_handle,
             _decoder_thread: decoder_thread,
+            _audio: audio_element,
             intrinsic_width,
             intrinsic_height,
         })
@@ -215,6 +224,77 @@ fn probe_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
     let w = parts.next()?.parse::<u32>().ok()?;
     let h = parts.next()?.parse::<u32>().ok()?;
     Some((w, h))
+}
+
+/// Pull the audio track out of the same media file via a second
+/// ffmpeg subprocess that writes a WAV-like PCM stream to stdout.
+/// `audio::decode_any` then ingests the bytes and the standard
+/// cpal player drives playback. Returns `None` if the file has no
+/// audio or ffmpeg refuses for any reason.
+fn decode_audio_via_ffmpeg(
+    path: &std::path::Path,
+    autoplay: bool,
+    loop_playback: bool,
+) -> Option<crate::audio::AudioElement> {
+    // Probe for audio stream presence; if none, skip.
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
+            path.to_str()?,
+        ])
+        .output()
+        .ok()?;
+    if !probe.status.success() || probe.stdout.is_empty() {
+        return None;
+    }
+
+    let mut cmd = Command::new("ffmpeg");
+    if loop_playback {
+        cmd.args(["-stream_loop", "-1"]);
+    }
+    cmd.args([
+        "-i",
+        path.to_str()?,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-vn", // ignore video
+        "-f",
+        "wav", // simple PCM container symphonia decodes immediately
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
+        "-",
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+
+    let mut child = cmd.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    let mut buf = Vec::new();
+    // Best-effort read of the full PCM stream. Long videos block this
+    // thread — for the toy that's acceptable; a streaming queue would
+    // be the next-step refinement.
+    use std::io::Read;
+    let _ = stdout.read_to_end(&mut buf);
+    let _ = child.wait();
+    let wav = crate::audio::decode_any(&buf)?;
+    let element = crate::audio::AudioElement::from_wav(wav)?;
+    if autoplay {
+        element.play();
+    }
+    let _ = loop_playback; // already handled by ffmpeg's -stream_loop
+    Some(element)
 }
 
 fn write_tempfile(bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {

@@ -45,11 +45,15 @@ pub(crate) mod canvas;
 pub(crate) mod dom;
 pub mod engine;
 pub(crate) mod idb;
+pub(crate) mod media;
 pub(crate) mod observers;
 pub(crate) mod rtc;
 pub(crate) mod storage;
+pub(crate) mod sw;
 pub(crate) mod web_classes;
+pub(crate) mod webgl;
 pub(crate) mod websocket;
+pub(crate) mod worker;
 pub(crate) mod xhr;
 
 pub use canvas::CanvasSurfaces;

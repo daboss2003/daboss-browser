@@ -32,6 +32,7 @@ use crate::dom::{Dom, NodeId, NodeKind};
 use crate::net;
 
 use super::dom as js_dom;
+use super::storage::{self, StorageArea, JS_LOCAL_STORAGE, JS_SESSION_STORAGE};
 use super::{collect_inline_scripts, install_console, JS_DOM};
 
 type ListenerMap = HashMap<(NodeId, String), Vec<JsFunction>>;
@@ -89,6 +90,12 @@ pub struct JsEngine {
     /// don't want unsolicited network I/O.
     fetch_client: Option<Rc<net::Client>>,
     base_url: Option<url::Url>,
+    /// `localStorage` map. Shared across pages within one browser run
+    /// (the [`crate::Browser`] hands a clone to each navigated engine).
+    local_storage: StorageArea,
+    /// `sessionStorage` map. Created per engine, so it resets on
+    /// navigation but survives across event handler ticks and timers.
+    session_storage: StorageArea,
 }
 
 /// Outcome of an event dispatch — informs the caller whether to skip the
@@ -105,32 +112,41 @@ impl JsEngine {
     /// scripts against `dom`. Mutations made by those scripts are visible
     /// on `dom` when this returns.
     pub fn new(dom: &mut Dom) -> Self {
-        Self::with_fetch(dom, None, None)
+        Self::with_fetch(dom, None, None, None)
     }
 
     /// Like [`JsEngine::new`] but with a network client and page base
-    /// URL plumbed through for `fetch`. The browser shell uses this
-    /// variant so scripts can reach the network through the
-    /// SSRF-guarded client; tests use [`JsEngine::new`] to stay offline.
+    /// URL plumbed through for `fetch`, plus an optional `localStorage`
+    /// area shared across navigations within one browser run. The
+    /// browser shell passes all four; tests use [`JsEngine::new`] to
+    /// stay offline and per-page-isolated.
     pub fn with_fetch(
         dom: &mut Dom,
         client: Option<Rc<net::Client>>,
         base_url: Option<url::Url>,
+        local_storage: Option<StorageArea>,
     ) -> Self {
         let mut ctx = Context::default();
         install_console(&mut ctx);
         js_dom::install(&mut ctx);
         install_timer_globals(&mut ctx);
         install_fetch_global(&mut ctx);
+        storage::install(&mut ctx);
+        install_window_alias(&mut ctx);
 
         let listeners: Rc<RefCell<ListenerMap>> = Rc::new(RefCell::new(HashMap::new()));
         let timers: Rc<RefCell<TimerState>> = Rc::new(RefCell::new(TimerState::default()));
+        let local_storage = local_storage
+            .unwrap_or_else(|| Rc::new(RefCell::new(HashMap::new())));
+        let session_storage: StorageArea = Rc::new(RefCell::new(HashMap::new()));
         let mut engine = JsEngine {
             ctx,
             listeners,
             timers,
             fetch_client: client,
             base_url,
+            local_storage,
+            session_storage,
         };
         engine.run_initial_scripts(dom);
         engine
@@ -177,6 +193,8 @@ impl JsEngine {
                 });
             }
         }
+        // Drain microtasks queued by the timer bodies.
+        self.ctx.run_jobs();
 
         let post_count = dom_rc.borrow().node_count();
         let mutated = post_count != pre_count;
@@ -213,6 +231,9 @@ impl JsEngine {
                 eprintln!("[js] script #{i} threw: {e}");
             }
         }
+        // Drain the promise / microtask queue so `.then` callbacks, the
+        // bodies after `await`, etc. all run before we hand control back.
+        self.ctx.run_jobs();
         self.uninstall_thread_locals(dom, rc, listeners_rc);
     }
 
@@ -278,6 +299,11 @@ impl JsEngine {
             }
         }
 
+        // Drain the microtask queue — handlers that called async fns or
+        // chained `.then(...)` need their continuations to run before
+        // we return to the browser.
+        self.ctx.run_jobs();
+
         let flags = EVENT_FLAGS.with(|f| *f.borrow());
         let post_mutation_marker = dom_rc.borrow().node_count();
         let mutated = post_mutation_marker != pre_mutation_marker;
@@ -317,6 +343,12 @@ impl JsEngine {
         JS_BASE_URL.with(|slot| {
             *slot.borrow_mut() = self.base_url.clone();
         });
+        JS_LOCAL_STORAGE.with(|slot| {
+            *slot.borrow_mut() = Some(self.local_storage.clone());
+        });
+        JS_SESSION_STORAGE.with(|slot| {
+            *slot.borrow_mut() = Some(self.session_storage.clone());
+        });
         (dom_rc, listeners_rc)
     }
 
@@ -326,6 +358,12 @@ impl JsEngine {
         dom_rc: Rc<RefCell<Dom>>,
         listeners_rc: Rc<RefCell<ListenerMap>>,
     ) {
+        JS_SESSION_STORAGE.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        JS_LOCAL_STORAGE.with(|slot| {
+            slot.borrow_mut().take();
+        });
         JS_BASE_URL.with(|slot| {
             slot.borrow_mut().take();
         });
@@ -349,6 +387,26 @@ impl JsEngine {
             Err(rc) => *dom = std::mem::take(&mut *rc.borrow_mut()),
         }
     }
+}
+
+/// Aliases `window` (and `self`) to the global object so scripts that
+/// reach into `window.something` or expect `self === globalThis` work.
+/// Cheap because both are just `Attribute::WRITABLE` properties — direct
+/// assignments to `window.foo = ...` mutate the global, matching browser
+/// behaviour.
+fn install_window_alias(ctx: &mut Context) {
+    let global = ctx.global_object();
+    let global_val = JsValue::from(global);
+    let _ = ctx.register_global_property(
+        js_string!("window"),
+        global_val.clone(),
+        Attribute::WRITABLE | Attribute::CONFIGURABLE,
+    );
+    let _ = ctx.register_global_property(
+        js_string!("self"),
+        global_val,
+        Attribute::WRITABLE | Attribute::CONFIGURABLE,
+    );
 }
 
 fn install_timer_globals(ctx: &mut Context) {
@@ -451,18 +509,23 @@ fn install_fetch_global(ctx: &mut Context) {
     .ok();
 }
 
-/// `fetch(url, [init])` — synchronous, returns a `Response`-shaped JS
-/// object (with `.then(cb)` for fire-and-forget Promise compat).
+/// `fetch(url, [init])` — performs the HTTP request synchronously (no
+/// real I/O concurrency yet) but wraps the result in a real
+/// [`JsPromise`] so callers can `await fetch(...)` or chain `.then()`
+/// using boa's native Promise machinery. The promise resolves with a
+/// `Response`-shaped JS object on success or with a stubbed response
+/// (`ok: false`, `status: 0`) on transport / blocklist failures.
 ///
 /// Supported `init` keys: `method` (`GET` / `POST`), `body` (string).
 /// Headers are ignored for now.
 fn js_fetch(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    use boa_engine::object::builtins::JsPromise;
+
     let Some(url_arg) = args.first() else {
-        return Ok(JsValue::null());
+        return Ok(JsPromise::resolve(JsValue::null(), ctx).into());
     };
     let url_str = url_arg.to_string(ctx)?.to_std_string_escaped();
 
-    // Resolve relative URLs against the page's base URL if we have one.
     let resolved_url = JS_BASE_URL.with(|slot| -> Option<url::Url> {
         if let Some(base) = slot.borrow().as_ref() {
             base.join(&url_str).ok()
@@ -471,14 +534,10 @@ fn js_fetch(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
         }
     });
     let Some(target_url) = resolved_url else {
-        return Ok(JsValue::from(make_failed_response(
-            ctx,
-            &url_str,
-            "invalid-url",
-        )));
+        let v = JsValue::from(make_failed_response(ctx, &url_str, "invalid-url"));
+        return Ok(JsPromise::resolve(v, ctx).into());
     };
 
-    // Parse the `init` argument for method / body.
     let mut method = "GET".to_string();
     let mut body: Option<Vec<u8>> = None;
     if let Some(init_val) = args.get(1) {
@@ -508,29 +567,23 @@ fn js_fetch(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
         })
     });
 
-    match response {
-        Some(Ok(resp)) => Ok(JsValue::from(make_response_object(
-            ctx,
-            target_url.as_str(),
-            resp,
-        ))),
+    let value = match response {
+        Some(Ok(resp)) => JsValue::from(make_response_object(ctx, target_url.as_str(), resp)),
         Some(Err(e)) => {
             eprintln!("[js] fetch({target_url}) failed: {e}");
-            Ok(JsValue::from(make_failed_response(
+            JsValue::from(make_failed_response(
                 ctx,
                 target_url.as_str(),
                 &e.to_string(),
-            )))
+            ))
         }
-        None => {
-            // No client installed (e.g., headless mode). Return a stub.
-            Ok(JsValue::from(make_failed_response(
-                ctx,
-                target_url.as_str(),
-                "no-fetch-client",
-            )))
-        }
-    }
+        None => JsValue::from(make_failed_response(
+            ctx,
+            target_url.as_str(),
+            "no-fetch-client",
+        )),
+    };
+    Ok(JsPromise::resolve(value, ctx).into())
 }
 
 fn make_response_object(
@@ -573,11 +626,6 @@ fn make_response_object(
             js_string!("json"),
             0,
         )
-        .function(
-            NativeFunction::from_fn_ptr(response_then),
-            js_string!("then"),
-            1,
-        )
         .build()
 }
 
@@ -614,11 +662,6 @@ fn make_failed_response(ctx: &mut Context, url_str: &str, reason: &str) -> boa_e
             js_string!("json"),
             0,
         )
-        .function(
-            NativeFunction::from_fn_ptr(response_then),
-            js_string!("then"),
-            1,
-        )
         .build()
 }
 
@@ -649,21 +692,6 @@ fn response_json(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<J
     parse_fn.call(&json.clone(), &[JsValue::from(body_str)], ctx)
 }
 
-/// Best-effort Promise compatibility: a `.then(cb)` that calls `cb(this)`
-/// immediately and returns whatever `cb` returned. Lets simple chains
-/// like `fetch(u).then(r => r.text())` work synchronously.
-fn response_then(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let Some(cb_val) = args.first() else {
-        return Ok(this.clone());
-    };
-    let Some(obj) = cb_val.as_object() else {
-        return Ok(this.clone());
-    };
-    let Some(cb) = JsFunction::from_object(obj.clone()) else {
-        return Ok(this.clone());
-    };
-    cb.call(&JsValue::undefined(), &[this.clone()], ctx)
-}
 
 fn bubble_chain(dom: &Dom, target: NodeId) -> Vec<NodeId> {
     // Ignore non-element targets — events shouldn't fire on Text /
@@ -891,24 +919,23 @@ mod tests {
     }
 
     #[test]
-    fn fetch_without_client_returns_stub_response() {
-        // No client plumbed in → ok=false, statusText="no-fetch-client".
-        // Use the response shape via the thenable to verify the contract.
+    fn fetch_without_client_returns_stub_promise() {
+        // No client plumbed in → promise resolves to ok=false stub. Use
+        // a real .then() — the engine drains the microtask queue after
+        // each script, so the handler fires before run_initial_scripts
+        // returns.
         let src = r#"
-            var r = fetch('https://example.com/');
-            document.getElementById('hi').setAttribute('data-ok', String(r.ok));
-            document.getElementById('hi').setAttribute('data-status', String(r.status));
-            // text() should be a no-throw call.
-            document.getElementById('hi').setAttribute('data-body', r.text());
-            // .then proxies to the callback synchronously.
-            r.then(function(resp) {
-                document.getElementById('hi').setAttribute('data-then', 'fired');
+            fetch('https://example.com/').then(function(resp) {
+                var el = document.getElementById('hi');
+                el.setAttribute('data-ok', String(resp.ok));
+                el.setAttribute('data-status', String(resp.status));
+                el.setAttribute('data-body', resp.text());
             });
         "#;
         let mut dom = html::parse(&format!(
             "<html><body><div id='hi'>x</div><script>{src}</script></body></html>"
         ));
-        let mut _engine = JsEngine::new(&mut dom); // no client
+        let mut _engine = JsEngine::new(&mut dom);
         let div = find_for_test_by_id(&dom, "hi").unwrap();
         if let NodeKind::Element { attrs, .. } = &dom.node(div).kind {
             assert_eq!(
@@ -923,9 +950,90 @@ mod tests {
                 attrs.iter().find(|(k, _)| k == "data-body").map(|(_, v)| v.as_str()),
                 Some("")
             );
+        }
+    }
+
+    #[test]
+    fn await_fetch_works_inside_async_function() {
+        // `await` on the returned Promise should resolve to the same
+        // stub response, end-to-end.
+        let src = r#"
+            (async function() {
+                var resp = await fetch('https://example.com/');
+                document.getElementById('hi').setAttribute('data-ok', String(resp.ok));
+            })();
+        "#;
+        let mut dom = html::parse(&format!(
+            "<html><body><div id='hi'>x</div><script>{src}</script></body></html>"
+        ));
+        let mut _engine = JsEngine::new(&mut dom);
+        let div = find_for_test_by_id(&dom, "hi").unwrap();
+        if let NodeKind::Element { attrs, .. } = &dom.node(div).kind {
             assert_eq!(
-                attrs.iter().find(|(k, _)| k == "data-then").map(|(_, v)| v.as_str()),
-                Some("fired")
+                attrs.iter().find(|(k, _)| k == "data-ok").map(|(_, v)| v.as_str()),
+                Some("false")
+            );
+        }
+    }
+
+    #[test]
+    fn local_and_session_storage_round_trip() {
+        let src = r#"
+            localStorage.setItem('hello', 'world');
+            sessionStorage.setItem('a', '1');
+            sessionStorage.setItem('b', '2');
+            var el = document.getElementById('hi');
+            el.setAttribute('data-local', localStorage.getItem('hello'));
+            el.setAttribute('data-len', String(sessionStorage.length));
+            el.setAttribute('data-key0', sessionStorage.key(0));
+            sessionStorage.removeItem('a');
+            el.setAttribute('data-after-remove', String(sessionStorage.length));
+            sessionStorage.clear();
+            el.setAttribute('data-after-clear', String(sessionStorage.length));
+        "#;
+        let mut dom = html::parse(&format!(
+            "<html><body><div id='hi'>x</div><script>{src}</script></body></html>"
+        ));
+        let mut _engine = JsEngine::new(&mut dom);
+        let div = find_for_test_by_id(&dom, "hi").unwrap();
+        if let NodeKind::Element { attrs, .. } = &dom.node(div).kind {
+            let get = |k: &str| {
+                attrs
+                    .iter()
+                    .find(|(name, _)| name == k)
+                    .map(|(_, v)| v.as_str())
+            };
+            assert_eq!(get("data-local"), Some("world"));
+            assert_eq!(get("data-len"), Some("2"));
+            assert_eq!(get("data-key0"), Some("a"));
+            assert_eq!(get("data-after-remove"), Some("1"));
+            assert_eq!(get("data-after-clear"), Some("0"));
+        }
+    }
+
+    #[test]
+    fn window_is_alias_for_global() {
+        let src = r#"
+            // `window` should be the global object: window === globalThis,
+            // and `window.foo = ...` should be visible as a bare global.
+            window.greeting = 'hi';
+            var el = document.getElementById('hi');
+            el.setAttribute('data-eq', String(window === globalThis));
+            el.setAttribute('data-greeting', greeting);
+        "#;
+        let mut dom = html::parse(&format!(
+            "<html><body><div id='hi'>x</div><script>{src}</script></body></html>"
+        ));
+        let mut _engine = JsEngine::new(&mut dom);
+        let div = find_for_test_by_id(&dom, "hi").unwrap();
+        if let NodeKind::Element { attrs, .. } = &dom.node(div).kind {
+            assert_eq!(
+                attrs.iter().find(|(k, _)| k == "data-eq").map(|(_, v)| v.as_str()),
+                Some("true")
+            );
+            assert_eq!(
+                attrs.iter().find(|(k, _)| k == "data-greeting").map(|(_, v)| v.as_str()),
+                Some("hi")
             );
         }
     }

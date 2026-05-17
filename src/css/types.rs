@@ -3,9 +3,117 @@
 
 use std::collections::HashMap;
 
+/// Snapshot of the environment that `@media` queries are evaluated
+/// against. Built from the current page viewport at cascade time.
+#[derive(Debug, Clone, Copy)]
+pub struct Viewport {
+    pub width: f32,
+    pub height: f32,
+    /// `prefers-color-scheme`. Always `"light"` until we add a settings
+    /// surface that lets the user pick.
+    pub color_scheme: &'static str,
+}
+
+impl Viewport {
+    pub const DEFAULT: Viewport = Viewport {
+        width: 1024.0,
+        height: 768.0,
+        color_scheme: "light",
+    };
+
+    pub fn from_size(width: f32, height: f32) -> Self {
+        Self {
+            width,
+            height,
+            color_scheme: "light",
+        }
+    }
+}
+
+impl Default for Viewport {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Stylesheet {
     pub rules: Vec<Rule>,
+    /// `@media` blocks. Cascade evaluates each block's query against the
+    /// viewport / device-state at compute time; matching blocks
+    /// contribute their `rules` to the normal cascade.
+    pub media_blocks: Vec<MediaBlock>,
+    /// `@font-face` declarations. The browser shell walks these and
+    /// downloads their `src:` URLs through the SSRF-guarded client,
+    /// then registers them with the text shaping system.
+    pub font_faces: Vec<FontFace>,
+    /// `@keyframes` rules. Stored verbatim; animation playback is a
+    /// later phase but we keep them out of "silently dropped" territory.
+    pub keyframes: Vec<KeyframesAnim>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MediaBlock {
+    pub query: MediaQuery,
+    pub rules: Vec<Rule>,
+}
+
+/// A parsed `@media` query. We support comma-separated alternatives
+/// (any one matching is enough) and `and`-joined conditions inside each
+/// alternative.
+#[derive(Debug, Clone, Default)]
+pub struct MediaQuery {
+    pub alternatives: Vec<Vec<MediaCondition>>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // fields are read by `evaluate_media_query` in the next commit
+pub enum MediaCondition {
+    /// `screen`, `print`, `all` — anything else is treated as non-matching.
+    MediaType(String),
+    MinWidth(f32),
+    MaxWidth(f32),
+    MinHeight(f32),
+    MaxHeight(f32),
+    Orientation(String),
+    PrefersColorScheme(String),
+    /// Bare `(width: 360px)` exact match — rare in practice but valid.
+    ExactWidth(f32),
+    /// Anything we don't recognise (`(any-pointer: fine)`, calc(), etc.).
+    /// Treated as non-matching so we don't accidentally apply mobile
+    /// styles desktop-wide. Carries the raw text for debug logs.
+    Unsupported(String),
+}
+
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // weight/style consumed once @font-face wiring is finished
+pub struct FontFace {
+    pub family: String,
+    pub sources: Vec<FontSource>,
+    pub weight: Option<u16>,
+    pub style: Option<FontStyle>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // format hint consumed when we pick from src: alternates
+pub enum FontSource {
+    Url(String, Option<String>),
+    Local(String),
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // steps consumed once animations land
+pub struct KeyframesAnim {
+    pub name: String,
+    pub steps: Vec<KeyframeStep>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct KeyframeStep {
+    /// `0.0` for `from`, `1.0` for `to`, `n%` → `n / 100`.
+    pub offset: f32,
+    pub declarations: Vec<Declaration>,
 }
 
 #[derive(Debug, Clone)]

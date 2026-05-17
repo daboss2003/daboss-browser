@@ -209,6 +209,11 @@ struct Browser {
 
     client: Rc<net::Client>,
 
+    /// `localStorage` shared across every page in this run. Cloned into
+    /// each navigated [`js::JsEngine`] so scripts on different URLs see
+    /// the same key/value map. No on-disk persistence yet.
+    local_storage: js::StorageArea,
+
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
     viewport_size: (u32, u32),
@@ -242,6 +247,7 @@ impl Browser {
         Self {
             pending_url: initial_url.clone(),
             client: Rc::new(net::Client::new().with_allow_loopback(allow_loopback)),
+            local_storage: Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
             window: None,
             surface: None,
             viewport_size: (1024, 768),
@@ -291,12 +297,14 @@ impl Browser {
         // Phase 7a/b/c/e: spin up a JS engine for the page and run its
         // inline `<script>` content. The engine persists on `Page` so
         // event handlers registered via `addEventListener` can fire on
-        // later clicks, and `fetch` is wired to the same SSRF-guarded
-        // client that powers page navigation.
+        // later clicks. `fetch` is wired to the same SSRF-guarded
+        // client that powers page navigation, and `localStorage` is
+        // shared with every other page in this browser run.
         let js_engine = js::JsEngine::with_fetch(
             &mut dom,
             Some(self.client.clone()),
             Some(parsed.clone()),
+            Some(self.local_storage.clone()),
         );
 
         // External stylesheets (with size cap)
@@ -321,7 +329,16 @@ impl Browser {
             }
         }
 
-        let style_tree = css::style_dom(&dom, &sheets);
+        let css_viewport = css::Viewport::from_size(
+            self.viewport_size.0 as f32,
+            self.page_viewport_height() as f32,
+        );
+        let style_tree = css::style_dom_with_viewport(
+            &dom,
+            &sheets,
+            &css::InteractionState::EMPTY,
+            &css_viewport,
+        );
 
         let mut images = layout::ImageCache::new();
         prefetch_images(&dom, &self.client, &parsed, &mut images);
@@ -667,6 +684,8 @@ impl Browser {
 
     fn recascade_and_paint(&mut self) {
         let page_w = self.viewport_size.0;
+        let css_viewport =
+            css::Viewport::from_size(page_w as f32, self.page_viewport_height() as f32);
         let Some(page) = self.page.as_mut() else {
             return;
         };
@@ -676,7 +695,12 @@ impl Browser {
             hover_chain: &hover_chain,
             focus_chain: &focus_chain,
         };
-        page.styles = css::style_dom_with(&page.dom, &page.sheets, &interaction);
+        page.styles = css::style_dom_with_viewport(
+            &page.dom,
+            &page.sheets,
+            &interaction,
+            &css_viewport,
+        );
         let max_bottom = page.pixmap.height();
         if let Some(mut pixmap) = paint::paint(
             &page.dom,

@@ -7,8 +7,9 @@
 //! phase 6 once we have interaction state).
 
 use super::types::{
-    AttributeOp, AttributeSelector, CalcExpr, Color, Combinator, Declaration, Rule, Selector,
-    SimpleSelector, Stylesheet, Unit, Value,
+    AttributeOp, AttributeSelector, CalcExpr, Color, Combinator, Declaration, FontFace,
+    FontSource, FontStyle, KeyframeStep, KeyframesAnim, MediaBlock, MediaCondition, MediaQuery,
+    Rule, Selector, SimpleSelector, Stylesheet, Unit, Value,
 };
 
 pub fn parse(input: &str) -> Stylesheet {
@@ -41,14 +42,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_stylesheet(&mut self) -> Stylesheet {
-        let mut rules = Vec::new();
+        let mut sheet = Stylesheet::default();
         loop {
             self.skip_ws();
             if self.eof() {
                 break;
             }
             if self.peek() == Some('@') {
-                self.skip_at_rule();
+                self.parse_at_rule(&mut sheet);
                 continue;
             }
             if self.peek() == Some('}') {
@@ -56,12 +57,163 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if let Some(rule) = self.parse_rule() {
-                rules.push(rule);
+                sheet.rules.push(rule);
             } else {
                 self.skip_to_block_end_or_semi();
             }
         }
-        Stylesheet { rules }
+        sheet
+    }
+
+    /// Handle a single top-level `@`-rule. Recognised:
+    ///  * `@media` — its body is recursively parsed as a normal
+    ///    stylesheet (nested `@media`s collapse, which is fine for our
+    ///    purposes).
+    ///  * `@font-face` — collected for later web-font fetching.
+    ///  * `@keyframes` / `@-webkit-keyframes` — stored verbatim.
+    ///
+    /// Everything else (`@supports`, `@page`, `@import`, etc.) is
+    /// skipped through `skip_at_rule` so we don't choke on it.
+    fn parse_at_rule(&mut self, sheet: &mut Stylesheet) {
+        // Snapshot in case we decide to skip.
+        let _start_pos = self.pos;
+        self.advance(); // '@'
+        let name = self.parse_ident().unwrap_or_default().to_ascii_lowercase();
+        match name.as_str() {
+            "media" => {
+                let query_text = self.read_prelude_until_brace();
+                if !self.consume('{') {
+                    return;
+                }
+                let inner = self.parse_at_block_inner();
+                let query = parse_media_query(&query_text);
+                sheet.media_blocks.push(MediaBlock {
+                    query,
+                    rules: inner.rules,
+                });
+                // Pull any nested @font-face / @keyframes out so they
+                // aren't trapped inside an @media we'll ignore.
+                sheet.font_faces.extend(inner.font_faces);
+                sheet.keyframes.extend(inner.keyframes);
+            }
+            "font-face" => {
+                self.skip_ws();
+                if !self.consume('{') {
+                    return;
+                }
+                let decls = self.parse_declarations();
+                self.skip_ws();
+                self.consume('}');
+                if let Some(ff) = font_face_from_declarations(&decls) {
+                    sheet.font_faces.push(ff);
+                }
+            }
+            "keyframes" | "-webkit-keyframes" | "-moz-keyframes" => {
+                let anim_name = self.read_prelude_until_brace().trim().to_string();
+                if !self.consume('{') {
+                    return;
+                }
+                let steps = self.parse_keyframes_body();
+                sheet.keyframes.push(KeyframesAnim {
+                    name: anim_name,
+                    steps,
+                });
+            }
+            _ => {
+                // Unknown @-rule. Skip its prelude + optional block.
+                self.skip_remaining_at_rule();
+            }
+        }
+    }
+
+    fn read_prelude_until_brace(&mut self) -> String {
+        let mut out = String::new();
+        while let Some(c) = self.peek() {
+            if c == '{' || c == ';' {
+                break;
+            }
+            out.push(c);
+            self.advance();
+        }
+        out
+    }
+
+    /// Parse the inside of an `@media` body as if it were a top-level
+    /// stylesheet, handling nested at-rules / regular rules until the
+    /// closing `}`. Returns the accumulated stylesheet for splicing into
+    /// the outer one.
+    fn parse_at_block_inner(&mut self) -> Stylesheet {
+        let mut sheet = Stylesheet::default();
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                None => return sheet,
+                Some('}') => {
+                    self.advance();
+                    return sheet;
+                }
+                Some('@') => {
+                    self.parse_at_rule(&mut sheet);
+                }
+                _ => {
+                    if let Some(rule) = self.parse_rule() {
+                        sheet.rules.push(rule);
+                    } else {
+                        self.skip_to_block_end_or_semi();
+                    }
+                }
+            }
+        }
+    }
+
+    fn parse_keyframes_body(&mut self) -> Vec<KeyframeStep> {
+        let mut steps = Vec::new();
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                None => return steps,
+                Some('}') => {
+                    self.advance();
+                    return steps;
+                }
+                _ => {
+                    let label = self.read_prelude_until_brace();
+                    if !self.consume('{') {
+                        // Malformed — bail.
+                        return steps;
+                    }
+                    let decls = self.parse_declarations();
+                    self.skip_ws();
+                    self.consume('}');
+                    for off in keyframe_offsets(&label) {
+                        steps.push(KeyframeStep {
+                            offset: off,
+                            declarations: decls.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    fn skip_remaining_at_rule(&mut self) {
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                None => return,
+                Some(';') => {
+                    self.advance();
+                    return;
+                }
+                Some('{') => {
+                    self.skip_balanced('{', '}');
+                    return;
+                }
+                _ => {
+                    self.advance();
+                }
+            }
+        }
     }
 
     fn parse_rule(&mut self) -> Option<Rule> {
@@ -716,28 +868,6 @@ impl<'a> Parser<'a> {
         Some(self.input[start..self.pos].to_string())
     }
 
-    fn skip_at_rule(&mut self) {
-        self.advance(); // '@'
-        let _ = self.parse_ident();
-        loop {
-            self.skip_ws();
-            match self.peek() {
-                None => return,
-                Some(';') => {
-                    self.advance();
-                    return;
-                }
-                Some('{') => {
-                    self.skip_balanced('{', '}');
-                    return;
-                }
-                _ => {
-                    self.advance();
-                }
-            }
-        }
-    }
-
     fn skip_to_block_end_or_semi(&mut self) {
         while let Some(c) = self.peek() {
             match c {
@@ -845,6 +975,231 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Parse an `@media` query prelude (everything between `@media` and `{`).
+/// Comma separates alternatives; `and` joins conditions. We support
+/// media types (`screen`/`print`/`all`) and the small set of named
+/// features the rest of the engine actually reads.
+fn parse_media_query(input: &str) -> MediaQuery {
+    let mut query = MediaQuery::default();
+    for alt in input.split(',') {
+        let conds = parse_media_alternative(alt);
+        if !conds.is_empty() {
+            query.alternatives.push(conds);
+        }
+    }
+    query
+}
+
+fn parse_media_alternative(s: &str) -> Vec<MediaCondition> {
+    let mut out = Vec::new();
+    // Tokens are either a bare ident (media type, "only", "not", "and")
+    // or a parenthesised feature.
+    let mut chars = s.trim().char_indices().peekable();
+    let bytes = s.as_bytes();
+    while let Some(&(i, c)) = chars.peek() {
+        if c.is_ascii_whitespace() {
+            chars.next();
+            continue;
+        }
+        if c == '(' {
+            // Find matching ')'.
+            let mut depth = 0;
+            let mut end = i;
+            for (j, ch) in s[i..].char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i + j;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let body = &s[i + 1..end];
+            out.push(parse_media_feature(body));
+            // Advance the iterator past the closing paren.
+            while let Some(&(j, _)) = chars.peek() {
+                if j > end {
+                    break;
+                }
+                chars.next();
+            }
+            continue;
+        }
+        // Bare token.
+        let start = i;
+        while let Some(&(j, ch)) = chars.peek() {
+            if ch.is_ascii_whitespace() || ch == '(' {
+                break;
+            }
+            chars.next();
+            let _ = j;
+            let _ = bytes;
+        }
+        let end = chars.peek().map(|(j, _)| *j).unwrap_or(s.len());
+        let tok = s[start..end].to_ascii_lowercase();
+        match tok.as_str() {
+            "and" | "only" | "" => {}
+            "not" => {
+                // Negation isn't supported beyond returning Unsupported so
+                // the whole alternative loses.
+                out.push(MediaCondition::Unsupported("not".into()));
+            }
+            // Media types
+            "screen" | "print" | "all" | "speech" => {
+                out.push(MediaCondition::MediaType(tok));
+            }
+            other => {
+                out.push(MediaCondition::Unsupported(other.into()));
+            }
+        }
+    }
+    out
+}
+
+fn parse_media_feature(body: &str) -> MediaCondition {
+    let body = body.trim();
+    let (name, value) = match body.split_once(':') {
+        Some((n, v)) => (n.trim().to_ascii_lowercase(), v.trim()),
+        None => (body.to_ascii_lowercase(), ""),
+    };
+    let px = parse_css_length_px(value);
+    match name.as_str() {
+        "min-width" => px.map(MediaCondition::MinWidth)
+            .unwrap_or_else(|| MediaCondition::Unsupported(body.to_string())),
+        "max-width" => px.map(MediaCondition::MaxWidth)
+            .unwrap_or_else(|| MediaCondition::Unsupported(body.to_string())),
+        "min-height" => px.map(MediaCondition::MinHeight)
+            .unwrap_or_else(|| MediaCondition::Unsupported(body.to_string())),
+        "max-height" => px.map(MediaCondition::MaxHeight)
+            .unwrap_or_else(|| MediaCondition::Unsupported(body.to_string())),
+        "width" => px.map(MediaCondition::ExactWidth)
+            .unwrap_or_else(|| MediaCondition::Unsupported(body.to_string())),
+        "orientation" => MediaCondition::Orientation(value.to_ascii_lowercase()),
+        "prefers-color-scheme" => MediaCondition::PrefersColorScheme(value.to_ascii_lowercase()),
+        _ => MediaCondition::Unsupported(body.to_string()),
+    }
+}
+
+/// Parse a CSS length like `"360px"`, `"45em"`, etc. into pixels.
+/// `em`/`rem` use 16px as the assumed root size, matching the cascade's
+/// default. Unit-less zero is accepted.
+fn parse_css_length_px(s: &str) -> Option<f32> {
+    let s = s.trim();
+    if s == "0" {
+        return Some(0.0);
+    }
+    let (num, unit) = split_number_unit(s)?;
+    Some(match unit {
+        "" | "px" => num,
+        "em" | "rem" => num * 16.0,
+        "pt" => num * 1.333,
+        "pc" => num * 16.0,
+        "in" => num * 96.0,
+        "cm" => num * 37.795,
+        "mm" => num * 3.7795,
+        _ => return None,
+    })
+}
+
+fn split_number_unit(s: &str) -> Option<(f32, &str)> {
+    let mut split = s.len();
+    for (i, c) in s.char_indices() {
+        if !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+') {
+            split = i;
+            break;
+        }
+    }
+    let (num, unit) = s.split_at(split);
+    Some((num.parse::<f32>().ok()?, unit))
+}
+
+fn font_face_from_declarations(decls: &[Declaration]) -> Option<FontFace> {
+    let mut ff = FontFace::default();
+    for d in decls {
+        match d.property.as_str() {
+            "font-family" => {
+                if let Some(name) = first_string_or_keyword(&d.value) {
+                    ff.family = name;
+                }
+            }
+            "src" => {
+                ff.sources = parse_font_face_src(&d.value);
+            }
+            "font-weight" => {
+                if let Value::Number(n) = &d.value {
+                    ff.weight = Some(*n as u16);
+                }
+            }
+            "font-style" => {
+                if let Value::Keyword(k) = &d.value {
+                    if k.eq_ignore_ascii_case("italic") {
+                        ff.style = Some(FontStyle::Italic);
+                    } else if k.eq_ignore_ascii_case("normal") {
+                        ff.style = Some(FontStyle::Normal);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if ff.family.is_empty() {
+        None
+    } else {
+        Some(ff)
+    }
+}
+
+fn first_string_or_keyword(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Keyword(k) => Some(k.clone()),
+        Value::List(xs) => xs.iter().find_map(first_string_or_keyword),
+        _ => None,
+    }
+}
+
+fn parse_font_face_src(v: &Value) -> Vec<FontSource> {
+    let mut out = Vec::new();
+    let mut visit = |val: &Value| match val {
+        Value::Url(u) => out.push(FontSource::Url(u.clone(), None)),
+        Value::String(s) => out.push(FontSource::Local(s.clone())),
+        _ => {}
+    };
+    match v {
+        Value::List(xs) => {
+            for x in xs {
+                visit(x);
+            }
+        }
+        other => visit(other),
+    }
+    out
+}
+
+/// Translate keyframe step labels (`from`, `to`, `50%`, `0%, 100%`) into
+/// the normalised `0.0..=1.0` offsets the engine consumes.
+fn keyframe_offsets(label: &str) -> Vec<f32> {
+    let mut out = Vec::new();
+    for piece in label.split(',') {
+        let p = piece.trim().to_ascii_lowercase();
+        match p.as_str() {
+            "from" => out.push(0.0),
+            "to" => out.push(1.0),
+            _ => {
+                let pct = p.trim_end_matches('%');
+                if let Ok(n) = pct.parse::<f32>() {
+                    out.push((n / 100.0).clamp(0.0, 1.0));
+                }
+            }
+        }
+    }
+    out
+}
+
 fn is_known_pseudo_element(name: &str) -> bool {
     matches!(
         name,
@@ -945,6 +1300,58 @@ fn named_color(name: &str) -> Option<Color> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_block_is_parsed_and_stored() {
+        let s = parse(
+            "@media (max-width: 600px) { p { color: red; } } body { color: blue; }",
+        );
+        assert_eq!(s.media_blocks.len(), 1);
+        assert_eq!(s.media_blocks[0].rules.len(), 1);
+        assert_eq!(s.rules.len(), 1);
+        assert_eq!(s.rules[0].selectors[0].compounds[0].tag.as_deref(), Some("body"));
+        // The query alternative has one MinWidth/MaxWidth condition.
+        assert!(matches!(
+            s.media_blocks[0].query.alternatives[0][0],
+            MediaCondition::MaxWidth(600.0)
+        ));
+    }
+
+    #[test]
+    fn font_face_collected() {
+        let s = parse(r#"@font-face { font-family: "Foo"; src: url(foo.woff2); }"#);
+        assert_eq!(s.font_faces.len(), 1);
+        assert_eq!(s.font_faces[0].family, "Foo");
+        assert!(matches!(
+            s.font_faces[0].sources[0],
+            FontSource::Url(ref u, _) if u == "foo.woff2"
+        ));
+    }
+
+    #[test]
+    fn keyframes_stored_with_offsets() {
+        let s = parse(
+            "@keyframes spin { from { opacity: 0; } 50% { opacity: 0.5; } to { opacity: 1; } }",
+        );
+        assert_eq!(s.keyframes.len(), 1);
+        assert_eq!(s.keyframes[0].name, "spin");
+        let offsets: Vec<f32> = s.keyframes[0]
+            .steps
+            .iter()
+            .map(|st| st.offset)
+            .collect();
+        assert_eq!(offsets, vec![0.0, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn unknown_at_rule_is_skipped_without_breaking_sheet() {
+        let s = parse("@charset \"utf-8\"; @supports (display: grid) { p { color: red; } } body { }");
+        // No crash, `body` rule still parsed.
+        assert!(s.rules.iter().any(|r| r
+            .selectors
+            .iter()
+            .any(|s| s.compounds[0].tag.as_deref() == Some("body"))));
+    }
 
     #[test]
     fn parses_simple_rule() {

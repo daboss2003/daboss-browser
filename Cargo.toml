@@ -19,6 +19,8 @@ webpki-roots = "0.26"
 cosmic-text = "0.12"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
 boa_engine = "0.20"
+flate2 = "1"
+brotli = { version = "8", default-features = false, features = ["std"] }
 
 [profile.release]
 lto = "thin"

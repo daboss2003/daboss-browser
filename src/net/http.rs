@@ -54,8 +54,10 @@ fn default_headers() -> Vec<(String, String)> {
     vec![
         ("User-Agent".into(), "daboss/0.1".into()),
         ("Accept".into(), "*/*".into()),
-        // identity: refuse compression so we don't have to decode gzip/br yet.
-        ("Accept-Encoding".into(), "identity".into()),
+        // Advertise the compressions we can decode. gzip/deflate go
+        // through flate2; br through the brotli crate. `identity` stays
+        // in the list so a server can opt out.
+        ("Accept-Encoding".into(), "gzip, br, deflate, identity".into()),
         // Drop the connection after one request — keeps the parser simple.
         ("Connection".into(), "close".into()),
     ]
@@ -103,12 +105,88 @@ impl Response {
             read_until_close(&mut br, max_bytes)?
         };
 
+        // Apply Content-Encoding decoders. `gzip`, `deflate`, `br` are
+        // supported; `identity` is a no-op. Anything else is a hard
+        // error rather than serving the page as garbage bytes.
+        let body = match find_header(&headers, "Content-Encoding") {
+            None => body,
+            Some(enc) => decode_content_encoding(enc, &body, max_bytes)?,
+        };
+
         Ok(Self {
             status,
             reason,
             headers,
             body,
         })
+    }
+}
+
+/// Decode a body whose `Content-Encoding` header lists one or more
+/// codings (RFC 9110 §8.4 — multiple values are applied right-to-left
+/// in the encoder, so we decode left-to-right). Caps the cumulative
+/// decoded size at `max_bytes`.
+fn decode_content_encoding(enc: &str, body: &[u8], max_bytes: usize) -> Result<Vec<u8>> {
+    let mut current = body.to_vec();
+    for codings in enc.split(',') {
+        let coding = codings.trim().to_ascii_lowercase();
+        if coding.is_empty() || coding == "identity" {
+            continue;
+        }
+        current = match coding.as_str() {
+            "gzip" | "x-gzip" => decode_gzip(&current, max_bytes)?,
+            "deflate" => decode_deflate(&current, max_bytes)?,
+            "br" => decode_brotli(&current, max_bytes)?,
+            other => {
+                return Err(Error::BadResponse(format!(
+                    "unsupported content-encoding: {other}"
+                )));
+            }
+        };
+        if current.len() > max_bytes {
+            return Err(Error::ResponseTooLarge(max_bytes));
+        }
+    }
+    Ok(current)
+}
+
+fn decode_gzip(input: &[u8], max_bytes: usize) -> Result<Vec<u8>> {
+    use flate2::read::GzDecoder;
+    let mut decoder = GzDecoder::new(input);
+    read_capped(&mut decoder, max_bytes, "gzip")
+}
+
+fn decode_deflate(input: &[u8], max_bytes: usize) -> Result<Vec<u8>> {
+    // Some servers send raw deflate, others zlib-wrapped. Try zlib
+    // first (the spec-correct interpretation) and fall back to raw.
+    use flate2::read::{DeflateDecoder, ZlibDecoder};
+    let mut zlib = ZlibDecoder::new(input);
+    if let Ok(out) = read_capped(&mut zlib, max_bytes, "deflate(zlib)") {
+        return Ok(out);
+    }
+    let mut raw = DeflateDecoder::new(input);
+    read_capped(&mut raw, max_bytes, "deflate(raw)")
+}
+
+fn decode_brotli(input: &[u8], max_bytes: usize) -> Result<Vec<u8>> {
+    let mut reader = brotli::Decompressor::new(input, 4096);
+    read_capped(&mut reader, max_bytes, "br")
+}
+
+fn read_capped<R: Read>(r: &mut R, max_bytes: usize, label: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = r.read(&mut buf).map_err(|e| {
+            Error::BadResponse(format!("{label} decode failed: {e}"))
+        })?;
+        if n == 0 {
+            return Ok(out);
+        }
+        if out.len() + n > max_bytes {
+            return Err(Error::ResponseTooLarge(max_bytes));
+        }
+        out.extend_from_slice(&buf[..n]);
     }
 }
 
@@ -261,6 +339,58 @@ mod tests {
         let resp = Response::read_from(Cursor::new(&data[..]), 1024).unwrap();
         assert_eq!(resp.header("content-type"), Some("text/plain"));
         assert_eq!(resp.header("CONTENT-TYPE"), Some("text/plain"));
+    }
+
+    #[test]
+    fn decodes_gzip_content_encoding() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(b"hello compressed world").unwrap();
+        let compressed = enc.finish().unwrap();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: ");
+        wire.extend_from_slice(compressed.len().to_string().as_bytes());
+        wire.extend_from_slice(b"\r\n\r\n");
+        wire.extend_from_slice(&compressed);
+
+        let resp = Response::read_from(Cursor::new(wire), 64 * 1024).unwrap();
+        assert_eq!(resp.body, b"hello compressed world");
+    }
+
+    #[test]
+    fn decodes_brotli_content_encoding() {
+        let mut compressed = Vec::new();
+        let mut writer = brotli::CompressorWriter::new(&mut compressed, 4096, 5, 22);
+        std::io::Write::write_all(&mut writer, b"brotlified contents").unwrap();
+        drop(writer);
+
+        let mut wire = Vec::new();
+        wire.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Encoding: br\r\nContent-Length: ");
+        wire.extend_from_slice(compressed.len().to_string().as_bytes());
+        wire.extend_from_slice(b"\r\n\r\n");
+        wire.extend_from_slice(&compressed);
+
+        let resp = Response::read_from(Cursor::new(wire), 64 * 1024).unwrap();
+        assert_eq!(resp.body, b"brotlified contents");
+    }
+
+    #[test]
+    fn identity_content_encoding_is_passthrough() {
+        let data =
+            b"HTTP/1.1 200 OK\r\nContent-Encoding: identity\r\nContent-Length: 5\r\n\r\nhello";
+        let resp = Response::read_from(Cursor::new(&data[..]), 1024).unwrap();
+        assert_eq!(resp.body, b"hello");
+    }
+
+    #[test]
+    fn unknown_encoding_errors_instead_of_serving_garbage() {
+        let data =
+            b"HTTP/1.1 200 OK\r\nContent-Encoding: xyzzy\r\nContent-Length: 3\r\n\r\nabc";
+        let err = Response::read_from(Cursor::new(&data[..]), 1024).unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)));
     }
 
     #[test]

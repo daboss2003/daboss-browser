@@ -43,8 +43,10 @@ use crate::dom::{Dom, NodeId, NodeKind};
 
 pub(crate) mod dom;
 pub mod engine;
+pub(crate) mod storage;
 
 pub use engine::JsEngine;
+pub use storage::StorageArea;
 
 thread_local! {
     /// Active DOM during script execution. Set by [`run_inline_scripts`]

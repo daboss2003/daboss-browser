@@ -10,8 +10,8 @@ pub use parser::{parse, parse_selector_list_str};
 pub use types::{
     AlignContent, AlignItems, BackgroundImage, BorderStyle, BoxShadow, BoxSides, BoxSizing, Color,
     ComputedStyle, Dimension, Display, FlexDirection, FlexWrap, FontStyle, GridAutoFlow, GridLine,
-    GridPlacement, GridTrack, JustifyContent, Position, Selector, Stylesheet, TableLayout,
-    TextAlign, TextDecoration, WhiteSpace,
+    GridPlacement, GridTrack, JustifyContent, MediaCondition, MediaQuery, Position, Selector,
+    Stylesheet, TableLayout, TextAlign, TextDecoration, Viewport, WhiteSpace,
 };
 
 use crate::dom::{Dom, NodeId, NodeKind};
@@ -71,19 +71,79 @@ pub fn style_dom(dom: &Dom, page_stylesheets: &[Stylesheet]) -> StyleTree {
     style_dom_with(dom, page_stylesheets, &InteractionState::EMPTY)
 }
 
-/// Same as `style_dom` but with explicit `:hover` / `:focus` chains.
+/// Same as `style_dom` but with explicit `:hover` / `:focus` chains and a
+/// default desktop viewport. Used by tests and the static PNG path.
 pub fn style_dom_with(
     dom: &Dom,
     page_stylesheets: &[Stylesheet],
     interaction: &InteractionState,
 ) -> StyleTree {
+    style_dom_with_viewport(dom, page_stylesheets, interaction, &Viewport::DEFAULT)
+}
+
+/// Cascade evaluation with full context: interaction state for
+/// `:hover` / `:focus`, plus the current viewport for `@media` queries.
+/// Each input stylesheet is flattened: rules from `@media` blocks whose
+/// query matches the viewport get merged into the rule list at their
+/// original position, preserving cascade order.
+pub fn style_dom_with_viewport(
+    dom: &Dom,
+    page_stylesheets: &[Stylesheet],
+    interaction: &InteractionState,
+    viewport: &Viewport,
+) -> StyleTree {
     let ua = ua_stylesheet();
-    let mut sheets: Vec<&Stylesheet> = Vec::with_capacity(1 + page_stylesheets.len());
-    sheets.push(&ua);
-    for s in page_stylesheets {
-        sheets.push(s);
-    }
+    let flattened: Vec<Stylesheet> = std::iter::once(&ua)
+        .chain(page_stylesheets.iter())
+        .map(|s| flatten_for_viewport(s, viewport))
+        .collect();
+    let sheets: Vec<&Stylesheet> = flattened.iter().collect();
     StyleTree::compute_with(dom, &sheets, interaction)
+}
+
+fn flatten_for_viewport(sheet: &Stylesheet, vp: &Viewport) -> Stylesheet {
+    let mut flat = Stylesheet {
+        rules: sheet.rules.clone(),
+        ..Stylesheet::default()
+    };
+    for mb in &sheet.media_blocks {
+        if media_query_matches(&mb.query, vp) {
+            flat.rules.extend(mb.rules.iter().cloned());
+        }
+    }
+    flat
+}
+
+/// `true` if **any** alternative in `q` matches `vp`. An empty query
+/// (e.g. `@media {}`) is treated as always matching.
+pub fn media_query_matches(q: &MediaQuery, vp: &Viewport) -> bool {
+    if q.alternatives.is_empty() {
+        return true;
+    }
+    q.alternatives
+        .iter()
+        .any(|alt| alt.iter().all(|c| condition_matches(c, vp)))
+}
+
+fn condition_matches(c: &MediaCondition, vp: &Viewport) -> bool {
+    match c {
+        MediaCondition::MediaType(t) => {
+            // We render to a screen and never to a printer in toy land.
+            matches!(t.as_str(), "screen" | "all")
+        }
+        MediaCondition::MinWidth(px) => vp.width >= *px,
+        MediaCondition::MaxWidth(px) => vp.width <= *px,
+        MediaCondition::MinHeight(px) => vp.height >= *px,
+        MediaCondition::MaxHeight(px) => vp.height <= *px,
+        MediaCondition::ExactWidth(px) => (vp.width - *px).abs() < 0.5,
+        MediaCondition::Orientation(which) => {
+            let landscape = vp.width >= vp.height;
+            (which == "landscape" && landscape) || (which == "portrait" && !landscape)
+        }
+        MediaCondition::PrefersColorScheme(scheme) => scheme == vp.color_scheme,
+        // Unknown features fail the alternative they're in.
+        MediaCondition::Unsupported(_) => false,
+    }
 }
 
 fn ua_stylesheet() -> Stylesheet {
@@ -167,5 +227,57 @@ mod tests {
         let dom = html::parse(r#"<link rel="icon" href="favicon.ico">"#);
         let refs = discover_stylesheets(&dom);
         assert_eq!(refs.len(), 0);
+    }
+
+    #[test]
+    fn media_query_matches_min_max_width() {
+        let s = parse("@media (max-width: 600px) { p { color: red; } }");
+        let narrow = Viewport::from_size(360.0, 800.0);
+        let wide = Viewport::from_size(1200.0, 800.0);
+        assert!(media_query_matches(&s.media_blocks[0].query, &narrow));
+        assert!(!media_query_matches(&s.media_blocks[0].query, &wide));
+    }
+
+    #[test]
+    fn media_query_evaluation_drives_cascade_decisions() {
+        // The narrow-viewport rule turns <p> red; the page rule turns it blue.
+        let dom = html::parse("<html><body><p>X</p></body></html>");
+        let sheet = parse(
+            "@media (max-width: 600px) { p { color: red; } } p { color: blue; }",
+        );
+        let interaction = InteractionState::EMPTY;
+        let narrow = Viewport::from_size(360.0, 800.0);
+        let wide = Viewport::from_size(1200.0, 800.0);
+
+        let narrow_tree = style_dom_with_viewport(&dom, &[sheet.clone()], &interaction, &narrow);
+        let wide_tree = style_dom_with_viewport(&dom, &[sheet], &interaction, &wide);
+
+        // Find the <p> node.
+        let p = find_p(&dom).expect("p");
+        let narrow_color = narrow_tree.get(p).color;
+        let wide_color = wide_tree.get(p).color;
+        // Narrow: red wins because @media matches and comes after the
+        // unscoped rule in cascade order. Wide: only the page rule
+        // applies, so blue.
+        assert_eq!(narrow_color.r, 255);
+        assert_eq!(narrow_color.g, 0);
+        assert_eq!(wide_color.b, 255);
+    }
+
+    fn find_p(dom: &Dom) -> Option<NodeId> {
+        fn walk(dom: &Dom, n: NodeId) -> Option<NodeId> {
+            if let NodeKind::Element { tag, .. } = &dom.node(n).kind {
+                if tag == "p" {
+                    return Some(n);
+                }
+            }
+            for c in dom.children(n).collect::<Vec<_>>() {
+                if let Some(found) = walk(dom, c) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        walk(dom, dom.document())
     }
 }

@@ -66,50 +66,63 @@ fn build_document(ctx: &mut Context) -> JsObject {
         None => JsValue::null(),
     };
 
-    ObjectInitializer::new(ctx)
-        .function(
-            NativeFunction::from_fn_ptr(get_element_by_id),
-            js_string!("getElementById"),
-            1,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(query_selector),
-            js_string!("querySelector"),
-            1,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(query_selector_all),
-            js_string!("querySelectorAll"),
-            1,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(document_create_element),
-            js_string!("createElement"),
-            1,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(document_create_text_node),
-            js_string!("createTextNode"),
-            1,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(document_get_elements_by_tag_name),
-            js_string!("getElementsByTagName"),
-            1,
-        )
-        .function(
-            NativeFunction::from_fn_ptr(document_get_elements_by_class_name),
-            js_string!("getElementsByClassName"),
-            1,
-        )
-        .property(
-            js_string!("documentElement"),
-            root_value,
-            Attribute::READONLY,
-        )
-        .property(js_string!("body"), body_value, Attribute::READONLY)
-        .property(js_string!("title"), js_string!(title), Attribute::READONLY)
-        .build()
+    let realm = ctx.realm().clone();
+    let getter = |f: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>| {
+        FunctionObjectBuilder::new(&realm, NativeFunction::from_fn_ptr(f)).build()
+    };
+    let cookie_get = getter(document_get_cookie);
+    let cookie_set = getter(document_set_cookie);
+
+    let mut b = ObjectInitializer::new(ctx);
+    b.function(
+        NativeFunction::from_fn_ptr(get_element_by_id),
+        js_string!("getElementById"),
+        1,
+    );
+    b.function(
+        NativeFunction::from_fn_ptr(query_selector),
+        js_string!("querySelector"),
+        1,
+    );
+    b.function(
+        NativeFunction::from_fn_ptr(query_selector_all),
+        js_string!("querySelectorAll"),
+        1,
+    );
+    b.function(
+        NativeFunction::from_fn_ptr(document_create_element),
+        js_string!("createElement"),
+        1,
+    );
+    b.function(
+        NativeFunction::from_fn_ptr(document_create_text_node),
+        js_string!("createTextNode"),
+        1,
+    );
+    b.function(
+        NativeFunction::from_fn_ptr(document_get_elements_by_tag_name),
+        js_string!("getElementsByTagName"),
+        1,
+    );
+    b.function(
+        NativeFunction::from_fn_ptr(document_get_elements_by_class_name),
+        js_string!("getElementsByClassName"),
+        1,
+    );
+    b.property(
+        js_string!("documentElement"),
+        root_value,
+        Attribute::READONLY,
+    );
+    b.property(js_string!("body"), body_value, Attribute::READONLY);
+    b.property(js_string!("title"), js_string!(title), Attribute::READONLY);
+    b.accessor(
+        js_string!("cookie"),
+        Some(cookie_get),
+        Some(cookie_set),
+        Attribute::ENUMERABLE,
+    );
+    b.build()
 }
 
 pub(crate) fn make_element_handle(ctx: &mut Context, id: NodeId) -> JsObject {
@@ -1596,6 +1609,32 @@ fn data_attr_to_camel(s: &str) -> String {
 }
 
 // ---------- helpers ----------
+
+// ---------- document.cookie ----------
+
+fn document_get_cookie(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    let value = super::engine::JS_FETCH_CLIENT.with(|client_slot| {
+        let client = client_slot.borrow().as_ref().cloned()?;
+        let url = super::engine::JS_BASE_URL.with(|u| u.borrow().clone())?;
+        Some(client.cookies_for(&url))
+    });
+    Ok(JsValue::from(js_string!(value.unwrap_or_default())))
+}
+
+fn document_set_cookie(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(val) = args.first() else {
+        return Ok(JsValue::undefined());
+    };
+    let text = val.to_string(ctx)?.to_std_string_escaped();
+    super::engine::JS_FETCH_CLIENT.with(|client_slot| {
+        if let Some(client) = client_slot.borrow().as_ref() {
+            if let Some(url) = super::engine::JS_BASE_URL.with(|u| u.borrow().clone()) {
+                client.set_cookie_for(&url, &text);
+            }
+        }
+    });
+    Ok(JsValue::undefined())
+}
 
 fn read_node_id_from(val: &JsValue, ctx: &mut Context) -> Option<NodeId> {
     let obj = val.as_object()?;

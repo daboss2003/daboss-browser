@@ -209,10 +209,10 @@ struct Browser {
 
     client: Rc<net::Client>,
 
-    /// `localStorage` shared across every page in this run. Cloned into
-    /// each navigated [`js::JsEngine`] so scripts on different URLs see
-    /// the same key/value map. No on-disk persistence yet.
-    local_storage: js::StorageArea,
+    /// Per-origin `localStorage` map. Each navigated [`js::JsEngine`]
+    /// gets the `StorageArea` keyed by its page's origin (scheme + host
+    /// + port). No on-disk persistence yet.
+    local_storage: Rc<std::cell::RefCell<std::collections::HashMap<String, js::StorageArea>>>,
 
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
@@ -247,7 +247,9 @@ impl Browser {
         Self {
             pending_url: initial_url.clone(),
             client: Rc::new(net::Client::new().with_allow_loopback(allow_loopback)),
-            local_storage: Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
+            local_storage: Rc::new(std::cell::RefCell::new(
+                std::collections::HashMap::<String, js::StorageArea>::new(),
+            )),
             window: None,
             surface: None,
             viewport_size: (1024, 768),
@@ -294,17 +296,40 @@ impl Browser {
         let body = String::from_utf8_lossy(&response.body).into_owned();
         let mut dom = html::parse(&body);
 
+        // Parse Content-Security-Policy from the page response. Without
+        // an unsafe-inline allowance, the JS engine skips running
+        // inline `<script>` content.
+        let csp = response
+            .header("Content-Security-Policy")
+            .map(net::Csp::parse)
+            .unwrap_or_default();
+        let inline_scripts_allowed = csp.allows_inline_scripts();
+        if !inline_scripts_allowed {
+            eprintln!("[csp] inline scripts blocked by Content-Security-Policy");
+        }
+
         // Phase 7a/b/c/e: spin up a JS engine for the page and run its
         // inline `<script>` content. The engine persists on `Page` so
         // event handlers registered via `addEventListener` can fire on
         // later clicks. `fetch` is wired to the same SSRF-guarded
-        // client that powers page navigation, and `localStorage` is
-        // shared with every other page in this browser run.
-        let js_engine = js::JsEngine::with_fetch(
+        // client that powers page navigation; `localStorage` is scoped
+        // per origin (scheme + host + port) — different origins get
+        // different stores within the same browser run.
+        let origin_key = parsed.origin().ascii_serialization();
+        let local_storage = self
+            .local_storage
+            .borrow_mut()
+            .entry(origin_key)
+            .or_insert_with(|| {
+                Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()))
+            })
+            .clone();
+        let js_engine = js::JsEngine::with_security(
             &mut dom,
             Some(self.client.clone()),
             Some(parsed.clone()),
-            Some(self.local_storage.clone()),
+            Some(local_storage),
+            inline_scripts_allowed,
         );
 
         // External stylesheets (with size cap)
@@ -1355,7 +1380,8 @@ fn load_iframe_document(
 ) -> Option<IframeContent> {
     let abs = base_url.join(src).ok()?;
     let url_str = abs.to_string();
-    let response = match client.get(&url_str) {
+    let ctx = net::RequestContext::new().with_initiator(base_url.clone());
+    let response = match client.get_with(&url_str, ctx) {
         Ok(r) if (200..400).contains(&r.status) => r,
         Ok(r) => {
             eprintln!("[iframe] {url_str}: HTTP {}", r.status);
@@ -1366,6 +1392,51 @@ fn load_iframe_document(
             return None;
         }
     };
+
+    // X-Frame-Options / CSP frame-ancestors enforcement. `DENY` refuses
+    // any embedding; `SAMEORIGIN` allows only same-origin parents.
+    if let Some(xfo) = response.header("X-Frame-Options") {
+        let val = xfo.trim().to_ascii_lowercase();
+        let blocked = match val.as_str() {
+            "deny" => true,
+            "sameorigin" => abs.origin() != base_url.origin(),
+            _ => false,
+        };
+        if blocked {
+            eprintln!("[iframe] {url_str}: refused via X-Frame-Options: {val}");
+            return None;
+        }
+    }
+    if let Some(csp_raw) = response.header("Content-Security-Policy") {
+        // The `frame-ancestors` directive may contain `'none'` or
+        // explicit origins. We honour `'none'` and `'self'` only.
+        for directive in csp_raw.split(';') {
+            let parts: Vec<&str> = directive.split_ascii_whitespace().collect();
+            if parts.first().map(|s| s.to_ascii_lowercase()) == Some("frame-ancestors".into()) {
+                let sources: Vec<String> = parts[1..]
+                    .iter()
+                    .map(|s| s.to_ascii_lowercase())
+                    .collect();
+                let allowed = if sources.iter().any(|s| s == "'none'") {
+                    false
+                } else if sources.iter().any(|s| s == "*") {
+                    true
+                } else if sources.iter().any(|s| s == "'self'") {
+                    abs.origin() == base_url.origin()
+                } else {
+                    // Specific hostnames — match against parent origin.
+                    let parent_origin = base_url.origin().ascii_serialization();
+                    sources.iter().any(|s| s == &parent_origin)
+                };
+                if !allowed {
+                    eprintln!(
+                        "[iframe] {url_str}: refused by Content-Security-Policy frame-ancestors"
+                    );
+                    return None;
+                }
+            }
+        }
+    }
     let body = String::from_utf8_lossy(&response.body).into_owned();
     let dom = html::parse(&body);
 

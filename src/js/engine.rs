@@ -257,6 +257,22 @@ impl JsEngine {
         base_url: Option<url::Url>,
         local_storage: Option<StorageArea>,
     ) -> Self {
+        Self::with_security(dom, client, base_url, local_storage, true)
+    }
+
+    /// Most-detailed constructor: lets the caller pass an
+    /// `allow_inline_scripts` flag sourced from the page's
+    /// `Content-Security-Policy`. When `false`, inline `<script>`
+    /// content is collected but never executed — the engine still
+    /// installs all the globals so listeners / timers registered later
+    /// (e.g. by external scripts when those land) can fire.
+    pub fn with_security(
+        dom: &mut Dom,
+        client: Option<Rc<net::Client>>,
+        base_url: Option<url::Url>,
+        local_storage: Option<StorageArea>,
+        allow_inline_scripts: bool,
+    ) -> Self {
         let perf_origin = Instant::now();
         let mut ctx = Context::default();
         install_console(&mut ctx);
@@ -268,6 +284,8 @@ impl JsEngine {
         install_window_alias(&mut ctx);
         install_navigator_screen_performance(&mut ctx);
         install_location_and_history_globals(&mut ctx);
+        super::xhr::install(&mut ctx);
+        super::web_classes::install(&mut ctx);
 
         let listeners: Rc<RefCell<ListenerMap>> = Rc::new(RefCell::new(HashMap::new()));
         let timers: Rc<RefCell<TimerState>> = Rc::new(RefCell::new(TimerState::default()));
@@ -301,7 +319,9 @@ impl JsEngine {
             nav_requests,
             history,
         };
-        engine.run_initial_scripts(dom);
+        if allow_inline_scripts {
+            engine.run_initial_scripts(dom);
+        }
         engine
     }
 
@@ -1321,13 +1341,18 @@ fn js_fetch(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
 
     let response = JS_FETCH_CLIENT.with(|slot| -> Option<net::Result<net::Response>> {
         let client = slot.borrow().as_ref()?.clone();
+        let initiator = JS_BASE_URL.with(|u| u.borrow().clone());
+        let mut ctx = net::RequestContext::new().with_cors(true);
+        if let Some(init) = initiator {
+            ctx = ctx.with_initiator(init);
+        }
         let url = target_url.to_string();
         Some(match method.as_str() {
             "POST" => {
                 let b = body.unwrap_or_default();
-                client.post(&url, b, "application/x-www-form-urlencoded")
+                client.post_with(&url, b, "application/x-www-form-urlencoded", ctx)
             }
-            _ => client.get(&url),
+            _ => client.get_with(&url, ctx),
         })
     });
 
@@ -1993,6 +2018,140 @@ mod tests {
         let reqs = engine.drain_nav_requests();
         assert_eq!(reqs.len(), 1);
         assert!(matches!(reqs[0], NavRequest::Assign(ref u) if u == "https://example.com/next"));
+    }
+
+    #[test]
+    fn url_class_parses_and_exposes_parts() {
+        let src = r#"
+            var u = new URL('https://example.com:8080/p?a=1#frag');
+            var el = document.getElementById('hi');
+            el.setAttribute('data-href', u.href);
+            el.setAttribute('data-origin', u.origin);
+            el.setAttribute('data-host', u.host);
+            el.setAttribute('data-pathname', u.pathname);
+            el.setAttribute('data-search', u.search);
+            el.setAttribute('data-hash', u.hash);
+        "#;
+        let mut dom = html::parse(&format!(
+            "<html><body><div id='hi'>x</div><script>{src}</script></body></html>"
+        ));
+        let mut _engine = JsEngine::new(&mut dom);
+        let id = find_for_test_by_id(&dom, "hi").unwrap();
+        if let NodeKind::Element { attrs, .. } = &dom.node(id).kind {
+            let get = |k: &str| {
+                attrs
+                    .iter()
+                    .find(|(n, _)| n == k)
+                    .map(|(_, v)| v.as_str())
+            };
+            assert_eq!(
+                get("data-href"),
+                Some("https://example.com:8080/p?a=1#frag")
+            );
+            assert_eq!(get("data-host"), Some("example.com:8080"));
+            assert_eq!(get("data-pathname"), Some("/p"));
+            assert_eq!(get("data-search"), Some("?a=1"));
+            assert_eq!(get("data-hash"), Some("#frag"));
+        }
+    }
+
+    #[test]
+    fn url_search_params_round_trip() {
+        let src = r#"
+            var p = new URLSearchParams('?a=1&b=two&a=3');
+            var el = document.getElementById('hi');
+            el.setAttribute('data-get-a', p.get('a'));
+            el.setAttribute('data-all', p.getAll('a').join(','));
+            p.append('c', 'four');
+            p.set('a', 'updated');
+            el.setAttribute('data-toString', p.toString());
+        "#;
+        let mut dom = html::parse(&format!(
+            "<html><body><div id='hi'>x</div><script>{src}</script></body></html>"
+        ));
+        let mut _engine = JsEngine::new(&mut dom);
+        let id = find_for_test_by_id(&dom, "hi").unwrap();
+        if let NodeKind::Element { attrs, .. } = &dom.node(id).kind {
+            let get = |k: &str| {
+                attrs
+                    .iter()
+                    .find(|(n, _)| n == k)
+                    .map(|(_, v)| v.as_str())
+            };
+            assert_eq!(get("data-get-a"), Some("1"));
+            assert_eq!(get("data-all"), Some("1,3"));
+            // After set/append: should contain b=two, c=four, a=updated.
+            // Order: leftover non-`a` entries first, then the appended /
+            // upserted `a`.
+            let s = get("data-toString").unwrap();
+            assert!(s.contains("b=two"));
+            assert!(s.contains("c=four"));
+            assert!(s.contains("a=updated"));
+        }
+    }
+
+    #[test]
+    fn text_encoder_decoder_round_trip() {
+        let src = r#"
+            var enc = new TextEncoder();
+            var dec = new TextDecoder();
+            var bytes = enc.encode('hi 👋');
+            document.getElementById('hi').setAttribute('data-len', String(bytes.length));
+            document.getElementById('hi').setAttribute('data-roundtrip', dec.decode(bytes));
+        "#;
+        let mut dom = html::parse(&format!(
+            "<html><body><div id='hi'>x</div><script>{src}</script></body></html>"
+        ));
+        let mut _engine = JsEngine::new(&mut dom);
+        let id = find_for_test_by_id(&dom, "hi").unwrap();
+        if let NodeKind::Element { attrs, .. } = &dom.node(id).kind {
+            let get = |k: &str| {
+                attrs
+                    .iter()
+                    .find(|(n, _)| n == k)
+                    .map(|(_, v)| v.as_str())
+            };
+            // 'hi ' is 3 bytes, '👋' is 4 bytes in UTF-8.
+            assert_eq!(get("data-len"), Some("7"));
+            assert_eq!(get("data-roundtrip"), Some("hi 👋"));
+        }
+    }
+
+    #[test]
+    fn xhr_constructor_and_state_machine_work() {
+        // Without a fetch client, send() fails; status should land on 0
+        // and readyState on 4, with onerror firing.
+        let src = r#"
+            var x = new XMLHttpRequest();
+            var trace = '';
+            x.onreadystatechange = function() {
+                trace += String(x.readyState) + ',';
+            };
+            x.onerror = function() {
+                trace += 'err';
+            };
+            x.open('GET', 'https://example.com/');
+            x.send();
+            document.getElementById('hi').setAttribute('data-trace', trace);
+            document.getElementById('hi').setAttribute('data-status', String(x.status));
+        "#;
+        let mut dom = html::parse(&format!(
+            "<html><body><div id='hi'>x</div><script>{src}</script></body></html>"
+        ));
+        let mut _engine = JsEngine::new(&mut dom);
+        let id = find_for_test_by_id(&dom, "hi").unwrap();
+        if let NodeKind::Element { attrs, .. } = &dom.node(id).kind {
+            let get = |k: &str| {
+                attrs
+                    .iter()
+                    .find(|(n, _)| n == k)
+                    .map(|(_, v)| v.as_str())
+            };
+            // open() fires readyState=1, send() with no client fires
+            // readyState=4 then onerror.
+            assert_eq!(get("data-trace"), Some("1,4,err"));
+            assert_eq!(get("data-status"), Some("0"));
+        }
     }
 
     #[test]

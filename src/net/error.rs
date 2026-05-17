@@ -18,6 +18,12 @@ pub enum Error {
     TooManyRedirects(u32),
     /// The request's hostname was on the bundled adblock blocklist.
     Blocked(String),
+    /// Active mixed content: an HTTPS page tried to load an HTTP
+    /// subresource.
+    MixedContent(String),
+    /// Cross-origin response without a permissive
+    /// `Access-Control-Allow-Origin` header.
+    Cors(String),
 }
 
 impl fmt::Display for Error {
@@ -39,6 +45,8 @@ impl fmt::Display for Error {
             Self::ResponseTooLarge(limit) => write!(f, "response exceeded {limit}-byte cap"),
             Self::TooManyRedirects(limit) => write!(f, "exceeded {limit} redirect hops"),
             Self::Blocked(host) => write!(f, "request to {host} blocked by adblock"),
+            Self::MixedContent(u) => write!(f, "mixed content blocked: {u}"),
+            Self::Cors(u) => write!(f, "blocked by CORS: {u}"),
         }
     }
 }

@@ -4,6 +4,7 @@ mod cookies;
 mod csp;
 mod dns;
 mod error;
+mod h2c;
 mod http;
 mod transport;
 
@@ -83,6 +84,9 @@ pub struct Client {
     pool: RefCell<
         std::collections::HashMap<(String, u16, bool), Vec<std::io::BufReader<transport::Connection>>>,
     >,
+    /// Hosts known to prefer HTTP/1.1 (we tried h2 ALPN and the server
+    /// negotiated http/1.1 or refused). Keyed by `(host_lower, port)`.
+    h2_blacklist: RefCell<HashSet<(String, u16)>>,
 }
 
 impl Default for Client {
@@ -105,6 +109,7 @@ impl Client {
             hsts: RefCell::new(HashSet::new()),
             cache: RefCell::new(cache::HttpCache::new()),
             pool: RefCell::new(std::collections::HashMap::new()),
+            h2_blacklist: RefCell::new(HashSet::new()),
         }
     }
 
@@ -381,10 +386,42 @@ impl Client {
             }
         }
 
-        // Network round-trip via the keep-alive pool. Stale pooled
-        // connections trigger one retry with a fresh socket.
+        // Try HTTP/2 first for HTTPS hosts we haven't yet seen reject
+        // the `h2` ALPN. Falls back transparently to the HTTP/1.1
+        // keep-alive path on negotiation failure.
         let pool_key = (host.to_ascii_lowercase(), port, use_tls);
-        let response = self.send_via_pool(&pool_key, &host, port, use_tls, &request)?;
+        let h2_key = (host.to_ascii_lowercase(), port);
+        let response = if use_tls && !self.h2_blacklist.borrow().contains(&h2_key) {
+            match h2c::request_h2(
+                &self.tls,
+                &host,
+                port,
+                &request.method,
+                &request.path,
+                &request.headers,
+                request.body.clone(),
+                self.connect_timeout,
+                self.read_timeout,
+                self.max_response_bytes,
+            ) {
+                h2c::H2Outcome::Ok(resp) => Some(resp),
+                h2c::H2Outcome::FallbackToH1 => {
+                    self.h2_blacklist.borrow_mut().insert(h2_key.clone());
+                    None
+                }
+                h2c::H2Outcome::Err(e) => {
+                    tracing::debug!(?e, "h2 request failed; falling back to h1");
+                    self.h2_blacklist.borrow_mut().insert(h2_key.clone());
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let response = match response {
+            Some(r) => r,
+            None => self.send_via_pool(&pool_key, &host, port, use_tls, &request)?,
+        };
 
         // Ingest any Set-Cookie headers before deciding whether to follow
         // a redirect — the spec scopes Set-Cookie to the redirect's

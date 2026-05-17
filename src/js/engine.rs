@@ -145,6 +145,10 @@ thread_local! {
     pub(crate) static JS_AUDIO_ELEMENTS: RefCell<Option<super::AudioElements>> =
         const { RefCell::new(None) };
 
+    /// Same idea for `<video>` elements.
+    pub(crate) static JS_VIDEO_ELEMENTS: RefCell<Option<super::VideoElements>> =
+        const { RefCell::new(None) };
+
     /// Per-dispatch flags toggled by `event.preventDefault()` /
     /// `event.stopPropagation()`. Reset at the start of each dispatch.
     pub(crate) static EVENT_FLAGS: RefCell<EventFlags> = const { RefCell::new(EventFlags::EMPTY) };
@@ -211,6 +215,9 @@ pub struct JsEngine {
     /// navigation time (audio bytes are decoded once and persist on
     /// the page).
     audio_elements: super::AudioElements,
+    /// Video elements keyed by NodeId. Each owns its own ffmpeg
+    /// subprocess for decoding.
+    video_elements: super::VideoElements,
 }
 
 /// Outcome of an event dispatch — informs the caller whether to skip the
@@ -355,6 +362,8 @@ impl JsEngine {
         > = Rc::new(RefCell::new(std::collections::HashMap::new()));
         let audio_elements: super::AudioElements =
             Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let video_elements: super::VideoElements =
+            Rc::new(RefCell::new(std::collections::HashMap::new()));
         let mut engine = JsEngine {
             ctx,
             listeners,
@@ -373,6 +382,7 @@ impl JsEngine {
             canvas_surfaces,
             computed_styles,
             audio_elements,
+            video_elements,
         };
         if allow_inline_scripts {
             engine.run_initial_scripts(dom);
@@ -398,6 +408,11 @@ impl JsEngine {
     /// drive playback.
     pub fn audio_elements(&self) -> super::AudioElements {
         self.audio_elements.clone()
+    }
+
+    /// Shared handle to the page's `<video>` instances.
+    pub fn video_elements(&self) -> super::VideoElements {
+        self.video_elements.clone()
     }
 
     /// Replace the per-element computed-style snapshot consumed by
@@ -727,6 +742,9 @@ impl JsEngine {
         JS_AUDIO_ELEMENTS.with(|slot| {
             *slot.borrow_mut() = Some(self.audio_elements.clone());
         });
+        JS_VIDEO_ELEMENTS.with(|slot| {
+            *slot.borrow_mut() = Some(self.video_elements.clone());
+        });
         (dom_rc, listeners_rc)
     }
 
@@ -752,6 +770,9 @@ impl JsEngine {
             slot.borrow_mut().take();
         });
         JS_AUDIO_ELEMENTS.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        JS_VIDEO_ELEMENTS.with(|slot| {
             slot.borrow_mut().take();
         });
         JS_NAV_REQUESTS.with(|slot| {

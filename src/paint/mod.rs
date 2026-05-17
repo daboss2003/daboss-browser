@@ -56,6 +56,13 @@ thread_local! {
     pub static PAINT_CANVAS_SURFACES:
         std::cell::RefCell<Option<crate::js::CanvasSurfaces>> =
         const { std::cell::RefCell::new(None) };
+
+    /// Same hook for `<video>` elements: paint pulls the latest
+    /// decoded frame from each VideoElement and composites at its
+    /// box rect.
+    pub static PAINT_VIDEO_ELEMENTS:
+        std::cell::RefCell<Option<crate::js::VideoElements>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -178,6 +185,11 @@ impl Painter {
             NodeKind::Element { tag, .. } if tag == "canvas" => {
                 if let Some(b) = tree.get(node) {
                     self.paint_canvas(b.rect, node, ctx);
+                }
+            }
+            NodeKind::Element { tag, .. } if tag == "video" => {
+                if let Some(b) = tree.get(node) {
+                    self.paint_video(b.rect, node, ctx);
                 }
             }
             _ => {}
@@ -447,6 +459,47 @@ impl Painter {
         paint.opacity = ctx.alpha;
         self.pixmap
             .draw_pixmap(0, 0, composed.as_ref(), &paint, transform, None);
+    }
+
+    /// Composite the latest decoded `<video>` frame at the element's
+    /// box rect. Pulls from `PAINT_VIDEO_ELEMENTS`; falls back to a
+    /// no-op when no decoder exists yet (loading state).
+    fn paint_video(&mut self, dest: Rect, node: NodeId, ctx: PaintCtx) {
+        let Some(frame) = PAINT_VIDEO_ELEMENTS.with(|slot| {
+            let rc = slot.borrow().as_ref().cloned()?;
+            let map = rc.borrow();
+            map.get(&node).and_then(|v| v.current_frame())
+        }) else {
+            return;
+        };
+        if frame.width == 0 || frame.height == 0 {
+            return;
+        }
+        let Some(mut src) = Pixmap::new(frame.width, frame.height) else {
+            return;
+        };
+        // ffmpeg emits straight (non-premultiplied) RGBA; premultiply
+        // before draw_pixmap to match the rest of our paint output.
+        let data = src.data_mut();
+        for (i, chunk) in frame.rgba.chunks_exact(4).enumerate() {
+            let r = chunk[0];
+            let g = chunk[1];
+            let b = chunk[2];
+            let a = chunk[3];
+            let p = i * 4;
+            data[p] = ((r as u16 * a as u16) / 255) as u8;
+            data[p + 1] = ((g as u16 * a as u16) / 255) as u8;
+            data[p + 2] = ((b as u16 * a as u16) / 255) as u8;
+            data[p + 3] = a;
+        }
+        let scale_x = dest.width / frame.width as f32;
+        let scale_y = dest.height / frame.height as f32;
+        let transform = Transform::from_translate(dest.x + ctx.tx, dest.y + ctx.ty)
+            .pre_scale(scale_x, scale_y);
+        let mut paint = PixmapPaint::default();
+        paint.opacity = ctx.alpha;
+        self.pixmap
+            .draw_pixmap(0, 0, src.as_ref(), &paint, transform, None);
     }
 
     /// Composite a `<canvas>` element's pixmap into the page. Pulled

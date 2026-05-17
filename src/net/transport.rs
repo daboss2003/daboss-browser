@@ -78,7 +78,12 @@ impl Write for Connection {
 pub fn default_tls_config() -> ClientConfig {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    ClientConfig::builder()
+    let mut cfg = ClientConfig::builder()
         .with_root_certificates(roots)
-        .with_no_client_auth()
+        .with_no_client_auth();
+    // Advertise HTTP/2 + HTTP/1.1 via ALPN so the h2 path can take
+    // over when the server supports it. tokio-rustls (the async path)
+    // re-uses this same config.
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    cfg
 }

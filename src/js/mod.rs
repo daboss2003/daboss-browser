@@ -58,6 +58,12 @@ pub use canvas::CanvasSurfaces;
 pub type AudioElements =
     std::rc::Rc<std::cell::RefCell<std::collections::HashMap<crate::dom::NodeId, crate::audio::AudioElement>>>;
 
+/// Same shape as [`AudioElements`] but for `<video>`. The decoder
+/// thread is owned by each `VideoElement`; paint pulls the latest
+/// frame for composite.
+pub type VideoElements =
+    std::rc::Rc<std::cell::RefCell<std::collections::HashMap<crate::dom::NodeId, crate::video::VideoElement>>>;
+
 pub use engine::JsEngine;
 pub use storage::StorageArea;
 

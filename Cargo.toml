@@ -33,6 +33,13 @@ symphonia = { version = "0.5", default-features = false, features = [
     "aac",
     "isomp4",
 ] }
+tokio = { version = "1", default-features = false, features = ["rt", "io-util", "net", "macros", "time", "sync"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+h2 = "0.4"
+http = "1"
+bytes = "1"
+# Video decode rides the system `ffmpeg` binary via std::process,
+# no crate needed beyond the FFmpeg CLI itself being on PATH.
 
 [profile.release]
 lto = "thin"

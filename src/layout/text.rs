@@ -13,7 +13,7 @@ use std::ops::Range;
 
 use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Style, Weight, Wrap};
 
-use crate::css::{ComputedStyle, FontStyle, StyleTree};
+use crate::css::{ComputedStyle, FontStyle, Overflow, StyleTree, TextOverflow};
 use crate::dom::NodeId;
 
 use super::PseudoKind;
@@ -73,8 +73,19 @@ impl TextLayout {
         let line_height = (parent_style.font_size * parent_style.line_height).max(1.0);
         let metrics = Metrics::new(parent_style.font_size.max(1.0), line_height);
         let mut buffer = Buffer::new(&mut self.system, metrics);
-        buffer.set_size(&mut self.system, Some(max_width), None);
-        buffer.set_wrap(&mut self.system, Wrap::Word);
+
+        // text-overflow: ellipsis turns the inline run into a
+        // single-line, non-wrapping shape that truncates at the box
+        // edge with `…` substituted in.
+        let ellipsis_mode = matches!(parent_style.text_overflow, TextOverflow::Ellipsis)
+            && !matches!(parent_style.overflow_x, Overflow::Visible);
+        if ellipsis_mode {
+            buffer.set_size(&mut self.system, Some(max_width), None);
+            buffer.set_wrap(&mut self.system, Wrap::None);
+        } else {
+            buffer.set_size(&mut self.system, Some(max_width), None);
+            buffer.set_wrap(&mut self.system, Wrap::Word);
+        }
 
         // Build rich-text spans from the text-owning spans only (element
         // spans nest and would overlap; the text spans are non-overlapping
@@ -123,6 +134,56 @@ impl TextLayout {
             if run.line_w > max_w {
                 max_w = run.line_w;
             }
+        }
+
+        // text-overflow: ellipsis post-processing. Cosmic-text doesn't
+        // expose a "truncate to width with ellipsis" knob, so we drop
+        // overflowing glyphs and shape a horizontal-ellipsis glyph in
+        // its place, sized to match the line we just produced.
+        if ellipsis_mode && max_w > max_width && !glyphs.is_empty() {
+            let ellipsis_width =
+                self.measure_natural_width("\u{2026}", parent_style);
+            let cutoff = (max_width - ellipsis_width).max(0.0);
+            let mut last_y = glyphs[0].y;
+            let mut line_height_used = glyphs[0].height;
+            glyphs.retain(|g| {
+                let keep = g.x + g.width <= cutoff;
+                if keep {
+                    last_y = g.y;
+                    line_height_used = g.height;
+                }
+                keep
+            });
+            // Append the ellipsis glyph at the cutoff. We re-shape just
+            // the ellipsis string into a fresh buffer so we get accurate
+            // glyph metrics for the active font.
+            let mut elps = Buffer::new(&mut self.system, metrics);
+            elps.set_size(&mut self.system, Some(ellipsis_width + 1.0), None);
+            elps.set_wrap(&mut self.system, Wrap::None);
+            elps.set_text(
+                &mut self.system,
+                "\u{2026}",
+                attrs_from_style(parent_style),
+                Shaping::Advanced,
+            );
+            elps.shape_until_scroll(&mut self.system, false);
+            let mut last_x =
+                glyphs.last().map(|g| g.x + g.width).unwrap_or(0.0);
+            for run in elps.layout_runs() {
+                for g in run.glyphs.iter() {
+                    glyphs.push(ShapedGlyph {
+                        text_start: g.start,
+                        x: last_x + g.x,
+                        y: last_y,
+                        width: g.w,
+                        height: line_height_used,
+                    });
+                }
+                if run.line_w > 0.0 {
+                    last_x += run.line_w;
+                }
+            }
+            max_w = last_x.min(max_width);
         }
 
         ShapedText {

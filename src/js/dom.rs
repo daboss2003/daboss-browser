@@ -1695,6 +1695,13 @@ fn audio_play(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsVa
                 }
             }
         });
+        super::engine::JS_VIDEO_ELEMENTS.with(|slot| {
+            if let Some(rc) = slot.borrow().as_ref() {
+                if let Some(el) = rc.borrow().get(&id) {
+                    el.play();
+                }
+            }
+        });
     }
     Ok(JsValue::undefined())
 }
@@ -1702,6 +1709,13 @@ fn audio_play(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsVa
 fn audio_pause(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     if let Some(id) = read_self_node_id(this, ctx) {
         super::engine::JS_AUDIO_ELEMENTS.with(|slot| {
+            if let Some(rc) = slot.borrow().as_ref() {
+                if let Some(el) = rc.borrow().get(&id) {
+                    el.pause();
+                }
+            }
+        });
+        super::engine::JS_VIDEO_ELEMENTS.with(|slot| {
             if let Some(rc) = slot.borrow().as_ref() {
                 if let Some(el) = rc.borrow().get(&id) {
                     el.pause();

@@ -8,6 +8,7 @@ mod js;
 mod layout;
 mod net;
 mod paint;
+mod video;
 
 use std::num::NonZeroU32;
 use std::process::ExitCode;
@@ -184,6 +185,9 @@ struct Page {
     /// during navigation. Held in a shared `Rc<RefCell>` so JS shims
     /// can grab the same map via a thread-local.
     audio: js::AudioElements,
+    /// `<video>` element registry; same shape as `audio` but each
+    /// entry owns an ffmpeg subprocess + decode thread.
+    video: js::VideoElements,
     /// Page-scoped JS context. Owns the long-lived `boa::Context` plus the
     /// addEventListener registry, so click handlers registered by inline
     /// scripts can fire on subsequent user input.
@@ -453,6 +457,9 @@ impl Browser {
         paint::PAINT_CANVAS_SURFACES.with(|slot| {
             *slot.borrow_mut() = Some(js_engine.canvas_surfaces());
         });
+        paint::PAINT_VIDEO_ELEMENTS.with(|slot| {
+            *slot.borrow_mut() = Some(js_engine.video_elements());
+        });
         let painted = paint::paint(
             &dom,
             &style_tree,
@@ -462,6 +469,9 @@ impl Browser {
             paint_h,
         );
         paint::PAINT_CANVAS_SURFACES.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        paint::PAINT_VIDEO_ELEMENTS.with(|slot| {
             slot.borrow_mut().take();
         });
         let mut pixmap = match painted {
@@ -495,6 +505,7 @@ impl Browser {
         seed_input_values(&dom, dom.document(), &mut inputs);
 
         let audio_map = js_engine.audio_elements();
+        let video_map = js_engine.video_elements();
         self.page = Some(Page {
             url: parsed,
             dom,
@@ -508,6 +519,7 @@ impl Browser {
             inputs,
             iframes,
             audio: audio_map,
+            video: video_map,
             js: js_engine,
         });
         self.scroll_y = 0.0;
@@ -515,6 +527,7 @@ impl Browser {
         self.refresh_js_bounding_rects();
         self.refresh_js_computed_styles();
         self.prefetch_audio_elements();
+        self.prefetch_video_elements();
 
         // Lifecycle: DOMContentLoaded fires now (parse complete + script
         // execution done), then `load` after layout/paint also done.
@@ -632,6 +645,9 @@ impl Browser {
         paint::PAINT_CANVAS_SURFACES.with(|slot| {
             *slot.borrow_mut() = Some(page.js.canvas_surfaces());
         });
+        paint::PAINT_VIDEO_ELEMENTS.with(|slot| {
+            *slot.borrow_mut() = Some(page.js.video_elements());
+        });
         let painted = paint::paint(
             &page.dom,
             &page.styles,
@@ -641,6 +657,9 @@ impl Browser {
             paint_h,
         );
         paint::PAINT_CANVAS_SURFACES.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        paint::PAINT_VIDEO_ELEMENTS.with(|slot| {
             slot.borrow_mut().take();
         });
         if let Some(mut pixmap) = painted {
@@ -896,6 +915,9 @@ impl Browser {
         paint::PAINT_CANVAS_SURFACES.with(|slot| {
             *slot.borrow_mut() = Some(page.js.canvas_surfaces());
         });
+        paint::PAINT_VIDEO_ELEMENTS.with(|slot| {
+            *slot.borrow_mut() = Some(page.js.video_elements());
+        });
         let painted = paint::paint(
             &page.dom,
             &page.styles,
@@ -905,6 +927,9 @@ impl Browser {
             max_bottom,
         );
         paint::PAINT_CANVAS_SURFACES.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        paint::PAINT_VIDEO_ELEMENTS.with(|slot| {
             slot.borrow_mut().take();
         });
         if let Some(mut pixmap) = painted {
@@ -1250,6 +1275,42 @@ fn logical_key_to_string(key: &Key, text: Option<&str>) -> String {
         Key::Named(NamedKey::Super) => "Meta".into(),
         Key::Character(s) => s.to_string(),
         _ => String::new(),
+    }
+}
+
+fn collect_video_sources(
+    dom: &dom::Dom,
+    node: dom::NodeId,
+    out: &mut Vec<(dom::NodeId, String, bool, bool)>,
+) {
+    if let dom::NodeKind::Element { tag, attrs } = &dom.node(node).kind {
+        if tag == "video" {
+            let src = attrs
+                .iter()
+                .find(|(k, _)| k == "src")
+                .map(|(_, v)| v.clone())
+                .or_else(|| {
+                    dom.children(node).find_map(|c| {
+                        if let dom::NodeKind::Element { tag: t, attrs: a } = &dom.node(c).kind {
+                            if t == "source" {
+                                return a
+                                    .iter()
+                                    .find(|(k, _)| k == "src")
+                                    .map(|(_, v)| v.clone());
+                            }
+                        }
+                        None
+                    })
+                });
+            if let Some(src) = src.filter(|s| !s.is_empty()) {
+                let autoplay = attrs.iter().any(|(k, _)| k == "autoplay");
+                let loop_ = attrs.iter().any(|(k, _)| k == "loop");
+                out.push((node, src, autoplay, loop_));
+            }
+        }
+    }
+    for c in dom.children(node).collect::<Vec<_>>() {
+        collect_video_sources(dom, c, out);
     }
 }
 
@@ -2445,6 +2506,35 @@ impl Browser {
             if autoplay {
                 element.play();
             }
+            elements.borrow_mut().insert(id, element);
+        }
+    }
+
+    /// Walk for `<video>` elements, fetch their `src`, hand the bytes
+    /// to ffmpeg via [`video::VideoElement::from_bytes`]. Stored on
+    /// the JsEngine's video_elements map so paint can pull frames.
+    fn prefetch_video_elements(&mut self) {
+        let Some(page) = self.page.as_mut() else {
+            return;
+        };
+        let mut to_prefetch: Vec<(dom::NodeId, String, bool, bool)> = Vec::new();
+        collect_video_sources(&page.dom, page.dom.document(), &mut to_prefetch);
+        let base = page.url.clone();
+        let elements = page.video.clone();
+        for (id, src, autoplay, loop_) in to_prefetch {
+            let Ok(abs) = base.join(&src) else { continue };
+            let url_str = abs.to_string();
+            let ctx = net::RequestContext::new().with_initiator(base.clone());
+            let Ok(resp) = self.client.get_with(&url_str, ctx) else { continue };
+            if !(200..300).contains(&resp.status) {
+                continue;
+            }
+            let Some(element) =
+                video::VideoElement::from_bytes(resp.body, autoplay, loop_)
+            else {
+                eprintln!("[video] could not start decode for {url_str}");
+                continue;
+            };
             elements.borrow_mut().insert(id, element);
         }
     }

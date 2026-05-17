@@ -990,21 +990,23 @@ fn parse_media_query(input: &str) -> MediaQuery {
     query
 }
 
-fn parse_media_alternative(s: &str) -> Vec<MediaCondition> {
+fn parse_media_alternative(input: &str) -> Vec<MediaCondition> {
+    // Indices into `chars` must be indices into the same slice we then
+    // re-slice; trimming `input` returns a substring whose offsets are
+    // not the offsets of `input`, so shadow it before tokenising.
+    let s = input.trim();
     let mut out = Vec::new();
-    // Tokens are either a bare ident (media type, "only", "not", "and")
-    // or a parenthesised feature.
-    let mut chars = s.trim().char_indices().peekable();
-    let bytes = s.as_bytes();
+    let mut chars = s.char_indices().peekable();
     while let Some(&(i, c)) = chars.peek() {
         if c.is_ascii_whitespace() {
             chars.next();
             continue;
         }
         if c == '(' {
-            // Find matching ')'.
+            // Find the matching ')'. Both `j` (offset within `s[i..]`)
+            // and `end` (offset within `s`) are byte indices.
             let mut depth = 0;
-            let mut end = i;
+            let mut end = s.len();
             for (j, ch) in s[i..].char_indices() {
                 match ch {
                     '(' => depth += 1,
@@ -1020,7 +1022,7 @@ fn parse_media_alternative(s: &str) -> Vec<MediaCondition> {
             }
             let body = &s[i + 1..end];
             out.push(parse_media_feature(body));
-            // Advance the iterator past the closing paren.
+            // Skip the iterator past the closing paren itself.
             while let Some(&(j, _)) = chars.peek() {
                 if j > end {
                     break;
@@ -1031,24 +1033,19 @@ fn parse_media_alternative(s: &str) -> Vec<MediaCondition> {
         }
         // Bare token.
         let start = i;
-        while let Some(&(j, ch)) = chars.peek() {
+        while let Some(&(_, ch)) = chars.peek() {
             if ch.is_ascii_whitespace() || ch == '(' {
                 break;
             }
             chars.next();
-            let _ = j;
-            let _ = bytes;
         }
         let end = chars.peek().map(|(j, _)| *j).unwrap_or(s.len());
         let tok = s[start..end].to_ascii_lowercase();
         match tok.as_str() {
             "and" | "only" | "" => {}
             "not" => {
-                // Negation isn't supported beyond returning Unsupported so
-                // the whole alternative loses.
                 out.push(MediaCondition::Unsupported("not".into()));
             }
-            // Media types
             "screen" | "print" | "all" | "speech" => {
                 out.push(MediaCondition::MediaType(tok));
             }
@@ -1469,8 +1466,12 @@ mod tests {
     }
 
     #[test]
-    fn skips_at_rules() {
+    fn at_media_preserves_top_level_rules() {
+        // The @media block goes into `media_blocks`; sibling top-level
+        // rules stay in `rules`. Used to be tested as "skipped" — they're
+        // now collected so the cascade can pull them in conditionally.
         let s = parse("@media print { p { color: red; } } body { color: blue; }");
+        assert_eq!(s.media_blocks.len(), 1);
         assert_eq!(s.rules.len(), 1);
         assert_eq!(s.rules[0].selectors[0].compounds[0].tag.as_deref(), Some("body"));
     }

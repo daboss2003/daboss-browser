@@ -399,14 +399,23 @@ impl Browser {
         // them into the parent pixmap as the last step).
         let iframes = render_iframes(&dom, &box_tree, &self.client, &parsed);
 
-        let mut pixmap = match paint::paint(
+        // Install the JS engine's canvas surfaces for the duration of
+        // paint so any `<canvas>` element composites correctly.
+        paint::PAINT_CANVAS_SURFACES.with(|slot| {
+            *slot.borrow_mut() = Some(js_engine.canvas_surfaces());
+        });
+        let painted = paint::paint(
             &dom,
             &style_tree,
             &box_tree,
             &images,
             self.viewport_size.0,
             paint_h,
-        ) {
+        );
+        paint::PAINT_CANVAS_SURFACES.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        let mut pixmap = match painted {
             Some(p) => p,
             None => {
                 eprintln!("[paint] could not allocate pixmap");
@@ -447,6 +456,8 @@ impl Browser {
             js: js_engine,
         });
         self.scroll_y = 0.0;
+
+        self.refresh_js_bounding_rects();
 
         // Lifecycle: DOMContentLoaded fires now (parse complete + script
         // execution done), then `load` after layout/paint also done.
@@ -537,14 +548,21 @@ impl Browser {
         let new_iframes =
             render_iframes(&page.dom, &box_tree, &self.client, &page.url);
 
-        if let Some(mut pixmap) = paint::paint(
+        paint::PAINT_CANVAS_SURFACES.with(|slot| {
+            *slot.borrow_mut() = Some(page.js.canvas_surfaces());
+        });
+        let painted = paint::paint(
             &page.dom,
             &page.styles,
             &box_tree,
             &page.images,
             page_w,
             paint_h,
-        ) {
+        );
+        paint::PAINT_CANVAS_SURFACES.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        if let Some(mut pixmap) = painted {
             composite_iframes(&mut pixmap, &box_tree, &new_iframes);
             page.box_tree = box_tree;
             page.pixmap = pixmap;
@@ -776,15 +794,37 @@ impl Browser {
             &interaction,
             &css_viewport,
         );
+        // The cascade may not change layout, but conservatively refresh
+        // rects so getBoundingClientRect doesn't return stale values
+        // when interaction state flips and a re-layout runs upstack.
+        let entries: Vec<(dom::NodeId, [f32; 4])> = page
+            .box_tree
+            .boxes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| {
+                let b = b.as_ref()?;
+                let id = dom::NodeId::from_raw(i as u32);
+                Some((id, [b.rect.x, b.rect.y, b.rect.width, b.rect.height]))
+            })
+            .collect();
+        page.js.refresh_bounding_rects(entries);
         let max_bottom = page.pixmap.height();
-        if let Some(mut pixmap) = paint::paint(
+        paint::PAINT_CANVAS_SURFACES.with(|slot| {
+            *slot.borrow_mut() = Some(page.js.canvas_surfaces());
+        });
+        let painted = paint::paint(
             &page.dom,
             &page.styles,
             &page.box_tree,
             &page.images,
             page_w,
             max_bottom,
-        ) {
+        );
+        paint::PAINT_CANVAS_SURFACES.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        if let Some(mut pixmap) = painted {
             composite_iframes(&mut pixmap, &page.box_tree, &page.iframes);
             page.pixmap = pixmap;
         }
@@ -2132,6 +2172,21 @@ impl Browser {
         }
     }
 
+    /// Walk the box tree and push each element's rect into the JS
+    /// engine so `getBoundingClientRect` can return current values
+    /// without going through the box tree directly.
+    fn refresh_js_bounding_rects(&mut self) {
+        let Some(page) = self.page.as_mut() else {
+            return;
+        };
+        let entries = page.box_tree.boxes.iter().enumerate().filter_map(|(i, b)| {
+            let b = b.as_ref()?;
+            let id = dom::NodeId::from_raw(i as u32);
+            Some((id, [b.rect.x, b.rect.y, b.rect.width, b.rect.height]))
+        });
+        page.js.refresh_bounding_rects(entries);
+    }
+
     fn pump_js_animation_frames(&mut self) {
         let Some(page) = self.page.as_mut() else {
             return;
@@ -2195,10 +2250,11 @@ fn walk_images(
     }
     if let dom::NodeKind::Element { tag, attrs } = &dom_ref.node(node).kind {
         if tag == "img" {
-            if let Some((_, src)) = attrs.iter().find(|(k, _)| k == "src") {
+            let chosen = pick_img_url(dom_ref, node, attrs);
+            if let Some(src) = chosen {
                 if !src.is_empty() {
                     *count += 1;
-                    if let Some(info) = fetch_and_decode(client, base_url, src) {
+                    if let Some(info) = fetch_and_decode(client, base_url, &src) {
                         cache.insert((node, layout::ImageSlot::Img), info);
                     }
                 }
@@ -2209,6 +2265,97 @@ fn walk_images(
     for c in kids {
         walk_images(dom_ref, c, client, base_url, cache, count);
     }
+}
+
+/// Pick the best source for an `<img>`. Honours `srcset` (1x/2x/Nx
+/// descriptors and `w`-descriptors), `<picture>` parent `<source>`
+/// elements, and falls back to `src=`. The toy assumes a 1x device
+/// pixel ratio; future tablets / Retina support would feed a real DPR
+/// in here.
+fn pick_img_url(
+    dom: &dom::Dom,
+    node: dom::NodeId,
+    attrs: &[(String, String)],
+) -> Option<String> {
+    // `<picture>` semantics: if the parent is a <picture>, walk its
+    // <source> children before this img and use the first one with a
+    // matching srcset. We don't parse `media`/`type` filters yet.
+    if let Some(parent) = dom.node(node).parent {
+        if let dom::NodeKind::Element { tag, .. } = &dom.node(parent).kind {
+            if tag == "picture" {
+                for sib in dom.children(parent) {
+                    if sib == node {
+                        break;
+                    }
+                    if let dom::NodeKind::Element { tag: t, attrs: a } = &dom.node(sib).kind {
+                        if t == "source" {
+                            if let Some(set) =
+                                a.iter().find(|(k, _)| k == "srcset").map(|(_, v)| v.as_str())
+                            {
+                                if let Some(pick) = pick_srcset_url(set) {
+                                    return Some(pick);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Then the img's own srcset, then bare src.
+    if let Some((_, set)) = attrs.iter().find(|(k, _)| k == "srcset") {
+        if let Some(pick) = pick_srcset_url(set) {
+            return Some(pick);
+        }
+    }
+    attrs.iter().find(|(k, _)| k == "src").map(|(_, v)| v.clone())
+}
+
+/// Parse a `srcset` and pick the entry closest to 1× DPR. Each
+/// candidate is `URL <descriptor>` where the descriptor is either
+/// `<n>x` (density) or `<n>w` (width hint). For width hints we don't
+/// know the rendered width, so we pick the smallest entry — keeps
+/// bandwidth low for the toy.
+fn pick_srcset_url(srcset: &str) -> Option<String> {
+    let mut candidates: Vec<(String, f32)> = Vec::new();
+    for entry in srcset.split(',') {
+        let parts: Vec<&str> = entry.trim().split_ascii_whitespace().collect();
+        if parts.is_empty() {
+            continue;
+        }
+        let url = parts[0].to_string();
+        let density = match parts.get(1) {
+            None => 1.0,
+            Some(d) => {
+                let d = d.trim();
+                if let Some(num) = d.strip_suffix('x').and_then(|s| s.parse::<f32>().ok()) {
+                    num
+                } else if let Some(num) = d.strip_suffix('w').and_then(|s| s.parse::<f32>().ok()) {
+                    // Approximate width descriptors as density via
+                    // width / 1024 (our default viewport). Smaller =
+                    // closer to 1×.
+                    (num / 1024.0).max(0.1)
+                } else {
+                    1.0
+                }
+            }
+        };
+        if !url.is_empty() {
+            candidates.push((url, density));
+        }
+    }
+    // Pick the entry with density closest to 1.0 (so 1x preferred over
+    // 2x or 3x on a non-Retina display).
+    candidates
+        .into_iter()
+        .min_by(|a, b| {
+            (a.1 - 1.0)
+                .abs()
+                .partial_cmp(&(b.1 - 1.0).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(u, _)| u)
 }
 
 fn fetch_and_decode(

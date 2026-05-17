@@ -21,6 +21,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 boa_engine = "0.20"
 flate2 = "1"
 brotli = { version = "8", default-features = false, features = ["std"] }
+resvg = { version = "0.43", default-features = false }
 
 [profile.release]
 lto = "thin"

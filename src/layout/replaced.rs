@@ -32,9 +32,16 @@ pub enum ImageSlot {
 
 pub type ImageCache = HashMap<(NodeId, ImageSlot), ImageInfo>;
 
-/// Decode an image from its raw bytes. Recognises PNG, JPEG, WebP, GIF, BMP.
-/// Returns `None` for unknown formats, decode errors, or oversized images.
+/// Decode an image from its raw bytes. Recognises PNG, JPEG, WebP, GIF,
+/// BMP, and SVG (via `resvg`). Returns `None` for unknown formats,
+/// decode errors, or oversized images.
 pub fn decode_image(bytes: &[u8]) -> Option<ImageInfo> {
+    // Try SVG first when the bytes look textual + match the SVG sniff.
+    if looks_like_svg(bytes) {
+        if let Some(info) = decode_svg(bytes) {
+            return Some(info);
+        }
+    }
     let reader = ::image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;
@@ -51,6 +58,39 @@ pub fn decode_image(bytes: &[u8]) -> Option<ImageInfo> {
         width,
         height,
         rgba: rgba.into_raw(),
+    })
+}
+
+fn looks_like_svg(bytes: &[u8]) -> bool {
+    let head_len = bytes.len().min(512);
+    let head = std::str::from_utf8(&bytes[..head_len]).unwrap_or("").trim_start();
+    head.starts_with("<?xml") && head.contains("<svg")
+        || head.starts_with("<svg")
+        || (head.starts_with("<!DOCTYPE") && head.to_ascii_lowercase().contains("svg"))
+}
+
+fn decode_svg(bytes: &[u8]) -> Option<ImageInfo> {
+    use resvg::tiny_skia;
+    use resvg::usvg;
+
+    let opts = usvg::Options::default();
+    let tree = usvg::Tree::from_data(bytes, &opts).ok()?;
+    let size = tree.size().to_int_size();
+    let width = size.width().min(MAX_IMAGE_DIMENSION);
+    let height = size.height().min(MAX_IMAGE_DIMENSION);
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let mut pixmap = tiny_skia::Pixmap::new(width, height)?;
+    resvg::render(
+        &tree,
+        tiny_skia::Transform::identity(),
+        &mut pixmap.as_mut(),
+    );
+    Some(ImageInfo {
+        width,
+        height,
+        rgba: pixmap.take(),
     })
 }
 
@@ -80,5 +120,19 @@ mod tests {
     #[test]
     fn decode_garbage_returns_none() {
         assert!(decode_image(b"not an image").is_none());
+    }
+
+    #[test]
+    fn decode_inline_svg() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="5">
+            <rect width="10" height="5" fill="red"/>
+        </svg>"#;
+        let info = decode_image(svg).expect("svg should decode");
+        assert_eq!(info.width, 10);
+        assert_eq!(info.height, 5);
+        assert_eq!(info.rgba.len(), 10 * 5 * 4);
+        // Top-left pixel should be red.
+        assert_eq!(info.rgba[0], 255);
+        assert_eq!(info.rgba[3], 255);
     }
 }

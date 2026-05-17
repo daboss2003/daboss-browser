@@ -128,6 +128,12 @@ thread_local! {
     pub(crate) static JS_HISTORY: RefCell<Option<Rc<RefCell<JsHistory>>>> =
         const { RefCell::new(None) };
 
+    /// Last-known bounding rects per node, populated by the browser
+    /// after each layout pass. Backs `getBoundingClientRect`.
+    pub(crate) static JS_BOUNDING_RECTS:
+        RefCell<Option<Rc<RefCell<std::collections::HashMap<NodeId, [f32; 4]>>>>> =
+        const { RefCell::new(None) };
+
     /// Per-dispatch flags toggled by `event.preventDefault()` /
     /// `event.stopPropagation()`. Reset at the start of each dispatch.
     pub(crate) static EVENT_FLAGS: RefCell<EventFlags> = const { RefCell::new(EventFlags::EMPTY) };
@@ -174,6 +180,19 @@ pub struct JsEngine {
     nav_requests: Rc<RefCell<Vec<NavRequest>>>,
     /// In-engine history stack for the History API.
     history: Rc<RefCell<JsHistory>>,
+    /// Observer registries (MutationObserver / IntersectionObserver /
+    /// ResizeObserver). Installed into a thread-local around each
+    /// dispatch so the DOM mutators can enqueue mutation records.
+    observers: Rc<RefCell<super::observers::ObserverState>>,
+    /// Per-element layout rects (x, y, width, height) in viewport
+    /// coordinates. Refreshed by the browser after every layout so
+    /// `getBoundingClientRect` can read them without touching the box
+    /// tree directly.
+    bounding_rects: Rc<RefCell<std::collections::HashMap<NodeId, [f32; 4]>>>,
+    /// `<canvas>` rendering surfaces. Each `<canvas>` element's first
+    /// `getContext('2d')` call inserts a pixmap here. Paint reads back
+    /// to composite the canvas onto the page.
+    canvas_surfaces: super::CanvasSurfaces,
 }
 
 /// Outcome of an event dispatch — informs the caller whether to skip the
@@ -286,6 +305,7 @@ impl JsEngine {
         install_location_and_history_globals(&mut ctx);
         super::xhr::install(&mut ctx);
         super::web_classes::install(&mut ctx);
+        super::observers::install(&mut ctx);
 
         let listeners: Rc<RefCell<ListenerMap>> = Rc::new(RefCell::new(HashMap::new()));
         let timers: Rc<RefCell<TimerState>> = Rc::new(RefCell::new(TimerState::default()));
@@ -305,6 +325,12 @@ impl JsEngine {
             }],
             cursor: 0,
         }));
+        let observers: Rc<RefCell<super::observers::ObserverState>> =
+            Rc::new(RefCell::new(super::observers::ObserverState::default()));
+        let bounding_rects: Rc<RefCell<std::collections::HashMap<NodeId, [f32; 4]>>> =
+            Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let canvas_surfaces: super::CanvasSurfaces =
+            Rc::new(RefCell::new(std::collections::HashMap::new()));
         let mut engine = JsEngine {
             ctx,
             listeners,
@@ -318,6 +344,9 @@ impl JsEngine {
             location_url,
             nav_requests,
             history,
+            observers,
+            bounding_rects,
+            canvas_surfaces,
         };
         if allow_inline_scripts {
             engine.run_initial_scripts(dom);
@@ -330,6 +359,27 @@ impl JsEngine {
     pub fn drain_nav_requests(&self) -> Vec<NavRequest> {
         let mut q = self.nav_requests.borrow_mut();
         std::mem::take(&mut *q)
+    }
+
+    /// Shared handle to the page's `<canvas>` pixmaps. The painter
+    /// reads from this to composite canvas pixels onto the page.
+    pub fn canvas_surfaces(&self) -> super::CanvasSurfaces {
+        self.canvas_surfaces.clone()
+    }
+
+    /// Refresh the per-element bounding-rect cache used by
+    /// `getBoundingClientRect`. The browser calls this after each
+    /// layout pass with `(node, x, y, w, h)` tuples in viewport
+    /// coordinates. Existing entries for absent nodes get pruned.
+    pub fn refresh_bounding_rects<I>(&self, rects: I)
+    where
+        I: IntoIterator<Item = (NodeId, [f32; 4])>,
+    {
+        let mut map = self.bounding_rects.borrow_mut();
+        map.clear();
+        for (node, rect) in rects {
+            map.insert(node, rect);
+        }
     }
 
     /// Update the engine's view of the current URL when the browser
@@ -425,6 +475,8 @@ impl JsEngine {
         }
         // Drain microtasks queued by the timer bodies.
         self.ctx.run_jobs();
+        super::observers::drain_mutation_records(&mut self.ctx);
+        self.ctx.run_jobs();
 
         let post_count = dom_rc.borrow().node_count();
         let mutated = post_count != pre_count;
@@ -463,6 +515,8 @@ impl JsEngine {
         }
         // Drain the promise / microtask queue so `.then` callbacks, the
         // bodies after `await`, etc. all run before we hand control back.
+        self.ctx.run_jobs();
+        super::observers::drain_mutation_records(&mut self.ctx);
         self.ctx.run_jobs();
         self.uninstall_thread_locals(dom, rc, listeners_rc);
     }
@@ -551,6 +605,8 @@ impl JsEngine {
         // chained `.then(...)` need their continuations to run before
         // we return to the browser.
         self.ctx.run_jobs();
+        super::observers::drain_mutation_records(&mut self.ctx);
+        self.ctx.run_jobs();
 
         let flags = EVENT_FLAGS.with(|f| *f.borrow());
         let post_mutation_marker = dom_rc.borrow().node_count();
@@ -609,6 +665,15 @@ impl JsEngine {
         JS_HISTORY.with(|slot| {
             *slot.borrow_mut() = Some(self.history.clone());
         });
+        super::observers::JS_OBSERVERS.with(|slot| {
+            *slot.borrow_mut() = Some(self.observers.clone());
+        });
+        JS_BOUNDING_RECTS.with(|slot| {
+            *slot.borrow_mut() = Some(self.bounding_rects.clone());
+        });
+        super::canvas::JS_CANVAS_SURFACES.with(|slot| {
+            *slot.borrow_mut() = Some(self.canvas_surfaces.clone());
+        });
         (dom_rc, listeners_rc)
     }
 
@@ -619,6 +684,15 @@ impl JsEngine {
         listeners_rc: Rc<RefCell<ListenerMap>>,
     ) {
         JS_HISTORY.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        super::observers::JS_OBSERVERS.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        JS_BOUNDING_RECTS.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        super::canvas::JS_CANVAS_SURFACES.with(|slot| {
             slot.borrow_mut().take();
         });
         JS_NAV_REQUESTS.with(|slot| {
@@ -2151,6 +2225,98 @@ mod tests {
             // readyState=4 then onerror.
             assert_eq!(get("data-trace"), Some("1,4,err"));
             assert_eq!(get("data-status"), Some("0"));
+        }
+    }
+
+    #[test]
+    fn canvas_fill_rect_writes_pixels() {
+        let src = r#"
+            var cv = document.getElementById('c');
+            var ctx = cv.getContext('2d');
+            ctx.fillStyle = '#ff0000';
+            ctx.fillRect(0, 0, 5, 5);
+        "#;
+        let mut dom = html::parse(&format!(
+            "<html><body><canvas id='c' width='10' height='10'></canvas><script>{src}</script></body></html>"
+        ));
+        let engine = JsEngine::new(&mut dom);
+        let surfaces = engine.canvas_surfaces();
+        let id = find_for_test_by_id(&dom, "c").unwrap();
+        let map = surfaces.borrow();
+        let s = map.get(&id).expect("surface should be created");
+        assert_eq!(s.pixmap.width(), 10);
+        assert_eq!(s.pixmap.height(), 10);
+        let data = s.pixmap.data();
+        // Top-left pixel: red, fully opaque.
+        assert_eq!(data[0], 255);
+        assert_eq!(data[1], 0);
+        assert_eq!(data[2], 0);
+        assert_eq!(data[3], 255);
+        // Outside the fill rect — should still be zero (canvas inits transparent).
+        let outside = (6 * 10 + 0) * 4;
+        assert_eq!(data[outside + 3], 0);
+    }
+
+    #[test]
+    fn mutation_observer_fires_on_attribute_change() {
+        // MutationObserver callbacks fire *after* the script finishes,
+        // so the callback itself writes its observations back to the
+        // DOM where we can inspect them.
+        let src = r#"
+            var el = document.getElementById('hi');
+            var mo = new MutationObserver(function(records) {
+                var trace = el.getAttribute('data-trace') || '';
+                for (var i = 0; i < records.length; i++) {
+                    trace += records[i].type + ':' + records[i].attributeName + ';';
+                }
+                // Disconnect so the trace-write doesn't itself trigger
+                // another callback round.
+                mo.disconnect();
+                el.setAttribute('data-trace', trace);
+            });
+            mo.observe(el, { attributes: true });
+            el.setAttribute('data-x', 'first');
+            el.setAttribute('data-y', 'second');
+        "#;
+        let mut dom = html::parse(&format!(
+            "<html><body><div id='hi'>x</div><script>{src}</script></body></html>"
+        ));
+        let mut _engine = JsEngine::new(&mut dom);
+        let id = find_for_test_by_id(&dom, "hi").unwrap();
+        if let NodeKind::Element { attrs, .. } = &dom.node(id).kind {
+            let trace = attrs
+                .iter()
+                .find(|(k, _)| k == "data-trace")
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("");
+            assert!(trace.contains("attributes:data-x;"), "got: {trace}");
+            assert!(trace.contains("attributes:data-y;"), "got: {trace}");
+        }
+    }
+
+    #[test]
+    fn intersection_observer_fires_on_observe() {
+        let src = r#"
+            var el = document.getElementById('hi');
+            var saw = false;
+            var io = new IntersectionObserver(function(entries) {
+                if (entries.length > 0 && entries[0].isIntersecting) {
+                    saw = true;
+                }
+            });
+            io.observe(el);
+            el.setAttribute('data-saw', String(saw));
+        "#;
+        let mut dom = html::parse(&format!(
+            "<html><body><div id='hi'>x</div><script>{src}</script></body></html>"
+        ));
+        let mut _engine = JsEngine::new(&mut dom);
+        let id = find_for_test_by_id(&dom, "hi").unwrap();
+        if let NodeKind::Element { attrs, .. } = &dom.node(id).kind {
+            assert_eq!(
+                attrs.iter().find(|(k, _)| k == "data-saw").map(|(_, v)| v.as_str()),
+                Some("true")
+            );
         }
     }
 

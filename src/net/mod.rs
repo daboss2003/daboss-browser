@@ -1,4 +1,5 @@
 mod adblock;
+mod cache;
 mod cookies;
 mod csp;
 mod dns;
@@ -71,6 +72,17 @@ pub struct Client {
     /// `Strict-Transport-Security` response header. Future `http://`
     /// requests to these hosts are upgraded to `https://`.
     hsts: RefCell<HashSet<String>>,
+    /// In-memory HTTP cache. Stores GET responses that opt in via
+    /// `Cache-Control` and validates with `ETag` / `If-None-Match` on
+    /// stale-with-validator hits.
+    cache: RefCell<cache::HttpCache>,
+    /// HTTP/1.1 keep-alive connection pool. Keyed by
+    /// `(host_lower, port, use_tls)`. After a successful response the
+    /// transport reads its buffered reader back into the pool unless
+    /// the server (or this side, on an error) requested close.
+    pool: RefCell<
+        std::collections::HashMap<(String, u16, bool), Vec<std::io::BufReader<transport::Connection>>>,
+    >,
 }
 
 impl Default for Client {
@@ -91,6 +103,8 @@ impl Client {
             cookies: RefCell::new(CookieJar::new()),
             blocklist: Blocklist::default_bundled(),
             hsts: RefCell::new(HashSet::new()),
+            cache: RefCell::new(cache::HttpCache::new()),
+            pool: RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -160,6 +174,90 @@ impl Client {
         )
     }
 
+    fn open_connection(
+        &self,
+        host: &str,
+        port: u16,
+        use_tls: bool,
+    ) -> Result<std::io::BufReader<transport::Connection>> {
+        let addrs = dns::resolve(host, port, self.allow_loopback)?;
+        let addr = addrs[0];
+        tracing::debug!(host, port, use_tls, "opening fresh connection");
+        let conn = transport::Connection::open(
+            addr,
+            host,
+            use_tls,
+            &self.tls,
+            self.connect_timeout,
+            self.read_timeout,
+        )?;
+        Ok(std::io::BufReader::new(conn))
+    }
+
+    fn send_via_pool(
+        &self,
+        key: &(String, u16, bool),
+        host: &str,
+        port: u16,
+        use_tls: bool,
+        request: &Request,
+    ) -> Result<Response> {
+        // Try a pooled connection first.
+        let pooled = self
+            .pool
+            .borrow_mut()
+            .get_mut(key)
+            .and_then(|v| v.pop());
+        if let Some(mut br) = pooled {
+            if let Ok(resp) = Self::send_and_recv(&mut br, request, self.max_response_bytes) {
+                self.return_to_pool(key, br, &resp);
+                return Ok(resp);
+            }
+            // Pooled connection was stale — drop and fall through.
+            tracing::debug!(?key, "pool: stale connection, retrying fresh");
+        }
+        // Open fresh.
+        let mut br = self.open_connection(host, port, use_tls)?;
+        let resp = Self::send_and_recv(&mut br, request, self.max_response_bytes)?;
+        self.return_to_pool(key, br, &resp);
+        Ok(resp)
+    }
+
+    fn send_and_recv(
+        br: &mut std::io::BufReader<transport::Connection>,
+        request: &Request,
+        max_bytes: usize,
+    ) -> Result<Response> {
+        request.write_to(br.get_mut())?;
+        Response::read_from_buf(br, max_bytes)
+    }
+
+    fn return_to_pool(
+        &self,
+        key: &(String, u16, bool),
+        br: std::io::BufReader<transport::Connection>,
+        response: &Response,
+    ) {
+        // If the server (or our request) said `Connection: close`, drop.
+        let close = response
+            .header("Connection")
+            .map(|v| v.eq_ignore_ascii_case("close"))
+            .unwrap_or(false);
+        if close {
+            return;
+        }
+        // Don't reuse on weird statuses — be conservative.
+        if !(200..500).contains(&response.status) {
+            return;
+        }
+        let mut pool = self.pool.borrow_mut();
+        let bucket = pool.entry(key.clone()).or_default();
+        // Cap per-host pool size — most browsers limit to 6.
+        if bucket.len() < 6 {
+            bucket.push(br);
+        }
+    }
+
     fn do_request(
         &self,
         url: Url,
@@ -215,19 +313,24 @@ impl Client {
             .port_or_known_default()
             .unwrap_or(if use_tls { 443 } else { 80 });
 
-        let addrs = dns::resolve(&host, port, self.allow_loopback)?;
-        let addr = addrs[0];
-
-        tracing::debug!(%url, %addr, use_tls, "connecting");
-
-        let mut conn = transport::Connection::open(
-            addr,
-            &host,
-            use_tls,
-            &self.tls,
-            self.connect_timeout,
-            self.read_timeout,
-        )?;
+        // HTTP cache lookup — only meaningful for GETs.
+        let cache_key = url.to_string();
+        let is_get = matches!(method, Method::Get);
+        if is_get {
+            let now = std::time::Instant::now();
+            let cached = self.cache.borrow().lookup(&cache_key).cloned();
+            if let Some(entry) = cached {
+                if entry.is_fresh(now) {
+                    tracing::debug!(%url, "cache: fresh hit");
+                    return Ok(Response {
+                        status: entry.status,
+                        reason: entry.reason,
+                        headers: entry.headers,
+                        body: entry.body,
+                    });
+                }
+            }
+        }
 
         let path = build_path(&url);
         let mut request = match &method {
@@ -236,6 +339,21 @@ impl Client {
                 Request::post(&host, &path, body.clone(), content_type)
             }
         };
+
+        // If we have a stale-with-validator entry, send the validators.
+        if is_get {
+            let entry = self.cache.borrow().lookup(&cache_key).cloned();
+            if let Some(entry) = entry {
+                if let Some(etag) = entry.etag {
+                    request.headers.push(("If-None-Match".to_string(), etag));
+                }
+                if let Some(lm) = entry.last_modified {
+                    request
+                        .headers
+                        .push(("If-Modified-Since".to_string(), lm));
+                }
+            }
+        }
         // Attach any matching cookies from the jar.
         if let Some(cookie_header) = self.cookies.borrow().header_for(&url) {
             request
@@ -263,9 +381,10 @@ impl Client {
             }
         }
 
-        request.write_to(&mut conn)?;
-
-        let response = Response::read_from(conn, self.max_response_bytes)?;
+        // Network round-trip via the keep-alive pool. Stale pooled
+        // connections trigger one retry with a fresh socket.
+        let pool_key = (host.to_ascii_lowercase(), port, use_tls);
+        let response = self.send_via_pool(&pool_key, &host, port, use_tls, &request)?;
 
         // Ingest any Set-Cookie headers before deciding whether to follow
         // a redirect — the spec scopes Set-Cookie to the redirect's
@@ -285,6 +404,30 @@ impl Client {
         if url.scheme() == "https" && response.header("Strict-Transport-Security").is_some() {
             if let Some(host) = url.host_str() {
                 self.hsts.borrow_mut().insert(host.to_ascii_lowercase());
+            }
+        }
+
+        // HTTP cache write / 304 refresh — only for GET.
+        if is_get {
+            if response.status == 304 {
+                let refreshed = self
+                    .cache
+                    .borrow_mut()
+                    .refresh_after_304(&cache_key, &response.headers);
+                if let Some(body) = refreshed {
+                    tracing::debug!(%url, "cache: 304 refresh");
+                    // Substitute the cached body but keep the new
+                    // response's headers so the cascade up the stack
+                    // (CORS / Set-Cookie / etc.) sees the latest.
+                    return Ok(Response {
+                        status: 200,
+                        reason: "OK".into(),
+                        headers: response.headers,
+                        body,
+                    });
+                }
+            } else if (200..400).contains(&response.status) {
+                self.cache.borrow_mut().store(&cache_key, &response);
             }
         }
 

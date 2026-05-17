@@ -58,8 +58,10 @@ fn default_headers() -> Vec<(String, String)> {
         // through flate2; br through the brotli crate. `identity` stays
         // in the list so a server can opt out.
         ("Accept-Encoding".into(), "gzip, br, deflate, identity".into()),
-        // Drop the connection after one request — keeps the parser simple.
-        ("Connection".into(), "close".into()),
+        // Opt into HTTP/1.1 keep-alive. The transport layer pools the
+        // connection back after each response unless the server (or
+        // we, on an error) decide to close.
+        ("Connection".into(), "keep-alive".into()),
     ]
 }
 
@@ -79,14 +81,22 @@ impl Response {
             .map(|(_, v)| v.as_str())
     }
 
+    #[allow(dead_code)] // kept for tests and one-shot integrations
     pub fn read_from<R: Read>(reader: R, max_bytes: usize) -> Result<Self> {
         let mut br = BufReader::new(reader);
-        let (status, reason) = read_status_line(&mut br)?;
-        let headers = read_headers(&mut br)?;
+        Self::read_from_buf(&mut br, max_bytes)
+    }
+
+    /// Same as `read_from` but takes a caller-managed buffered reader.
+    /// Lets the connection-pool path keep the same `BufReader` (and the
+    /// underlying TCP/TLS stream) live across requests.
+    pub fn read_from_buf<R: BufRead>(br: &mut R, max_bytes: usize) -> Result<Self> {
+        let (status, reason) = read_status_line(br)?;
+        let headers = read_headers(br)?;
 
         let body = if let Some(te) = find_header(&headers, "Transfer-Encoding") {
             if te.eq_ignore_ascii_case("chunked") {
-                read_chunked(&mut br, max_bytes)?
+                read_chunked(br, max_bytes)?
             } else {
                 return Err(Error::BadResponse(format!(
                     "unsupported transfer-encoding: {te}"
@@ -100,9 +110,9 @@ impl Response {
             if n > max_bytes {
                 return Err(Error::ResponseTooLarge(max_bytes));
             }
-            read_exact_vec(&mut br, n)?
+            read_exact_vec(br, n)?
         } else {
-            read_until_close(&mut br, max_bytes)?
+            read_until_close(br, max_bytes)?
         };
 
         // Apply Content-Encoding decoders. `gzip`, `deflate`, `br` are

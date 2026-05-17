@@ -550,6 +550,12 @@ pub enum WhiteSpace {
     Normal,
     Pre,
     NoWrap,
+    /// Like `pre` but lines wrap at the box edge.
+    PreWrap,
+    /// Like `normal` but preserves runs of whitespace.
+    PreLine,
+    /// Like `pre-wrap` but wrappable on whitespace inside the wrap.
+    BreakSpaces,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

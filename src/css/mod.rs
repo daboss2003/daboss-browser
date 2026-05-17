@@ -169,6 +169,8 @@ title { display: none; }
 meta { display: none; }
 link { display: none; }
 base { display: none; }
+template { display: none; }
+noscript { display: none; }
 
 body {
     margin: 8px;

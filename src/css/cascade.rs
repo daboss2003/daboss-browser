@@ -801,6 +801,9 @@ fn apply_declaration(
                 style.white_space = match k.as_str() {
                     "pre" => WhiteSpace::Pre,
                     "nowrap" => WhiteSpace::NoWrap,
+                    "pre-wrap" => WhiteSpace::PreWrap,
+                    "pre-line" => WhiteSpace::PreLine,
+                    "break-spaces" => WhiteSpace::BreakSpaces,
                     _ => WhiteSpace::Normal,
                 };
             }
@@ -810,11 +813,59 @@ fn apply_declaration(
         "margin-right" => apply_side(value, &mut style.margin.right, style.font_size, parent),
         "margin-bottom" => apply_side(value, &mut style.margin.bottom, style.font_size, parent),
         "margin-left" => apply_side(value, &mut style.margin.left, style.font_size, parent),
+        // Logical properties — under our LTR horizontal-tb assumption,
+        // `inline-start` = left, `inline-end` = right, `block-start` =
+        // top, `block-end` = bottom. Real browsers swap these based on
+        // `writing-mode` and `direction`; we don't read those yet.
+        "margin-inline-start" => {
+            apply_side(value, &mut style.margin.left, style.font_size, parent)
+        }
+        "margin-inline-end" => {
+            apply_side(value, &mut style.margin.right, style.font_size, parent)
+        }
+        "margin-block-start" => {
+            apply_side(value, &mut style.margin.top, style.font_size, parent)
+        }
+        "margin-block-end" => {
+            apply_side(value, &mut style.margin.bottom, style.font_size, parent)
+        }
+        "margin-inline" => {
+            apply_side(value, &mut style.margin.left, style.font_size, parent);
+            apply_side(value, &mut style.margin.right, style.font_size, parent);
+        }
+        "margin-block" => {
+            apply_side(value, &mut style.margin.top, style.font_size, parent);
+            apply_side(value, &mut style.margin.bottom, style.font_size, parent);
+        }
         "padding" => apply_box_shorthand(value, &mut style.padding, style.font_size, parent),
         "padding-top" => apply_side(value, &mut style.padding.top, style.font_size, parent),
         "padding-right" => apply_side(value, &mut style.padding.right, style.font_size, parent),
         "padding-bottom" => apply_side(value, &mut style.padding.bottom, style.font_size, parent),
         "padding-left" => apply_side(value, &mut style.padding.left, style.font_size, parent),
+        "padding-inline-start" => {
+            apply_side(value, &mut style.padding.left, style.font_size, parent)
+        }
+        "padding-inline-end" => {
+            apply_side(value, &mut style.padding.right, style.font_size, parent)
+        }
+        "padding-block-start" => {
+            apply_side(value, &mut style.padding.top, style.font_size, parent)
+        }
+        "padding-block-end" => {
+            apply_side(value, &mut style.padding.bottom, style.font_size, parent)
+        }
+        "padding-inline" => {
+            apply_side(value, &mut style.padding.left, style.font_size, parent);
+            apply_side(value, &mut style.padding.right, style.font_size, parent);
+        }
+        "padding-block" => {
+            apply_side(value, &mut style.padding.top, style.font_size, parent);
+            apply_side(value, &mut style.padding.bottom, style.font_size, parent);
+        }
+        "inset-inline-start" => style.left = offset_from(value, style.font_size, parent),
+        "inset-inline-end" => style.right = offset_from(value, style.font_size, parent),
+        "inset-block-start" => style.top = offset_from(value, style.font_size, parent),
+        "inset-block-end" => style.bottom = offset_from(value, style.font_size, parent),
         "border-width" => apply_box_shorthand(value, &mut style.border_width, style.font_size, parent),
         "border-color" => {
             if let Some(c) = color_from(value) {

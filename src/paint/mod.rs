@@ -49,6 +49,14 @@ pub fn paint(
     Some(painter.pixmap)
 }
 
+thread_local! {
+    /// Installed by the browser shell for the duration of a paint pass
+    /// so the painter can composite `<canvas>` element pixmaps.
+    pub static PAINT_CANVAS_SURFACES:
+        std::cell::RefCell<Option<crate::js::CanvasSurfaces>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PaintCtx {
     /// Multiplicative alpha factor (composes via multiplication on recursion).
@@ -137,6 +145,11 @@ impl Painter {
                     (tree.get(node), images.get(&(node, ImageSlot::Img)))
                 {
                     self.paint_image(b.rect, info, ctx);
+                }
+            }
+            NodeKind::Element { tag, .. } if tag == "canvas" => {
+                if let Some(b) = tree.get(node) {
+                    self.paint_canvas(b.rect, node, ctx);
                 }
             }
             _ => {}
@@ -352,6 +365,35 @@ impl Painter {
             self.pixmap
                 .fill_rect(rect, &paint, Transform::identity(), None);
         }
+    }
+
+    /// Composite a `<canvas>` element's pixmap into the page. Pulled
+    /// from the `PAINT_CANVAS_SURFACES` thread-local that the browser
+    /// installs around each paint pass.
+    fn paint_canvas(&mut self, dest: Rect, node: NodeId, ctx: PaintCtx) {
+        let surface_bytes: Option<(u32, u32, Vec<u8>)> = PAINT_CANVAS_SURFACES.with(|slot| {
+            let rc = slot.borrow().as_ref().cloned()?;
+            let map = rc.borrow();
+            let s = map.get(&node)?;
+            Some((s.pixmap.width(), s.pixmap.height(), s.pixmap.data().to_vec()))
+        });
+        let Some((w, h, data)) = surface_bytes else {
+            return;
+        };
+        let Some(mut src) = Pixmap::new(w, h) else {
+            return;
+        };
+        // Canvas pixmaps in our toy are already premultiplied
+        // (tiny_skia writes them that way). Copy straight over.
+        src.data_mut().copy_from_slice(&data);
+        let scale_x = dest.width / w as f32;
+        let scale_y = dest.height / h as f32;
+        let transform = Transform::from_translate(dest.x + ctx.tx, dest.y + ctx.ty)
+            .pre_scale(scale_x, scale_y);
+        let mut paint = PixmapPaint::default();
+        paint.opacity = ctx.alpha;
+        self.pixmap
+            .draw_pixmap(0, 0, src.as_ref(), &paint, transform, None);
     }
 
     fn paint_image(&mut self, dest: Rect, info: &ImageInfo, ctx: PaintCtx) {

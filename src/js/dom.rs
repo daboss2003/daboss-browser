@@ -219,6 +219,16 @@ pub(crate) fn make_element_handle(ctx: &mut Context, id: NodeId) -> JsObject {
         2,
     );
     init.function(
+        NativeFunction::from_fn_ptr(element_get_bounding_client_rect),
+        js_string!("getBoundingClientRect"),
+        0,
+    );
+    init.function(
+        NativeFunction::from_fn_ptr(element_get_context),
+        js_string!("getContext"),
+        1,
+    );
+    init.function(
         NativeFunction::from_fn_ptr(element_append_child),
         js_string!("appendChild"),
         1,
@@ -526,6 +536,11 @@ fn element_set_text_content(this: &JsValue, args: &[JsValue], ctx: &mut Context)
     };
     let s = val.to_string(ctx)?.to_std_string_escaped();
     with_dom_mut(|dom| dom.set_text_content(id, s));
+    super::observers::push_mutation_record(super::observers::MutationRecord {
+        kind: super::observers::MutationKind::CharacterData,
+        target: id,
+        attribute_name: None,
+    });
     Ok(JsValue::undefined())
 }
 
@@ -569,6 +584,11 @@ fn element_set_attribute(this: &JsValue, args: &[JsValue], ctx: &mut Context) ->
     let name = name_val.to_string(ctx)?.to_std_string_escaped();
     let value = val_val.to_string(ctx)?.to_std_string_escaped();
     with_dom_mut(|dom| dom.set_attribute(id, &name, value));
+    super::observers::push_mutation_record(super::observers::MutationRecord {
+        kind: super::observers::MutationKind::Attributes,
+        target: id,
+        attribute_name: Some(name),
+    });
     Ok(JsValue::undefined())
 }
 
@@ -581,6 +601,11 @@ fn element_remove_attribute(this: &JsValue, args: &[JsValue], ctx: &mut Context)
     };
     let name = name_val.to_string(ctx)?.to_std_string_escaped();
     with_dom_mut(|dom| dom.remove_attribute(id, &name));
+    super::observers::push_mutation_record(super::observers::MutationRecord {
+        kind: super::observers::MutationKind::Attributes,
+        target: id,
+        attribute_name: Some(name),
+    });
     Ok(JsValue::undefined())
 }
 
@@ -772,6 +797,11 @@ fn element_append_child(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
     if !ok {
         return Ok(JsValue::null());
     }
+    super::observers::push_mutation_record(super::observers::MutationRecord {
+        kind: super::observers::MutationKind::ChildList,
+        target: parent,
+        attribute_name: None,
+    });
     Ok(child_val.clone())
 }
 
@@ -789,6 +819,11 @@ fn element_remove_child(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
         if dom.node(child).parent == Some(parent) {
             dom.detach(child);
         }
+    });
+    super::observers::push_mutation_record(super::observers::MutationRecord {
+        kind: super::observers::MutationKind::ChildList,
+        target: parent,
+        attribute_name: None,
     });
     Ok(child_val.clone())
 }
@@ -1609,6 +1644,90 @@ fn data_attr_to_camel(s: &str) -> String {
 }
 
 // ---------- helpers ----------
+
+fn element_get_bounding_client_rect(
+    this: &JsValue,
+    _: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(id) = read_self_node_id(this, ctx) else {
+        return Ok(empty_rect(ctx));
+    };
+    let rect = super::engine::JS_BOUNDING_RECTS.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|rc| rc.borrow().get(&id).copied())
+    });
+    let [x, y, w, h] = rect.unwrap_or([0.0, 0.0, 0.0, 0.0]);
+    let f = |v: f32| JsValue::from(v as f64);
+    let obj = ObjectInitializer::new(ctx)
+        .property(js_string!("x"), f(x), Attribute::READONLY)
+        .property(js_string!("y"), f(y), Attribute::READONLY)
+        .property(js_string!("width"), f(w), Attribute::READONLY)
+        .property(js_string!("height"), f(h), Attribute::READONLY)
+        .property(js_string!("left"), f(x), Attribute::READONLY)
+        .property(js_string!("top"), f(y), Attribute::READONLY)
+        .property(js_string!("right"), f(x + w), Attribute::READONLY)
+        .property(js_string!("bottom"), f(y + h), Attribute::READONLY)
+        .build();
+    Ok(JsValue::from(obj))
+}
+
+fn element_get_context(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(id) = read_self_node_id(this, ctx) else {
+        return Ok(JsValue::null());
+    };
+    let ty = args
+        .first()
+        .map(|v| v.to_string(ctx).map(|s| s.to_std_string_escaped()))
+        .transpose()?
+        .unwrap_or_default();
+    if ty != "2d" {
+        return Ok(JsValue::null());
+    }
+
+    let (is_canvas, width, height) = with_dom(|dom| {
+        if let NodeKind::Element { tag, attrs } = &dom.node(id).kind {
+            if tag != "canvas" {
+                return (false, 0_u32, 0_u32);
+            }
+            let w = attrs
+                .iter()
+                .find(|(k, _)| k == "width")
+                .and_then(|(_, v)| v.parse::<u32>().ok())
+                .unwrap_or(300);
+            let h = attrs
+                .iter()
+                .find(|(k, _)| k == "height")
+                .and_then(|(_, v)| v.parse::<u32>().ok())
+                .unwrap_or(150);
+            (true, w, h)
+        } else {
+            (false, 0, 0)
+        }
+    })
+    .unwrap_or((false, 0, 0));
+    if !is_canvas {
+        return Ok(JsValue::null());
+    }
+    Ok(super::canvas::get_or_create_context(ctx, id, width, height))
+}
+
+fn empty_rect(ctx: &mut Context) -> JsValue {
+    let zero = JsValue::from(0.0_f64);
+    JsValue::from(
+        ObjectInitializer::new(ctx)
+            .property(js_string!("x"), zero.clone(), Attribute::READONLY)
+            .property(js_string!("y"), zero.clone(), Attribute::READONLY)
+            .property(js_string!("width"), zero.clone(), Attribute::READONLY)
+            .property(js_string!("height"), zero.clone(), Attribute::READONLY)
+            .property(js_string!("left"), zero.clone(), Attribute::READONLY)
+            .property(js_string!("top"), zero.clone(), Attribute::READONLY)
+            .property(js_string!("right"), zero.clone(), Attribute::READONLY)
+            .property(js_string!("bottom"), zero, Attribute::READONLY)
+            .build(),
+    )
+}
 
 // ---------- document.cookie ----------
 

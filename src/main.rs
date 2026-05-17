@@ -3,12 +3,14 @@
 mod audio;
 mod css;
 mod dom;
+mod gpu;
 mod html;
 mod js;
 mod layout;
 mod net;
 mod paint;
 mod video;
+mod webrtc;
 
 use std::num::NonZeroU32;
 use std::process::ExitCode;
@@ -17,7 +19,6 @@ use std::rc::Rc;
 use cosmic_text::{
     Attrs, Buffer, Color as CtColor, Family, FontSystem, Metrics, Shaping, SwashCache, Wrap,
 };
-use softbuffer::{Context, Surface};
 use tiny_skia::Pixmap;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -226,8 +227,14 @@ struct Browser {
     /// + port). No on-disk persistence yet.
     local_storage: Rc<std::cell::RefCell<std::collections::HashMap<String, js::StorageArea>>>,
 
-    window: Option<Rc<Window>>,
-    surface: Option<Surface<Rc<Window>, Rc<Window>>>,
+    window: Option<std::sync::Arc<Window>>,
+    /// GPU surface + presenter. None until winit's `resumed` event
+    /// gives us a window we can build a wgpu surface against.
+    surface: Option<gpu::GpuPresenter>,
+    /// CPU-side framebuffer the rest of the rendering pipeline writes
+    /// into. We swap this for whatever the wgpu presenter wants on
+    /// each frame.
+    framebuf: Vec<u32>,
     viewport_size: (u32, u32),
     scroll_y: f32,
     cursor: (f32, f32),
@@ -271,6 +278,7 @@ impl Browser {
             )),
             window: None,
             surface: None,
+            framebuf: Vec::new(),
             viewport_size: (1024, 768),
             scroll_y: 0.0,
             cursor: (0.0, 0.0),
@@ -1165,16 +1173,15 @@ impl Browser {
         else {
             return;
         };
-        surface.resize(w, h).expect("surface resize");
-        let mut buffer = surface.buffer_mut().expect("buffer");
 
         let vw = w.get() as usize;
         let vh = h.get() as usize;
+        let needed = vw.saturating_mul(vh);
+        self.framebuf.clear();
+        self.framebuf.resize(needed, 0x00FF_FFFF);
+        let buffer = &mut self.framebuf[..];
 
-        // White page fill.
-        for px in buffer.iter_mut() {
-            *px = 0x00FF_FFFF;
-        }
+        // (white page fill already applied during the `resize` above)
 
         // Blit the page pixmap *below* the chrome strip.
         if let Some(page) = &self.page {
@@ -1207,7 +1214,7 @@ impl Browser {
         // Sticky positioning — re-blit pixmap regions of sticky elements
         // when scrolled past their threshold.
         if let Some(page) = &self.page {
-            paint_sticky_overlays(&mut buffer, vw as u32, vh as u32, page, self.scroll_y);
+            paint_sticky_overlays(buffer, vw as u32, vh as u32, page, self.scroll_y);
         }
 
         // Input overlays — typed values painted on top of the page pixmap.
@@ -1215,7 +1222,7 @@ impl Browser {
             paint_input_overlays(
                 &mut self.chrome_font_system,
                 &mut self.chrome_swash,
-                &mut buffer,
+                buffer,
                 vw as u32,
                 vh as u32,
                 page,
@@ -1228,13 +1235,25 @@ impl Browser {
         paint_chrome(
             &mut self.chrome_font_system,
             &mut self.chrome_swash,
-            &mut buffer,
+            buffer,
             vw as u32,
             vh as u32,
             &self.chrome,
         );
 
-        buffer.present().expect("present");
+        // Repack u32 ARGB → BGRA bytes for the GPU upload. wgpu's
+        // `Bgra8UnormSrgb` matches a little-endian read of our u32s,
+        // but we treat it as bytes here for clarity.
+        let pixels_u8: Vec<u8> = buffer
+            .iter()
+            .flat_map(|p| {
+                let b = (*p & 0xFF) as u8;
+                let g = ((*p >> 8) & 0xFF) as u8;
+                let r = ((*p >> 16) & 0xFF) as u8;
+                [b, g, r, 0xFF]
+            })
+            .collect();
+        surface.present(&pixels_u8, vw as u32, vh as u32);
     }
 }
 
@@ -2228,9 +2247,9 @@ impl ApplicationHandler for Browser {
         let attrs = Window::default_attributes()
             .with_title("DaBoss")
             .with_inner_size(LogicalSize::new(1024.0, 768.0));
-        let window = Rc::new(event_loop.create_window(attrs).expect("create window"));
-        let context = Context::new(window.clone()).expect("softbuffer context");
-        let surface = Surface::new(&context, window.clone()).expect("softbuffer surface");
+        let window = std::sync::Arc::new(event_loop.create_window(attrs).expect("create window"));
+        let surface = gpu::GpuPresenter::new(window.clone())
+            .expect("could not init GPU presenter");
         let size = window.inner_size();
         self.viewport_size = (size.width.max(1), size.height.max(1));
         self.window = Some(window);

@@ -218,6 +218,13 @@ pub struct JsEngine {
     /// Video elements keyed by NodeId. Each owns its own ffmpeg
     /// subprocess for decoding.
     video_elements: super::VideoElements,
+    /// RTCPeerConnection registry — one slot per JS-constructed
+    /// instance. Backed by `webrtc-rs` for the protocol stack.
+    rtc_registry: super::rtc::RtcRegistry,
+    /// Shared tokio runtime for async crates (h2 currently uses
+    /// per-request runtimes; webrtc-rs uses this one for the lifetime
+    /// of the engine).
+    rtc_runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
 }
 
 /// Outcome of an event dispatch — informs the caller whether to skip the
@@ -332,6 +339,7 @@ impl JsEngine {
         super::xhr::install(&mut ctx);
         super::web_classes::install(&mut ctx);
         super::observers::install(&mut ctx);
+        super::rtc::install(&mut ctx);
 
         let listeners: Rc<RefCell<ListenerMap>> = Rc::new(RefCell::new(HashMap::new()));
         let timers: Rc<RefCell<TimerState>> = Rc::new(RefCell::new(TimerState::default()));
@@ -364,6 +372,8 @@ impl JsEngine {
             Rc::new(RefCell::new(std::collections::HashMap::new()));
         let video_elements: super::VideoElements =
             Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let rtc_registry: super::rtc::RtcRegistry = Rc::new(RefCell::new(Vec::new()));
+        let rtc_runtime = crate::webrtc::build_runtime();
         let mut engine = JsEngine {
             ctx,
             listeners,
@@ -383,6 +393,8 @@ impl JsEngine {
             computed_styles,
             audio_elements,
             video_elements,
+            rtc_registry,
+            rtc_runtime,
         };
         if allow_inline_scripts {
             engine.run_initial_scripts(dom);
@@ -538,6 +550,7 @@ impl JsEngine {
         // Drain microtasks queued by the timer bodies.
         self.ctx.run_jobs();
         super::observers::drain_mutation_records(&mut self.ctx);
+        super::rtc::drain_rtc_events(&mut self.ctx);
         self.ctx.run_jobs();
 
         let post_count = dom_rc.borrow().node_count();
@@ -579,6 +592,7 @@ impl JsEngine {
         // bodies after `await`, etc. all run before we hand control back.
         self.ctx.run_jobs();
         super::observers::drain_mutation_records(&mut self.ctx);
+        super::rtc::drain_rtc_events(&mut self.ctx);
         self.ctx.run_jobs();
         self.uninstall_thread_locals(dom, rc, listeners_rc);
     }
@@ -668,6 +682,7 @@ impl JsEngine {
         // we return to the browser.
         self.ctx.run_jobs();
         super::observers::drain_mutation_records(&mut self.ctx);
+        super::rtc::drain_rtc_events(&mut self.ctx);
         self.ctx.run_jobs();
 
         let flags = EVENT_FLAGS.with(|f| *f.borrow());
@@ -745,6 +760,12 @@ impl JsEngine {
         JS_VIDEO_ELEMENTS.with(|slot| {
             *slot.borrow_mut() = Some(self.video_elements.clone());
         });
+        super::rtc::JS_RTC_REGISTRY.with(|slot| {
+            *slot.borrow_mut() = Some(self.rtc_registry.clone());
+        });
+        super::rtc::JS_RTC_RUNTIME.with(|slot| {
+            *slot.borrow_mut() = self.rtc_runtime.clone();
+        });
         (dom_rc, listeners_rc)
     }
 
@@ -773,6 +794,12 @@ impl JsEngine {
             slot.borrow_mut().take();
         });
         JS_VIDEO_ELEMENTS.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        super::rtc::JS_RTC_REGISTRY.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        super::rtc::JS_RTC_RUNTIME.with(|slot| {
             slot.borrow_mut().take();
         });
         JS_NAV_REQUESTS.with(|slot| {
@@ -2492,6 +2519,48 @@ mod tests {
                 attrs.iter().find(|(k, _)| k == "data-saw").map(|(_, v)| v.as_str()),
                 Some("true")
             );
+        }
+    }
+
+    #[test]
+    fn rtc_peer_connection_constructor_returns_an_object() {
+        // The constructor needs a tokio runtime to build the inner
+        // webrtc-rs PeerConnection. With one installed, `new
+        // RTCPeerConnection()` should produce a handle with the
+        // expected methods.
+        let src = r#"
+            try {
+                var pc = new RTCPeerConnection();
+                var el = document.getElementById('hi');
+                el.setAttribute('data-type', typeof pc);
+                el.setAttribute('data-has-create-offer',
+                    typeof pc.createOffer === 'function' ? 'yes' : 'no');
+                el.setAttribute('data-has-add-ice',
+                    typeof pc.addIceCandidate === 'function' ? 'yes' : 'no');
+                var dc = pc.createDataChannel('chat');
+                el.setAttribute('data-dc-label', dc ? dc.label : 'null');
+            } catch (e) {
+                document.getElementById('hi').setAttribute('data-error', String(e));
+            }
+        "#;
+        let mut dom = html::parse(&format!(
+            "<html><body><div id='hi'>x</div><script>{src}</script></body></html>"
+        ));
+        let mut _engine = JsEngine::new(&mut dom);
+        let id = find_for_test_by_id(&dom, "hi").unwrap();
+        if let NodeKind::Element { attrs, .. } = &dom.node(id).kind {
+            let get = |k: &str| {
+                attrs
+                    .iter()
+                    .find(|(n, _)| n == k)
+                    .map(|(_, v)| v.as_str())
+            };
+            // If anything threw, the test makes that visible.
+            assert!(get("data-error").is_none(), "RTC threw: {:?}", get("data-error"));
+            assert_eq!(get("data-type"), Some("object"));
+            assert_eq!(get("data-has-create-offer"), Some("yes"));
+            assert_eq!(get("data-has-add-ice"), Some("yes"));
+            assert_eq!(get("data-dc-label"), Some("chat"));
         }
     }
 

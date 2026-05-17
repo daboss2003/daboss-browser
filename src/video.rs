@@ -43,7 +43,9 @@ pub struct VideoElement {
     /// Process handle so we can kill ffmpeg on drop.
     child: Arc<Mutex<Option<Child>>>,
     _decoder_thread: JoinHandle<()>,
+    #[allow(dead_code)] // exposed for the upcoming `videoWidth` JS prop
     pub intrinsic_width: u32,
+    #[allow(dead_code)] // exposed for the upcoming `videoHeight` JS prop
     pub intrinsic_height: u32,
 }
 

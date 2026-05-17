@@ -44,10 +44,12 @@ use crate::dom::{Dom, NodeId, NodeKind};
 pub(crate) mod canvas;
 pub(crate) mod dom;
 pub mod engine;
+pub(crate) mod idb;
 pub(crate) mod observers;
 pub(crate) mod rtc;
 pub(crate) mod storage;
 pub(crate) mod web_classes;
+pub(crate) mod websocket;
 pub(crate) mod xhr;
 
 pub use canvas::CanvasSurfaces;

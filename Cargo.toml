@@ -43,6 +43,7 @@ bytes = "1"
 wgpu = { version = "22", features = ["wgsl"] }
 pollster = "0.3"
 webrtc = "0.13"
+tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "handshake"] }
 
 [profile.release]
 lto = "thin"

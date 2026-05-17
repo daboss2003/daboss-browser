@@ -11,6 +11,7 @@ mod net;
 mod paint;
 mod video;
 mod webrtc;
+mod ws;
 
 use std::num::NonZeroU32;
 use std::process::ExitCode;
@@ -33,7 +34,12 @@ const MAX_IFRAMES: usize = 5;
 const PAINT_HEIGHT_CEILING: u32 = 65_535;
 /// Height (px) of the browser chrome strip at the top of the window —
 /// holds the URL bar.
-const CHROME_HEIGHT: u32 = 36;
+const CHROME_HEIGHT: u32 = 64;
+const TAB_STRIP_HEIGHT: u32 = 28;
+const URL_BAR_HEIGHT: u32 = CHROME_HEIGHT - TAB_STRIP_HEIGHT;
+const TAB_WIDTH: u32 = 180;
+const TAB_CLOSE_RADIUS: f32 = 7.0;
+const NEW_TAB_BUTTON_WIDTH: u32 = 32;
 
 /// Maximum number of preserved Pages in the back-forward cache.
 const BFCACHE_CAP: usize = 5;
@@ -163,6 +169,18 @@ fn run_browser(initial_url: Option<String>) {
     event_loop.run_app(&mut browser).expect("event loop");
 }
 
+/// One in-flight CSS transition. Only `opacity` is honoured today —
+/// adding more interpolated properties is each its own follow-up.
+struct RunningAnim {
+    node: dom::NodeId,
+    property: String,
+    from: f32,
+    to: f32,
+    start: std::time::Instant,
+    duration: std::time::Duration,
+    timing: css::TimingFunction,
+}
+
 struct Page {
     url: url::Url,
     dom: dom::Dom,
@@ -193,6 +211,12 @@ struct Page {
     /// addEventListener registry, so click handlers registered by inline
     /// scripts can fire on subsequent user input.
     js: js::JsEngine,
+    /// Currently animating properties. Browser advances these on each
+    /// rAF tick and writes interpolated values back into `styles`.
+    anims: Vec<RunningAnim>,
+    /// Last cascaded opacity per element. After each cascade we compare
+    /// to detect properties that should start transitioning.
+    prev_opacity: std::collections::HashMap<dom::NodeId, f32>,
 }
 
 /// A nested document loaded inside an `<iframe>`. We render it like a real
@@ -214,6 +238,53 @@ struct Chrome {
     /// Text currently in the URL bar (editable when focused).
     text: String,
     focused: bool,
+}
+
+/// Find-in-page state: query string + cached matches + cursor.
+struct FindState {
+    query: String,
+    /// IDs of element nodes whose text content contains the query.
+    matches: Vec<dom::NodeId>,
+    /// Index into `matches` of the currently-highlighted hit.
+    current: usize,
+}
+
+impl FindState {
+    fn new() -> Self {
+        Self {
+            query: String::new(),
+            matches: Vec::new(),
+            current: 0,
+        }
+    }
+}
+
+/// Snapshot of a tab while it isn't focused. When the user switches
+/// to this tab, the Browser swaps its current active state into the
+/// vacated `InactiveTab` slot and pulls these fields back onto the
+/// live `Browser` ones.
+struct InactiveTab {
+    page: Option<Page>,
+    history: Vec<url::Url>,
+    history_cursor: Option<usize>,
+    scroll_y: f32,
+    url_bar: String,
+    /// `Some(url)` when this tab hasn't navigated yet (new tab; load
+    /// pending) — drives the first paint after the tab is focused.
+    pending_url: Option<String>,
+}
+
+impl Default for InactiveTab {
+    fn default() -> Self {
+        Self {
+            page: None,
+            history: Vec::new(),
+            history_cursor: None,
+            scroll_y: 0.0,
+            url_bar: String::new(),
+            pending_url: None,
+        }
+    }
 }
 
 struct Browser {
@@ -259,6 +330,19 @@ struct Browser {
     /// `None` means we're at the live tip (no back-navigation active).
     history_cursor: Option<usize>,
 
+    /// Inactive tabs. The active tab's state lives directly on the
+    /// fields above (`page` / `history` / `history_cursor` /
+    /// `scroll_y` / `chrome.text`); switching tabs swaps state into /
+    /// out of this list.
+    tabs: Vec<InactiveTab>,
+    /// Index of the active tab. The active tab itself has no entry in
+    /// `tabs` — its state IS the live Browser state.
+    active_tab: usize,
+
+    /// Find-in-page state. `Some` while the find bar is visible /
+    /// active.
+    find: Option<FindState>,
+
     /// Back-forward cache. Each entry preserves a fully-rendered Page
     /// keyed by URL so Back / Forward can restore without refetching
     /// (no network round-trip, no JS re-execution, scroll position
@@ -292,6 +376,9 @@ impl Browser {
             page: None,
             history: Vec::new(),
             history_cursor: None,
+            tabs: Vec::new(),
+            active_tab: 0,
+            find: None,
             bfcache: Vec::new(),
         }
     }
@@ -529,11 +616,14 @@ impl Browser {
             audio: audio_map,
             video: video_map,
             js: js_engine,
+            anims: Vec::new(),
+            prev_opacity: std::collections::HashMap::new(),
         });
         self.scroll_y = 0.0;
 
         self.refresh_js_bounding_rects();
         self.refresh_js_computed_styles();
+        self.start_css_transitions();
         self.prefetch_audio_elements();
         self.prefetch_video_elements();
 
@@ -586,6 +676,142 @@ impl Browser {
         };
         if r2.mutated {
             self.recascade_and_paint();
+        }
+    }
+
+    /// Total number of tabs (active + inactive).
+    fn tab_count(&self) -> usize {
+        self.tabs.len() + 1
+    }
+
+    /// Pull the active tab's snapshot fields out into a new
+    /// `InactiveTab` and zero out the live ones. The caller is
+    /// responsible for placing the snapshot somewhere.
+    fn snapshot_active_tab(&mut self) -> InactiveTab {
+        InactiveTab {
+            page: self.page.take(),
+            history: std::mem::take(&mut self.history),
+            history_cursor: self.history_cursor.take(),
+            scroll_y: self.scroll_y,
+            url_bar: std::mem::take(&mut self.chrome.text),
+            pending_url: None,
+        }
+    }
+
+    /// Replace the live state with the contents of an `InactiveTab`.
+    /// Doesn't touch `tabs` / `active_tab`.
+    fn restore_into_active(&mut self, tab: InactiveTab) {
+        self.page = tab.page;
+        self.history = tab.history;
+        self.history_cursor = tab.history_cursor;
+        self.scroll_y = tab.scroll_y;
+        self.chrome.text = tab.url_bar;
+        if let Some(url) = tab.pending_url {
+            self.navigate(&url, true);
+        }
+    }
+
+    /// Switch to the tab at `index` (relative to all tabs, with the
+    /// active tab counted at its `active_tab` position). No-op if
+    /// already focused there or out of range.
+    fn switch_to_tab(&mut self, index: usize) {
+        if index >= self.tab_count() {
+            return;
+        }
+        if index == self.active_tab {
+            return;
+        }
+        // Materialise the inactive list with the current active tab
+        // inserted at `active_tab`. Cheaper to operate on directly:
+        // pull the target out, push the current active in its place.
+        // Because `tabs` is "all non-active tabs in display order",
+        // its indexing relative to `active_tab` is:
+        //   display index < active_tab: tabs[display index]
+        //   display index = active_tab: live (Browser fields)
+        //   display index > active_tab: tabs[display index - 1]
+        let active_pos = self.active_tab;
+        let snapshot = self.snapshot_active_tab();
+        if index < active_pos {
+            // Pull tabs[index]; insert snapshot so the active slot
+            // now lives where the live state used to be.
+            let next = std::mem::take(&mut self.tabs[index]);
+            self.tabs[index] = snapshot;
+            self.restore_into_active(next);
+            // active_tab now reflects the new display index.
+            self.active_tab = index;
+        } else {
+            // index > active_pos: tabs[index - 1] is the target.
+            let tabs_idx = index - 1;
+            let next = std::mem::take(&mut self.tabs[tabs_idx]);
+            self.tabs[tabs_idx] = snapshot;
+            self.restore_into_active(next);
+            self.active_tab = index;
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Open a new tab and switch to it. The new tab is empty until
+    /// the user navigates.
+    fn open_new_tab(&mut self) {
+        let active_pos = self.active_tab;
+        let snapshot = self.snapshot_active_tab();
+        // Insert the snapshot at the current active position.
+        self.tabs.insert(active_pos, snapshot);
+        // Start the new tab with a blank slate. `active_tab` is now
+        // one past the old position (display order: ..., snapshot,
+        // [new live]).
+        self.active_tab = active_pos + 1;
+        self.chrome.text = String::new();
+        self.scroll_y = 0.0;
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Close the tab at the given display index. If it's the active
+    /// tab, switches to the previous one. If it's the last tab,
+    /// closes the window (sets a pending exit flag the event loop
+    /// honours).
+    fn close_tab(&mut self, index: usize) {
+        if self.tab_count() <= 1 {
+            // Last tab — closing it should bring up an empty live
+            // state rather than killing the window unsolicited.
+            self.page = None;
+            self.history.clear();
+            self.history_cursor = None;
+            self.scroll_y = 0.0;
+            self.chrome.text.clear();
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+            return;
+        }
+        if index == self.active_tab {
+            // Close the active tab: pop the previous one (or next if
+            // none earlier) into the live slot.
+            let take_idx = if self.active_tab > 0 {
+                self.active_tab - 1
+            } else {
+                // active_tab was 0; tabs[0] is now the display tab
+                // at position 1.
+                0
+            };
+            let restored = std::mem::take(&mut self.tabs[take_idx]);
+            self.tabs.remove(take_idx);
+            self.restore_into_active(restored);
+            if take_idx < self.active_tab {
+                self.active_tab -= 1;
+            }
+        } else if index < self.active_tab {
+            self.tabs.remove(index);
+            self.active_tab -= 1;
+        } else {
+            self.tabs.remove(index - 1);
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
         }
     }
 
@@ -712,6 +938,36 @@ impl Browser {
     }
 
     fn click_at(&mut self, x: f32, y: f32) {
+        // Tab strip clicks: select-or-close on existing tabs, "+"
+        // button opens a new tab.
+        if y < TAB_STRIP_HEIGHT as f32 {
+            let total = self.tab_count();
+            let click_tab_idx = (x as u32 / TAB_WIDTH) as usize;
+            if click_tab_idx < total {
+                // Check if click landed on the close-button circle.
+                let tab_origin_x = (click_tab_idx as u32) * TAB_WIDTH;
+                let close_cx = (tab_origin_x + TAB_WIDTH - 14) as f32;
+                let close_cy = (TAB_STRIP_HEIGHT / 2) as f32;
+                let dx = x - close_cx;
+                let dy = y - close_cy;
+                if dx * dx + dy * dy <= TAB_CLOSE_RADIUS * TAB_CLOSE_RADIUS {
+                    self.close_tab(click_tab_idx);
+                } else {
+                    self.switch_to_tab(click_tab_idx);
+                }
+            } else {
+                let plus_x = (total as u32) * TAB_WIDTH;
+                if x >= plus_x as f32 && x < (plus_x + NEW_TAB_BUTTON_WIDTH) as f32 {
+                    self.open_new_tab();
+                    self.chrome.focused = true;
+                }
+            }
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+            return;
+        }
+        // URL bar clicks: focus it (Cmd+L style).
         if y < CHROME_HEIGHT as f32 {
             self.chrome.focused = true;
             if let Some(w) = &self.window {
@@ -919,6 +1175,14 @@ impl Browser {
         page.js.refresh_bounding_rects(entries);
         let style_snaps = computed_style_snapshots(&page.dom, &page.styles);
         page.js.refresh_computed_styles(style_snaps);
+        self.start_css_transitions();
+        // Re-apply currently running animation values so transitions
+        // mid-flight survive a recascade caused by interaction state
+        // changes.
+        self.tick_css_animations();
+        let Some(page) = self.page.as_mut() else {
+            return;
+        };
         let max_bottom = page.pixmap.height();
         paint::PAINT_CANVAS_SURFACES.with(|slot| {
             *slot.borrow_mut() = Some(page.js.canvas_surfaces());
@@ -966,6 +1230,38 @@ impl Browser {
                     }
                     return;
                 }
+                Key::Character("t") | Key::Character("T") => {
+                    self.open_new_tab();
+                    self.chrome.focused = true;
+                    return;
+                }
+                Key::Character("f") | Key::Character("F") => {
+                    if self.find.is_none() {
+                        self.find = Some(FindState::new());
+                    } else {
+                        self.find = None;
+                    }
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    return;
+                }
+                Key::Character("w") | Key::Character("W") => {
+                    let idx = self.active_tab;
+                    self.close_tab(idx);
+                    return;
+                }
+                Key::Named(NamedKey::Tab) => {
+                    // Cmd+Tab style cycle through tabs (Cmd+Tab is OS-
+                    // reserved; using it inside the app is unusual but
+                    // gives us a keyboard tab switcher.)
+                    let count = self.tab_count();
+                    if count > 1 {
+                        let next = (self.active_tab + 1) % count;
+                        self.switch_to_tab(next);
+                    }
+                    return;
+                }
                 Key::Named(NamedKey::ArrowLeft) => {
                     self.history_back();
                     return;
@@ -978,6 +1274,10 @@ impl Browser {
             }
         }
 
+        if self.find.is_some() {
+            self.handle_find_key(logical_key, text);
+            return;
+        }
         if self.chrome.focused {
             self.handle_chrome_key(logical_key, text);
             return;
@@ -1001,6 +1301,70 @@ impl Browser {
             self.handle_input_key(logical_key, text);
         } else {
             self.handle_page_key(logical_key);
+        }
+    }
+
+    fn handle_find_key(&mut self, key: Key, text: Option<winit::keyboard::SmolStr>) {
+        let close = matches!(key.as_ref(), Key::Named(NamedKey::Escape));
+        if close {
+            self.find = None;
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+            return;
+        }
+        let Some(find) = self.find.as_mut() else {
+            return;
+        };
+        match key.as_ref() {
+            Key::Named(NamedKey::Backspace) => {
+                find.query.pop();
+            }
+            Key::Named(NamedKey::Enter) => {
+                if !find.matches.is_empty() {
+                    find.current = (find.current + 1) % find.matches.len();
+                }
+            }
+            _ => {
+                if let Some(s) = text {
+                    let s: &str = s.as_ref();
+                    if !s.is_empty() && !s.chars().any(|c| c.is_control()) {
+                        find.query.push_str(s);
+                    }
+                }
+            }
+        }
+        // Recompute matches on every keystroke.
+        self.recompute_find_matches();
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    fn recompute_find_matches(&mut self) {
+        let Some(find) = self.find.as_mut() else {
+            return;
+        };
+        find.matches.clear();
+        find.current = 0;
+        if find.query.is_empty() {
+            return;
+        }
+        let needle = find.query.to_lowercase();
+        let Some(page) = self.page.as_ref() else {
+            return;
+        };
+        let mut stack: Vec<dom::NodeId> = vec![page.dom.document()];
+        while let Some(n) = stack.pop() {
+            if matches!(page.dom.node(n).kind, dom::NodeKind::Element { .. }) {
+                let mut hay = String::new();
+                collect_immediate_text(&page.dom, n, &mut hay);
+                if hay.to_lowercase().contains(&needle) {
+                    find.matches.push(n);
+                }
+            }
+            let kids: Vec<dom::NodeId> = page.dom.children(n).collect();
+            stack.extend(kids);
         }
     }
 
@@ -1231,7 +1595,31 @@ impl Browser {
             );
         }
 
-        // Chrome strip on top.
+        // Find-in-page match highlights — paint yellow rects under
+        // the matched elements before the chrome strips overlay them.
+        if let (Some(find), Some(page)) = (self.find.as_ref(), self.page.as_ref()) {
+            paint_find_highlights(
+                buffer,
+                vw as u32,
+                vh as u32,
+                page,
+                self.scroll_y,
+                CHROME_HEIGHT,
+                find,
+            );
+        }
+
+        // Tab strip + URL bar.
+        paint_tab_strip(
+            &mut self.chrome_font_system,
+            &mut self.chrome_swash,
+            buffer,
+            vw as u32,
+            self.active_tab,
+            &self.tabs,
+            &self.chrome.text,
+            self.page.as_ref().map(|p| &p.url),
+        );
         paint_chrome(
             &mut self.chrome_font_system,
             &mut self.chrome_swash,
@@ -1240,6 +1628,18 @@ impl Browser {
             vh as u32,
             &self.chrome,
         );
+
+        // Find bar overlay (above the URL bar's bottom border, below
+        // any tab strip border).
+        if let Some(find) = self.find.as_ref() {
+            paint_find_bar(
+                &mut self.chrome_font_system,
+                &mut self.chrome_swash,
+                buffer,
+                vw as u32,
+                find,
+            );
+        }
 
         // Repack u32 ARGB → BGRA bytes for the GPU upload. wgpu's
         // `Bgra8UnormSrgb` matches a little-endian read of our u32s,
@@ -1267,6 +1667,26 @@ fn chain_of(dom: &dom::Dom, node: Option<dom::NodeId>) -> Vec<dom::NodeId> {
         cur = dom.node(n).parent;
     }
     out
+}
+
+/// Apply a CSS timing function to linear progress in [0, 1].
+fn ease(t: f32, kind: css::TimingFunction) -> f32 {
+    match kind {
+        css::TimingFunction::Linear => t,
+        css::TimingFunction::EaseIn => t * t,
+        css::TimingFunction::EaseOut => 1.0 - (1.0 - t).powi(2),
+        css::TimingFunction::EaseInOut => {
+            if t < 0.5 {
+                2.0 * t * t
+            } else {
+                1.0 - (-2.0 * t + 2.0).powi(2) / 2.0
+            }
+        }
+        css::TimingFunction::Ease => {
+            // Approximation of the `ease` cubic-bezier.
+            1.0 - (1.0 - t).powi(3)
+        }
+    }
 }
 
 /// Map a winit `Key` (plus any `text` payload for character keys) to a
@@ -1474,6 +1894,17 @@ fn position_to_css(p: &css::Position) -> String {
         css::Position::Sticky => "sticky",
     }
     .to_string()
+}
+
+/// Concatenate the immediate text-node children of `node` (no
+/// descent into element children). Used by find-in-page to test the
+/// shallowest text content for a match.
+fn collect_immediate_text(dom: &dom::Dom, node: dom::NodeId, out: &mut String) {
+    for c in dom.children(node).collect::<Vec<_>>() {
+        if let dom::NodeKind::Text(t) = &dom.node(c).kind {
+            out.push_str(t);
+        }
+    }
 }
 
 /// First element child of `parent` (skipping text/comments). Used by
@@ -2150,15 +2581,16 @@ fn paint_chrome(
     _height: u32,
     chrome: &Chrome,
 ) {
-    let bar_h = CHROME_HEIGHT.min(_height);
+    let y_off = TAB_STRIP_HEIGHT.min(_height);
+    let bar_h = (y_off + URL_BAR_HEIGHT).min(_height);
     let bg_color = if chrome.focused {
         0x00FFFFFF // white when editing
     } else {
         0x00ECEEF1 // soft gray otherwise
     };
     let border_color = 0x00C0C4CC;
-    // Background
-    for y in 0..bar_h.saturating_sub(1) {
+    // Background — URL bar strip below the tab strip.
+    for y in y_off..bar_h.saturating_sub(1) {
         let row = (y * width) as usize;
         for x in 0..width {
             buffer[row + x as usize] = bg_color;
@@ -2174,7 +2606,7 @@ fn paint_chrome(
 
     // Text rendering inside the bar.
     let pad_x: f32 = 10.0;
-    let baseline_y: f32 = 8.0;
+    let baseline_y: f32 = (y_off as f32) + 8.0;
     let display_text = if chrome.text.is_empty() {
         "about:blank"
     } else {
@@ -2229,13 +2661,337 @@ fn paint_chrome(
     // Caret if focused: a thin black bar just past the last glyph.
     if chrome.focused {
         let caret_x = (last_glyph_right + 2).max(pad_x as i32);
-        let caret_y0 = 6;
+        let caret_y0 = (y_off as i32) + 6;
         let caret_y1 = (bar_h as i32).saturating_sub(7);
         if caret_x >= 0 && caret_x < width as i32 {
             for y in caret_y0..caret_y1 {
                 let idx = (y * width as i32 + caret_x) as usize;
                 if let Some(p) = buffer.get_mut(idx) {
                     *p = 0x00000000;
+                }
+            }
+        }
+    }
+}
+
+/// Paint yellow translucent highlights under each find-in-page
+/// match's element box. The "current" match gets a darker outline.
+fn paint_find_highlights(
+    buffer: &mut [u32],
+    vw: u32,
+    vh: u32,
+    page: &Page,
+    scroll_y: f32,
+    top_offset: u32,
+    find: &FindState,
+) {
+    for (i, &node) in find.matches.iter().enumerate() {
+        let Some(b) = page.box_tree.get(node) else { continue };
+        let highlight_color = if i == find.current { 0x00FFC107 } else { 0x00FFEB80 };
+        let x0 = b.rect.x.max(0.0) as i32;
+        let y0 = (b.rect.y - scroll_y + top_offset as f32).max(top_offset as f32) as i32;
+        let x1 = (b.rect.x + b.rect.width).min(vw as f32) as i32;
+        let y1 = (b.rect.y + b.rect.height - scroll_y + top_offset as f32)
+            .min(vh as f32) as i32;
+        if x1 <= x0 || y1 <= y0 {
+            continue;
+        }
+        for y in y0..y1 {
+            let row = (y as usize) * vw as usize;
+            for x in x0..x1 {
+                let idx = row + x as usize;
+                if let Some(p) = buffer.get_mut(idx) {
+                    // 50% alpha blend with the highlight color.
+                    let dst = *p;
+                    let dr = (dst >> 16) & 0xFF;
+                    let dg = (dst >> 8) & 0xFF;
+                    let db = dst & 0xFF;
+                    let sr = (highlight_color >> 16) & 0xFF;
+                    let sg = (highlight_color >> 8) & 0xFF;
+                    let sb = highlight_color & 0xFF;
+                    let nr = (sr + dr) / 2;
+                    let ng = (sg + dg) / 2;
+                    let nb = (sb + db) / 2;
+                    *p = (nr << 16) | (ng << 8) | nb;
+                }
+            }
+        }
+    }
+}
+
+fn paint_find_bar(
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    buffer: &mut [u32],
+    width: u32,
+    find: &FindState,
+) {
+    let bar_h = 30u32;
+    let bar_y0 = CHROME_HEIGHT;
+    let bar_color = 0x00FFFCCC;
+    let border = 0x00C0C4CC;
+    for y in bar_y0..(bar_y0 + bar_h) {
+        let row = (y * width) as usize;
+        for x in 0..width {
+            buffer[row + x as usize] = bar_color;
+        }
+    }
+    let last_row = ((bar_y0 + bar_h - 1) * width) as usize;
+    for x in 0..width {
+        buffer[last_row + x as usize] = border;
+    }
+    let label = if find.query.is_empty() {
+        "Find: ".to_string()
+    } else {
+        format!(
+            "Find: {}   {} match{}",
+            find.query,
+            find.matches.len(),
+            if find.matches.len() == 1 { "" } else { "es" }
+        )
+    };
+    let metrics = Metrics::new(13.0, 18.0);
+    let mut tb = Buffer::new(font_system, metrics);
+    tb.set_size(font_system, Some(width as f32 - 20.0), None);
+    tb.set_wrap(font_system, Wrap::None);
+    let attrs = Attrs::new().family(Family::SansSerif);
+    tb.set_text(font_system, &label, attrs, Shaping::Advanced);
+    tb.shape_until_scroll(font_system, false);
+    let text_color = CtColor::rgb(35, 35, 40);
+    for run in tb.layout_runs() {
+        for glyph in run.glyphs.iter() {
+            let physical = glyph.physical((10.0, bar_y0 as f32 + 6.0 + run.line_y), 1.0);
+            let cache_key = physical.cache_key;
+            let glyph_x = physical.x;
+            let glyph_y = physical.y;
+            let pmap_w = width as i32;
+            let pmap_h_end = (bar_y0 + bar_h) as i32;
+            swash_cache.with_pixels(font_system, cache_key, text_color, |x_off, y_off, color| {
+                let px = glyph_x + x_off;
+                let py = glyph_y + y_off;
+                if px < 0 || py < bar_y0 as i32 || px >= pmap_w || py >= pmap_h_end {
+                    return;
+                }
+                let idx = py as usize * pmap_w as usize + px as usize;
+                let src_a = color.a();
+                if src_a == 0 {
+                    return;
+                }
+                let inv_a = 255u32 - src_a as u32;
+                let dst = buffer[idx];
+                let dr = (dst >> 16) & 0xFF;
+                let dg = (dst >> 8) & 0xFF;
+                let db = dst & 0xFF;
+                let sr = color.r() as u32 * src_a as u32 / 255;
+                let sg = color.g() as u32 * src_a as u32 / 255;
+                let sb = color.b() as u32 * src_a as u32 / 255;
+                let nr = sr + dr * inv_a / 255;
+                let ng = sg + dg * inv_a / 255;
+                let nb = sb + db * inv_a / 255;
+                buffer[idx] = (nr << 16) | (ng << 8) | nb;
+            });
+        }
+    }
+}
+
+/// Paint the tab strip at the top of the chrome. Inactive tabs from
+/// `tabs`, the active tab at `active_tab`. Returns the box rects
+/// (tab title rect, close-button center) for hit testing.
+#[allow(clippy::too_many_arguments)]
+fn paint_tab_strip(
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    buffer: &mut [u32],
+    width: u32,
+    active_tab: usize,
+    tabs: &[InactiveTab],
+    active_url_bar: &str,
+    active_page_url: Option<&url::Url>,
+) {
+    let strip_h = TAB_STRIP_HEIGHT;
+    let bg_color = 0x00DDDDDD;
+    let active_color = 0x00ECEEF1;
+    let border_color = 0x00C0C4CC;
+
+    // Strip background.
+    for y in 0..strip_h.saturating_sub(1) {
+        let row = (y * width) as usize;
+        for x in 0..width {
+            buffer[row + x as usize] = bg_color;
+        }
+    }
+    // Single-pixel bottom separator between strip and URL bar.
+    if strip_h > 0 {
+        let row = ((strip_h - 1) * width) as usize;
+        for x in 0..width {
+            buffer[row + x as usize] = border_color;
+        }
+    }
+
+    let total = tabs.len() + 1;
+    for display_idx in 0..total {
+        let tab_x = (display_idx as u32) * TAB_WIDTH;
+        if tab_x + TAB_WIDTH > width {
+            break;
+        }
+        // Title source: live state for active tab, snapshot for the rest.
+        let title = if display_idx == active_tab {
+            if !active_url_bar.is_empty() {
+                active_url_bar.to_string()
+            } else {
+                active_page_url
+                    .and_then(|u| u.host_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "New Tab".to_string())
+            }
+        } else {
+            let pos = if display_idx < active_tab {
+                display_idx
+            } else {
+                display_idx - 1
+            };
+            let tab = &tabs[pos];
+            if !tab.url_bar.is_empty() {
+                tab.url_bar.clone()
+            } else if let Some(page) = &tab.page {
+                page.url.host_str().unwrap_or("New Tab").to_string()
+            } else {
+                "New Tab".to_string()
+            }
+        };
+
+        let is_active = display_idx == active_tab;
+        let fill = if is_active { active_color } else { bg_color };
+        // Fill the tab rect (one pixel inset on the right for separator).
+        for y in 1..strip_h.saturating_sub(1) {
+            let row = (y * width) as usize;
+            for x in tab_x..(tab_x + TAB_WIDTH - 1) {
+                buffer[row + x as usize] = fill;
+            }
+        }
+        // Right-edge separator.
+        for y in 0..strip_h {
+            let idx = (y * width + tab_x + TAB_WIDTH - 1) as usize;
+            if idx < buffer.len() {
+                buffer[idx] = border_color;
+            }
+        }
+        // Top accent line for the active tab.
+        if is_active {
+            for x in tab_x..(tab_x + TAB_WIDTH - 1) {
+                let idx = x as usize;
+                if idx < buffer.len() {
+                    buffer[idx] = 0x004A90E2;
+                }
+            }
+        }
+
+        // Render the title.
+        let metrics = Metrics::new(12.0, 16.0);
+        let mut tb = Buffer::new(font_system, metrics);
+        let available = (TAB_WIDTH as f32 - 24.0 - TAB_CLOSE_RADIUS * 2.0).max(20.0);
+        tb.set_size(font_system, Some(available), None);
+        tb.set_wrap(font_system, Wrap::None);
+        let attrs = Attrs::new().family(Family::SansSerif);
+        tb.set_text(font_system, &title, attrs, Shaping::Advanced);
+        tb.shape_until_scroll(font_system, false);
+
+        let text_x = tab_x as f32 + 10.0;
+        let text_y = 6.0;
+        let text_color = CtColor::rgb(40, 40, 50);
+        for run in tb.layout_runs() {
+            for glyph in run.glyphs.iter() {
+                let physical = glyph.physical((text_x, text_y + run.line_y), 1.0);
+                let cache_key = physical.cache_key;
+                let glyph_x = physical.x;
+                let glyph_y = physical.y;
+                let pmap_w = width as i32;
+                let pmap_h = strip_h as i32;
+                let title_right = (tab_x + TAB_WIDTH - 24) as i32;
+                swash_cache.with_pixels(font_system, cache_key, text_color, |x_off, y_off, color| {
+                    let px = glyph_x + x_off;
+                    let py = glyph_y + y_off;
+                    if px < tab_x as i32 || py < 0 || px >= title_right || py >= pmap_h {
+                        return;
+                    }
+                    let idx = py as usize * pmap_w as usize + px as usize;
+                    let src_a = color.a();
+                    if src_a == 0 {
+                        return;
+                    }
+                    let inv_a = 255u32 - src_a as u32;
+                    let dst = buffer[idx];
+                    let dr = (dst >> 16) & 0xFF;
+                    let dg = (dst >> 8) & 0xFF;
+                    let db = dst & 0xFF;
+                    let sr = color.r() as u32 * src_a as u32 / 255;
+                    let sg = color.g() as u32 * src_a as u32 / 255;
+                    let sb = color.b() as u32 * src_a as u32 / 255;
+                    let nr = sr + dr * inv_a / 255;
+                    let ng = sg + dg * inv_a / 255;
+                    let nb = sb + db * inv_a / 255;
+                    buffer[idx] = (nr << 16) | (ng << 8) | nb;
+                });
+            }
+        }
+
+        // Close button (×) — a 14×14 region near the right edge.
+        let close_cx = (tab_x + TAB_WIDTH - 14) as i32;
+        let close_cy = (strip_h / 2) as i32;
+        let r = TAB_CLOSE_RADIUS as i32;
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx * dx + dy * dy > r * r {
+                    continue;
+                }
+                let px = close_cx + dx;
+                let py = close_cy + dy;
+                if px < 0 || py < 0 || px >= width as i32 || py >= strip_h as i32 {
+                    continue;
+                }
+                let idx = py as usize * width as usize + px as usize;
+                if let Some(p) = buffer.get_mut(idx) {
+                    *p = 0x00B0B4BC;
+                }
+            }
+        }
+        // Render an `×` as two thin diagonal lines in the close circle.
+        for off in -3..=3i32 {
+            for &(dx, dy) in &[(off, off), (off, -off)] {
+                let px = close_cx + dx;
+                let py = close_cy + dy;
+                if px < 0 || py < 0 || px >= width as i32 || py >= strip_h as i32 {
+                    continue;
+                }
+                let idx = py as usize * width as usize + px as usize;
+                if let Some(p) = buffer.get_mut(idx) {
+                    *p = 0x00404040;
+                }
+            }
+        }
+    }
+
+    // `+` New tab button to the right of the last tab.
+    let plus_x = (total as u32) * TAB_WIDTH;
+    if plus_x + NEW_TAB_BUTTON_WIDTH <= width {
+        for y in 1..strip_h.saturating_sub(1) {
+            let row = (y * width) as usize;
+            for x in plus_x..(plus_x + NEW_TAB_BUTTON_WIDTH) {
+                buffer[row + x as usize] = bg_color;
+            }
+        }
+        // Render a `+` glyph
+        let cx = (plus_x + NEW_TAB_BUTTON_WIDTH / 2) as i32;
+        let cy = (strip_h / 2) as i32;
+        for off in -5..=5i32 {
+            for &(dx, dy) in &[(off, 0_i32), (0, off)] {
+                let px = cx + dx;
+                let py = cy + dy;
+                if px < 0 || py < 0 || px >= width as i32 || py >= strip_h as i32 {
+                    continue;
+                }
+                let idx = py as usize * width as usize + px as usize;
+                if let Some(p) = buffer.get_mut(idx) {
+                    *p = 0x00404040;
                 }
             }
         }
@@ -2576,7 +3332,105 @@ impl Browser {
         if r.mutated {
             self.recascade_and_paint();
         }
+        // Advance CSS-side animations. If anything is still running
+        // we want the next frame to keep ticking.
+        let has_active = self.tick_css_animations();
+        if has_active {
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
         self.process_js_nav_requests();
+    }
+
+    /// Advance running CSS transitions / animations by reading the
+    /// current wall-clock time, writing the interpolated value back
+    /// into the live computed style for each animating element. Drops
+    /// completed animations. Returns `true` if any animations are
+    /// still in flight.
+    fn tick_css_animations(&mut self) -> bool {
+        let Some(page) = self.page.as_mut() else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        let mut still_active = false;
+        page.anims.retain(|anim| {
+            let elapsed = now.duration_since(anim.start);
+            let raw = if anim.duration.as_secs_f32() <= 0.0 {
+                1.0
+            } else {
+                (elapsed.as_secs_f32() / anim.duration.as_secs_f32()).clamp(0.0, 1.0)
+            };
+            let progress = ease(raw, anim.timing);
+            let value = anim.from + (anim.to - anim.from) * progress;
+            // Write back to the live style.
+            let style = page.styles.get_mut(anim.node);
+            if anim.property == "opacity" {
+                style.opacity = value.clamp(0.0, 1.0);
+            }
+            if raw < 1.0 {
+                still_active = true;
+                true
+            } else {
+                false
+            }
+        });
+        still_active
+    }
+
+    /// After each cascade, compare opacities and start transitions
+    /// for elements that have `transition` on opacity (or `all`).
+    fn start_css_transitions(&mut self) {
+        let Some(page) = self.page.as_mut() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        // Walk every element in the DOM with a computed style.
+        let mut new_opacity_map: std::collections::HashMap<dom::NodeId, f32> =
+            std::collections::HashMap::new();
+        let doc = page.dom.document();
+        let mut stack: Vec<dom::NodeId> = vec![doc];
+        while let Some(n) = stack.pop() {
+            if matches!(page.dom.node(n).kind, dom::NodeKind::Element { .. }) {
+                let s = page.styles.get(n);
+                let new_opacity = s.opacity;
+                let was = page.prev_opacity.get(&n).copied();
+                let transitions_opacity = s
+                    .transitions
+                    .iter()
+                    .any(|t| t.property == "opacity" || t.property == "all");
+                if let Some(prev) = was {
+                    if (prev - new_opacity).abs() > f32::EPSILON && transitions_opacity {
+                        if let Some(rule) = s
+                            .transitions
+                            .iter()
+                            .find(|t| t.property == "opacity" || t.property == "all")
+                        {
+                            let dur = std::time::Duration::from_secs_f32(rule.duration_s);
+                            // Push a running animation FROM prev TO new.
+                            page.anims.push(RunningAnim {
+                                node: n,
+                                property: "opacity".into(),
+                                from: prev,
+                                to: new_opacity,
+                                start: now
+                                    + std::time::Duration::from_secs_f32(rule.delay_s),
+                                duration: dur,
+                                timing: rule.timing,
+                            });
+                            // The first frame of the animation should
+                            // show `prev`, not `new` — write back.
+                            page.styles.get_mut(n).opacity = prev;
+                        }
+                    }
+                }
+                new_opacity_map.insert(n, new_opacity);
+            }
+            for c in page.dom.children(n).collect::<Vec<_>>() {
+                stack.push(c);
+            }
+        }
+        page.prev_opacity = new_opacity_map;
     }
 
     /// Drain navigation requests scripts have queued (location.assign,

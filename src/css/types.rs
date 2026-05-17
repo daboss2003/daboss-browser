@@ -3,6 +3,38 @@
 
 use std::collections::HashMap;
 
+#[derive(Debug, Clone)]
+pub struct TransitionRule {
+    /// Property name (lowercased). `"all"` matches every animatable
+    /// property; visual interpolation today only honours `opacity`.
+    pub property: String,
+    /// Duration in seconds.
+    pub duration_s: f32,
+    /// Delay in seconds.
+    pub delay_s: f32,
+    /// Timing function — currently only `linear` and `ease` are
+    /// distinguishable; everything else falls back to `linear`.
+    pub timing: TimingFunction,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnimationRule {
+    pub name: String,
+    pub duration_s: f32,
+    pub delay_s: f32,
+    pub iteration_count: f32, // `f32::INFINITY` for `infinite`
+    pub timing: TimingFunction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimingFunction {
+    Linear,
+    Ease,
+    EaseIn,
+    EaseOut,
+    EaseInOut,
+}
+
 /// One entry in a `filter:` declaration. Numeric arguments are
 /// percent-normalised (0.0..=1.0 for `100%`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -711,6 +743,15 @@ pub struct ComputedStyle {
     /// requires width-aware glyph clipping in the inline formatting
     /// context.
     pub text_overflow: TextOverflow,
+    /// `transition: <prop> <duration> [<timing>] [<delay>]` entries.
+    /// When a tracked property changes between cascades, the browser
+    /// shell starts a running animation that interpolates the old →
+    /// new value over `duration`.
+    pub transitions: Vec<TransitionRule>,
+    /// `animation: <name> <duration> ...` entries pointing at
+    /// `@keyframes` blocks. Browser shell instantiates each on the
+    /// next animation tick.
+    pub animations: Vec<AnimationRule>,
     /// One drop shadow. Not inherited.
     pub box_shadow: Option<BoxShadow>,
     /// `transform: translate(...)` only — `(dx_px, dy_px)`. Not inherited
@@ -811,6 +852,8 @@ impl ComputedStyle {
             overflow_x: Overflow::Visible,
             overflow_y: Overflow::Visible,
             text_overflow: TextOverflow::Clip,
+            transitions: Vec::new(),
+            animations: Vec::new(),
             box_shadow: None,
             transform_translate: None,
             transform: None,

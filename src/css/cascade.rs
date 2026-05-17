@@ -17,12 +17,13 @@ use std::collections::HashMap;
 
 use crate::css::parser::parse_inline_declarations;
 use crate::css::types::{
-    AlignContent, AlignItems, AttributeOp, AttributeSelector, BackgroundImage, BorderStyle,
-    BoxShadow, BoxSides, BoxSizing, CalcExpr, Color, Combinator, ComputedStyle, Declaration,
-    Dimension, Direction, Display, FilterFunction, FlexDirection, FlexWrap, FontStyle,
-    GridAutoFlow, GridLine, GridTrack, JustifyContent, Overflow, Position, PseudoClass, Rule,
-    Selector, SimpleSelector, Stylesheet, TableLayout, TextAlign, TextDecoration, TextOverflow,
-    Transform2D, Unit, Value, WhiteSpace,
+    AlignContent, AlignItems, AnimationRule, AttributeOp, AttributeSelector, BackgroundImage,
+    BorderStyle, BoxShadow, BoxSides, BoxSizing, CalcExpr, Color, Combinator, ComputedStyle,
+    Declaration, Dimension, Direction, Display, FilterFunction, FlexDirection, FlexWrap,
+    FontStyle, GridAutoFlow, GridLine, GridTrack, JustifyContent, Overflow, Position,
+    PseudoClass, Rule, Selector, SimpleSelector, Stylesheet, TableLayout, TextAlign,
+    TextDecoration, TextOverflow, TimingFunction, Transform2D, TransitionRule, Unit, Value,
+    WhiteSpace,
 };
 use crate::dom::{Dom, NodeId, NodeKind};
 
@@ -420,6 +421,19 @@ impl StyleTree {
 
     pub fn get(&self, id: NodeId) -> &ComputedStyle {
         &self.styles[id.index()]
+    }
+
+    /// Mutable access for the animation engine to write interpolated
+    /// values back per frame. Auto-grows the underlying vec when
+    /// `id` is beyond the current length (e.g. nodes inserted by JS
+    /// after the initial cascade).
+    pub fn get_mut(&mut self, id: NodeId) -> &mut ComputedStyle {
+        let idx = id.index();
+        if idx >= self.styles.len() {
+            self.styles
+                .resize_with(idx + 1, ComputedStyle::initial);
+        }
+        &mut self.styles[idx]
     }
 
     pub fn before_style(&self, id: NodeId) -> Option<&ComputedStyle> {
@@ -1158,6 +1172,56 @@ fn apply_declaration(
                 _ => TextOverflow::Clip,
             };
         }
+        "transition" => {
+            style.transitions = transitions_from(value);
+        }
+        "transition-property" => {
+            for t in style.transitions.iter_mut() {
+                if let Value::Keyword(k) = value {
+                    t.property = k.clone();
+                }
+            }
+        }
+        "transition-duration" => {
+            if let Some(d) = duration_seconds(value) {
+                for t in style.transitions.iter_mut() {
+                    t.duration_s = d;
+                }
+            }
+        }
+        "animation" => {
+            style.animations = animations_from(value);
+        }
+        "animation-name" => {
+            if let Value::Keyword(k) = value {
+                for a in style.animations.iter_mut() {
+                    a.name = k.clone();
+                }
+                if style.animations.is_empty() {
+                    style.animations.push(AnimationRule {
+                        name: k.clone(),
+                        duration_s: 0.0,
+                        delay_s: 0.0,
+                        iteration_count: 1.0,
+                        timing: TimingFunction::Linear,
+                    });
+                }
+            }
+        }
+        "animation-duration" => {
+            if let Some(d) = duration_seconds(value) {
+                for a in style.animations.iter_mut() {
+                    a.duration_s = d;
+                }
+            }
+        }
+        "animation-iteration-count" => {
+            if let Some(n) = iteration_count(value) {
+                for a in style.animations.iter_mut() {
+                    a.iteration_count = n;
+                }
+            }
+        }
         "filter" => {
             style.filter = filter_chain_from(value);
             // Fold `opacity(<n>)` into the regular opacity for paint —
@@ -1249,6 +1313,144 @@ fn box_shadow_from(
 /// translateX/Y, scale, scaleX/Y, rotate (+ rotateZ), skewX/Y, and
 /// matrix(). Unknown / 3D variants are skipped silently. Returns `None`
 /// only when the value is literally `none` or contains nothing usable.
+fn duration_seconds(v: &Value) -> Option<f32> {
+    match v {
+        Value::Number(n) => Some(*n),
+        Value::Length(n, Unit::Px) => Some(*n / 1000.0), // ambiguous; treat as ms
+        Value::Length(n, _) => Some(*n), // assume seconds
+        Value::String(s) | Value::Keyword(s) => {
+            if let Some(ms) = s.strip_suffix("ms") {
+                ms.parse::<f32>().ok().map(|v| v / 1000.0)
+            } else if let Some(sec) = s.strip_suffix("s") {
+                sec.parse::<f32>().ok()
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn iteration_count(v: &Value) -> Option<f32> {
+    match v {
+        Value::Number(n) => Some(*n),
+        Value::Keyword(k) if k == "infinite" => Some(f32::INFINITY),
+        _ => None,
+    }
+}
+
+fn timing_from(v: &Value) -> TimingFunction {
+    match v {
+        Value::Keyword(k) => match k.as_str() {
+            "linear" => TimingFunction::Linear,
+            "ease" => TimingFunction::Ease,
+            "ease-in" => TimingFunction::EaseIn,
+            "ease-out" => TimingFunction::EaseOut,
+            "ease-in-out" => TimingFunction::EaseInOut,
+            _ => TimingFunction::Linear,
+        },
+        _ => TimingFunction::Linear,
+    }
+}
+
+/// Parse `transition: <prop> <dur> [<timing>] [<delay>], ...` into
+/// rules. We accept any whitespace-delimited token order.
+fn transitions_from(value: &Value) -> Vec<TransitionRule> {
+    let mut out = Vec::new();
+    let groups: Vec<Vec<Value>> = match value {
+        Value::List(xs) => {
+            // Split on commas isn't directly available — our parser
+            // currently flattens commas, so treat the entire list as
+            // a single transition for the toy.
+            vec![xs.clone()]
+        }
+        single => vec![vec![single.clone()]],
+    };
+    for group in groups {
+        let mut rule = TransitionRule {
+            property: "all".into(),
+            duration_s: 0.0,
+            delay_s: 0.0,
+            timing: TimingFunction::Linear,
+        };
+        let mut saw_duration = false;
+        for v in &group {
+            if let Some(d) = duration_seconds(v) {
+                if !saw_duration {
+                    rule.duration_s = d;
+                    saw_duration = true;
+                } else {
+                    rule.delay_s = d;
+                }
+                continue;
+            }
+            if let Value::Keyword(k) = v {
+                match k.as_str() {
+                    "linear" | "ease" | "ease-in" | "ease-out" | "ease-in-out" => {
+                        rule.timing = timing_from(v);
+                    }
+                    _ => {
+                        rule.property = k.to_ascii_lowercase();
+                    }
+                }
+            }
+        }
+        if rule.duration_s > 0.0 || !rule.property.is_empty() {
+            out.push(rule);
+        }
+    }
+    out
+}
+
+fn animations_from(value: &Value) -> Vec<AnimationRule> {
+    let mut rule = AnimationRule {
+        name: String::new(),
+        duration_s: 0.0,
+        delay_s: 0.0,
+        iteration_count: 1.0,
+        timing: TimingFunction::Linear,
+    };
+    let items: Vec<&Value> = match value {
+        Value::List(xs) => xs.iter().collect(),
+        single => vec![single],
+    };
+    let mut saw_duration = false;
+    for v in items {
+        if let Some(d) = duration_seconds(v) {
+            if !saw_duration {
+                rule.duration_s = d;
+                saw_duration = true;
+            } else {
+                rule.delay_s = d;
+            }
+            continue;
+        }
+        if let Some(n) = iteration_count(v) {
+            rule.iteration_count = n;
+            continue;
+        }
+        if let Value::Keyword(k) = v {
+            match k.as_str() {
+                "linear" | "ease" | "ease-in" | "ease-out" | "ease-in-out" => {
+                    rule.timing = timing_from(v);
+                }
+                "infinite" => {
+                    rule.iteration_count = f32::INFINITY;
+                }
+                _ => {
+                    if rule.name.is_empty() {
+                        rule.name = k.clone();
+                    }
+                }
+            }
+        }
+    }
+    if rule.name.is_empty() && rule.duration_s == 0.0 {
+        return Vec::new();
+    }
+    vec![rule]
+}
+
 fn overflow_from(value: &Value) -> Overflow {
     match value {
         Value::Keyword(k) => match k.as_str() {

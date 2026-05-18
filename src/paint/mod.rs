@@ -582,17 +582,14 @@ impl Painter {
             ty: -box_rect.y,
         };
         self.paint_subtree_inner(dom, styles, tree, images, node, inner_ctx);
-        let filtered = std::mem::replace(&mut self.pixmap, saved);
-        // Apply each filter function in declaration order.
-        let mut data = filtered.data().to_vec();
+        let mut filtered = std::mem::replace(&mut self.pixmap, saved);
+        // Apply each filter function in declaration order. The
+        // pixmap-aware dispatcher handles per-pixel and spatial
+        // (blur) filters identically from the caller's POV.
         for f in &style.filter {
-            apply_filter_pixels(*f, &mut data);
+            apply_filter_to_pixmap(*f, &mut filtered);
         }
-        let mut composed = match Pixmap::new(off_w, off_h) {
-            Some(p) => p,
-            None => return,
-        };
-        composed.data_mut().copy_from_slice(&data);
+        let composed = filtered;
         let transform = Transform::from_translate(dest_x, dest_y);
         let mut paint = PixmapPaint::default();
         paint.opacity = ctx.alpha;
@@ -833,13 +830,128 @@ fn apply_filter_pixels(filter: FilterFunction, data: &mut [u8]) {
         FilterFunction::Invert(amount) => apply_invert(data, amount),
         FilterFunction::Saturate(factor) => apply_saturate(data, factor),
         FilterFunction::Sepia(amount) => apply_sepia(data, amount),
-        FilterFunction::HueRotate(_) | FilterFunction::Blur(_) => {
-            // Hue rotation needs an HSL roundtrip; blur needs a Gaussian
-            // convolution. Both are real work but well-isolated — the
-            // cascade still records them, paint just doesn't render
-            // them yet. Documented limitation.
+        FilterFunction::HueRotate(deg) => apply_hue_rotate(data, deg),
+        // Blur needs the pixmap dimensions — this per-buffer entry
+        // point can't apply spatial filters. The pixmap-aware
+        // dispatcher handles blur in [`apply_filter_pixmap`].
+        FilterFunction::Blur(_) => {}
+    }
+}
+
+/// Pixmap-aware filter application. Per-pixel filters delegate to
+/// [`apply_filter_pixels`]; spatial filters (blur) need the
+/// dimensions, so they live here.
+pub(crate) fn apply_filter_to_pixmap(
+    filter: FilterFunction,
+    pixmap: &mut tiny_skia::Pixmap,
+) {
+    match filter {
+        FilterFunction::Blur(radius_px) => {
+            let r = radius_px.max(0.0).min(64.0); // cap to keep work bounded
+            if r > 0.5 {
+                let w = pixmap.width();
+                let h = pixmap.height();
+                let data = pixmap.data_mut();
+                gaussian_blur_rgba(data, w as usize, h as usize, r);
+            }
+        }
+        other => apply_filter_pixels(other, pixmap.data_mut()),
+    }
+}
+
+/// Separable Gaussian blur with a clipped kernel. Operates on
+/// premultiplied RGBA so partial-alpha edges fade correctly.
+fn gaussian_blur_rgba(data: &mut [u8], width: usize, height: usize, radius: f32) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    let sigma = radius * 0.5;
+    let half = radius.ceil() as isize;
+    if half < 1 {
+        return;
+    }
+    // Precompute the 1D kernel.
+    let mut kernel: Vec<f32> = Vec::with_capacity((2 * half + 1) as usize);
+    let two_sigma_sq = 2.0 * sigma * sigma;
+    let mut sum = 0.0;
+    for i in -half..=half {
+        let v = (-((i as f32).powi(2)) / two_sigma_sq).exp();
+        kernel.push(v);
+        sum += v;
+    }
+    for v in &mut kernel {
+        *v /= sum;
+    }
+
+    let row_stride = width * 4;
+    // Two-pass horizontal then vertical.
+    let mut tmp = vec![0u8; data.len()];
+
+    // Horizontal pass: src=data → dst=tmp.
+    for y in 0..height {
+        let row = y * row_stride;
+        for x in 0..width {
+            let mut acc = [0.0f32; 4];
+            for (ki, k) in kernel.iter().enumerate() {
+                let sx = x as isize + ki as isize - half;
+                let sx = sx.clamp(0, width as isize - 1) as usize;
+                let off = row + sx * 4;
+                acc[0] += data[off] as f32 * k;
+                acc[1] += data[off + 1] as f32 * k;
+                acc[2] += data[off + 2] as f32 * k;
+                acc[3] += data[off + 3] as f32 * k;
+            }
+            let off = row + x * 4;
+            tmp[off] = acc[0].clamp(0.0, 255.0) as u8;
+            tmp[off + 1] = acc[1].clamp(0.0, 255.0) as u8;
+            tmp[off + 2] = acc[2].clamp(0.0, 255.0) as u8;
+            tmp[off + 3] = acc[3].clamp(0.0, 255.0) as u8;
         }
     }
+
+    // Vertical pass: src=tmp → dst=data.
+    for y in 0..height {
+        for x in 0..width {
+            let mut acc = [0.0f32; 4];
+            for (ki, k) in kernel.iter().enumerate() {
+                let sy = y as isize + ki as isize - half;
+                let sy = sy.clamp(0, height as isize - 1) as usize;
+                let off = sy * row_stride + x * 4;
+                acc[0] += tmp[off] as f32 * k;
+                acc[1] += tmp[off + 1] as f32 * k;
+                acc[2] += tmp[off + 2] as f32 * k;
+                acc[3] += tmp[off + 3] as f32 * k;
+            }
+            let off = y * row_stride + x * 4;
+            data[off] = acc[0].clamp(0.0, 255.0) as u8;
+            data[off + 1] = acc[1].clamp(0.0, 255.0) as u8;
+            data[off + 2] = acc[2].clamp(0.0, 255.0) as u8;
+            data[off + 3] = acc[3].clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+fn apply_hue_rotate(data: &mut [u8], degrees: f32) {
+    let theta = degrees.to_radians();
+    let c = theta.cos();
+    let s = theta.sin();
+    // Standard hue-rotate matrix per the SVG filter spec.
+    let m = [
+        [0.213 + c * 0.787 - s * 0.213, 0.715 - c * 0.715 - s * 0.715, 0.072 - c * 0.072 + s * 0.928],
+        [0.213 - c * 0.213 + s * 0.143, 0.715 + c * 0.285 + s * 0.140, 0.072 - c * 0.072 - s * 0.283],
+        [0.213 - c * 0.213 - s * 0.787, 0.715 - c * 0.715 + s * 0.715, 0.072 + c * 0.928 + s * 0.072],
+    ];
+    each_rgba_unpremultiplied(data, |r, g, b| {
+        let rf = *r as f32;
+        let gf = *g as f32;
+        let bf = *b as f32;
+        let nr = m[0][0] * rf + m[0][1] * gf + m[0][2] * bf;
+        let ng = m[1][0] * rf + m[1][1] * gf + m[1][2] * bf;
+        let nb = m[2][0] * rf + m[2][1] * gf + m[2][2] * bf;
+        *r = nr.clamp(0.0, 255.0) as u8;
+        *g = ng.clamp(0.0, 255.0) as u8;
+        *b = nb.clamp(0.0, 255.0) as u8;
+    });
 }
 
 fn each_rgba_unpremultiplied(data: &mut [u8], mut apply: impl FnMut(&mut u8, &mut u8, &mut u8)) {

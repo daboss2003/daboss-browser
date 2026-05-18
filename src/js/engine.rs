@@ -436,6 +436,7 @@ impl JsEngine {
         super::compression::install(&mut ctx);
         super::opfs::install(&mut ctx);
         super::trusted_types::install(&mut ctx);
+        super::shadow_dom::install(&mut ctx);
 
         let listeners: Rc<RefCell<ListenerMap>> = Rc::new(RefCell::new(HashMap::new()));
         let timers: Rc<RefCell<TimerState>> = Rc::new(RefCell::new(TimerState::default()));
@@ -762,6 +763,16 @@ impl JsEngine {
         target: NodeId,
     ) -> DispatchResult {
         self.dispatch_event_with(dom, event_type, target, EventInit::bubbling())
+    }
+
+    /// Drive IntersectionObserver / ResizeObserver against the
+    /// current layout. Call once per layout pass; callbacks fire
+    /// for any threshold crossing or size change.
+    pub fn tick_layout_observers(&mut self, dom: &mut Dom, box_tree: &crate::layout::BoxTree) {
+        let (dom_rc, listeners_rc) = self.install_thread_locals(dom);
+        super::observers::tick_layout_observers(box_tree, &mut self.ctx);
+        super::observers::drain_mutation_records(&mut self.ctx);
+        self.uninstall_thread_locals(dom, dom_rc, listeners_rc);
     }
 
     /// Dispatch with explicit per-event properties (MouseEvent coords,

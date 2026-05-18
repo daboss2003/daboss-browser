@@ -957,6 +957,10 @@ impl Browser {
         });
         if let Some(mut pixmap) = painted {
             composite_iframes(&mut pixmap, &box_tree, &new_iframes);
+            // Drive Intersection / Resize observers using the layout
+            // we just computed. Done after paint so callback work
+            // doesn't delay the visible update.
+            page.js.tick_layout_observers(&mut page.dom, &box_tree);
             page.box_tree = box_tree;
             page.pixmap = pixmap;
             page.iframes = new_iframes;

@@ -697,6 +697,36 @@ impl<'a> Parser<'a> {
                     self.consume(')');
                     rgb_from_args(&args)
                 }
+                "hsl" | "hsla" => {
+                    let args = self.parse_function_args();
+                    self.consume(')');
+                    hsl_from_args(&args)
+                }
+                "oklch" => {
+                    let args = self.parse_function_args();
+                    self.consume(')');
+                    oklch_from_args(&args)
+                }
+                "oklab" => {
+                    let args = self.parse_function_args();
+                    self.consume(')');
+                    oklab_from_args(&args)
+                }
+                "lab" => {
+                    let args = self.parse_function_args();
+                    self.consume(')');
+                    lab_from_args(&args)
+                }
+                "lch" => {
+                    let args = self.parse_function_args();
+                    self.consume(')');
+                    lch_from_args(&args)
+                }
+                "color" => {
+                    let args = self.parse_function_args();
+                    self.consume(')');
+                    color_func_from_args(&args)
+                }
                 _ => {
                     // Unknown function — keep args so e.g. `transform:
                     // translate(10px, 20px)` can be picked up later.
@@ -1324,6 +1354,251 @@ fn number_to_byte(v: &Value) -> u8 {
         Value::Percentage(p) => (p * 2.55).round().clamp(0.0, 255.0) as u8,
         _ => 0,
     }
+}
+
+/// `Value` → angle in degrees. Bare numbers are degrees by default
+/// (matches modern color syntax where `oklch(L C 200)` is allowed).
+fn value_as_degrees(v: &Value) -> Option<f32> {
+    match v {
+        Value::Number(n) => Some(*n),
+        // We don't carry deg/rad/turn unit info on Length values yet
+        // so degrees is the assumed default.
+        Value::Length(n, _) => Some(*n),
+        _ => None,
+    }
+}
+
+fn value_as_number(v: &Value) -> Option<f32> {
+    match v {
+        Value::Number(n) => Some(*n),
+        Value::Percentage(p) => Some(p / 100.0),
+        _ => None,
+    }
+}
+
+fn value_as_axis(v: &Value, scale: f32) -> Option<f32> {
+    match v {
+        Value::Number(n) => Some(*n),
+        Value::Percentage(p) => Some(p / 100.0 * scale),
+        _ => None,
+    }
+}
+
+fn alpha_from(args: &[Value], at: usize) -> u8 {
+    match args.get(at) {
+        Some(Value::Number(n)) => (n * 255.0).clamp(0.0, 255.0) as u8,
+        Some(Value::Percentage(p)) => (p * 2.55).clamp(0.0, 255.0) as u8,
+        _ => 255,
+    }
+}
+
+fn srgb_to_byte_color(r: f32, g: f32, b: f32, a: u8) -> Color {
+    Color {
+        r: (r * 255.0).clamp(0.0, 255.0).round() as u8,
+        g: (g * 255.0).clamp(0.0, 255.0).round() as u8,
+        b: (b * 255.0).clamp(0.0, 255.0).round() as u8,
+        a,
+    }
+}
+
+// hsl(H S L [/ A])
+fn hsl_from_args(args: &[Value]) -> Option<Value> {
+    if args.len() < 3 {
+        return None;
+    }
+    let h = value_as_degrees(&args[0])?;
+    let s = value_as_number(&args[1])?;
+    let l = value_as_number(&args[2])?;
+    let a = alpha_from(args, 3);
+    let (r, g, b) = hsl_to_srgb(h, s.clamp(0.0, 1.0), l.clamp(0.0, 1.0));
+    Some(Value::Color(srgb_to_byte_color(r, g, b, a)))
+}
+
+fn hsl_to_srgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let h_prime = ((h % 360.0 + 360.0) % 360.0) / 60.0;
+    let x = c * (1.0 - (h_prime % 2.0 - 1.0).abs());
+    let (r1, g1, b1) = match h_prime as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    (r1 + m, g1 + m, b1 + m)
+}
+
+// oklch(L C H [/ A]) per CSS Color 4. L is in [0,1] (or 0%-100%).
+// C is unbounded but typically <= 0.4. H is degrees.
+fn oklch_from_args(args: &[Value]) -> Option<Value> {
+    if args.len() < 3 {
+        return None;
+    }
+    let l = value_as_number(&args[0])?;
+    let c = match &args[1] {
+        Value::Number(n) => *n,
+        Value::Percentage(p) => p / 100.0 * 0.4,
+        _ => return None,
+    };
+    let h = value_as_degrees(&args[2])?;
+    let a = alpha_from(args, 3);
+    let h_rad = h.to_radians();
+    let oklab_a = c * h_rad.cos();
+    let oklab_b = c * h_rad.sin();
+    let (r, g, b) = oklab_to_srgb(l, oklab_a, oklab_b);
+    Some(Value::Color(srgb_to_byte_color(r, g, b, a)))
+}
+
+fn oklab_from_args(args: &[Value]) -> Option<Value> {
+    if args.len() < 3 {
+        return None;
+    }
+    let l = value_as_number(&args[0])?;
+    let a_ = value_as_axis(&args[1], 0.4)?;
+    let b_ = value_as_axis(&args[2], 0.4)?;
+    let alpha = alpha_from(args, 3);
+    let (r, g, b) = oklab_to_srgb(l, a_, b_);
+    Some(Value::Color(srgb_to_byte_color(r, g, b, alpha)))
+}
+
+/// OKLab → linear sRGB → sRGB. Matrices per Björn Ottosson's reference.
+fn oklab_to_srgb(l: f32, a: f32, b: f32) -> (f32, f32, f32) {
+    let l_ = l + 0.3963377774 * a + 0.2158037573 * b;
+    let m_ = l - 0.1055613458 * a - 0.0638541728 * b;
+    let s_ = l - 0.0894841775 * a - 1.2914855480 * b;
+    let l3 = l_ * l_ * l_;
+    let m3 = m_ * m_ * m_;
+    let s3 = s_ * s_ * s_;
+    let lr = 4.0767416621 * l3 - 3.3077115913 * m3 + 0.2309699292 * s3;
+    let lg = -1.2684380046 * l3 + 2.6097574011 * m3 - 0.3413193965 * s3;
+    let lb = -0.0041960863 * l3 - 0.7034186147 * m3 + 1.7076147010 * s3;
+    (linear_to_srgb(lr), linear_to_srgb(lg), linear_to_srgb(lb))
+}
+
+fn linear_to_srgb(c: f32) -> f32 {
+    let c = c.max(0.0);
+    if c <= 0.0031308 {
+        12.92 * c
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+fn srgb_to_linear(c: f32) -> f32 {
+    let c = c.max(0.0);
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+// lab(L a b [/ A]) — CIE Lab, D50 reference white.
+fn lab_from_args(args: &[Value]) -> Option<Value> {
+    if args.len() < 3 {
+        return None;
+    }
+    let l = match &args[0] {
+        Value::Number(n) => *n,
+        Value::Percentage(p) => *p, // 0..100
+        _ => return None,
+    };
+    let a_ = match &args[1] {
+        Value::Number(n) => *n,
+        Value::Percentage(p) => p / 100.0 * 125.0,
+        _ => return None,
+    };
+    let b_ = match &args[2] {
+        Value::Number(n) => *n,
+        Value::Percentage(p) => p / 100.0 * 125.0,
+        _ => return None,
+    };
+    let alpha = alpha_from(args, 3);
+    let (r, g, b) = lab_to_srgb(l, a_, b_);
+    Some(Value::Color(srgb_to_byte_color(r, g, b, alpha)))
+}
+
+fn lch_from_args(args: &[Value]) -> Option<Value> {
+    if args.len() < 3 {
+        return None;
+    }
+    let l = match &args[0] {
+        Value::Number(n) => *n,
+        Value::Percentage(p) => *p,
+        _ => return None,
+    };
+    let c = match &args[1] {
+        Value::Number(n) => *n,
+        Value::Percentage(p) => p / 100.0 * 150.0,
+        _ => return None,
+    };
+    let h = value_as_degrees(&args[2])?;
+    let alpha = alpha_from(args, 3);
+    let h_rad = h.to_radians();
+    let a_ = c * h_rad.cos();
+    let b_ = c * h_rad.sin();
+    let (r, g, b) = lab_to_srgb(l, a_, b_);
+    Some(Value::Color(srgb_to_byte_color(r, g, b, alpha)))
+}
+
+/// Lab (D50) → XYZ (D50) → sRGB. Uses the standard CIE conversion +
+/// Bradford D50→D65 chromatic adaptation, then the sRGB matrix.
+fn lab_to_srgb(l: f32, a: f32, b: f32) -> (f32, f32, f32) {
+    // L is 0..100.
+    let l = l / 100.0;
+    let fy = (l + 0.16) / 1.16;
+    let fx = a / 5.0 + fy;
+    let fz = fy - b / 2.0;
+    let kappa = 24389.0 / 27.0;
+    let eps = 216.0 / 24389.0;
+    let xr = if fx.powi(3) > eps { fx.powi(3) } else { (116.0 * fx - 16.0) / kappa };
+    let yr = if l > kappa * eps / 116.0 { fy.powi(3) } else { l / kappa * 116.0 };
+    let zr = if fz.powi(3) > eps { fz.powi(3) } else { (116.0 * fz - 16.0) / kappa };
+    // D50 reference white.
+    let (xd50, yd50, zd50) = (xr * 0.9642, yr * 1.0, zr * 0.8249);
+    // Bradford D50 → D65.
+    let xd65 = 0.9555766 * xd50 - 0.0230393 * yd50 + 0.0631636 * zd50;
+    let yd65 = -0.0282895 * xd50 + 1.0099416 * yd50 + 0.0210077 * zd50;
+    let zd65 = 0.0122982 * xd50 - 0.0204830 * yd50 + 1.3299098 * zd50;
+    // XYZ (D65) → linear sRGB.
+    let lr = 3.2404542 * xd65 - 1.5371385 * yd65 - 0.4985314 * zd65;
+    let lg = -0.9692660 * xd65 + 1.8760108 * yd65 + 0.0415560 * zd65;
+    let lb = 0.0556434 * xd65 - 0.2040259 * yd65 + 1.0572252 * zd65;
+    (linear_to_srgb(lr), linear_to_srgb(lg), linear_to_srgb(lb))
+}
+
+// color(space r g b [/ a]) — supports srgb, srgb-linear, display-p3.
+fn color_func_from_args(args: &[Value]) -> Option<Value> {
+    if args.len() < 4 {
+        return None;
+    }
+    let space = match &args[0] {
+        Value::Keyword(s) => s.to_ascii_lowercase(),
+        _ => return None,
+    };
+    let r = value_as_number(&args[1])?;
+    let g = value_as_number(&args[2])?;
+    let b = value_as_number(&args[3])?;
+    let a = alpha_from(args, 4);
+    let (sr, sg, sb) = match space.as_str() {
+        "srgb" => (r, g, b),
+        "srgb-linear" => (linear_to_srgb(r), linear_to_srgb(g), linear_to_srgb(b)),
+        "display-p3" => {
+            // Display-P3 → linear-P3 → linear-sRGB via the standard
+            // 3x3, then gamma-encode.
+            let lr = srgb_to_linear(r);
+            let lg = srgb_to_linear(g);
+            let lb = srgb_to_linear(b);
+            let sr_l = 1.2249401 * lr - 0.2249404 * lg + 0.0000004 * lb;
+            let sg_l = -0.0420569 * lr + 1.0420571 * lg - 0.0000001 * lb;
+            let sb_l = -0.0196376 * lr - 0.0786361 * lg + 1.0982735 * lb;
+            (linear_to_srgb(sr_l), linear_to_srgb(sg_l), linear_to_srgb(sb_l))
+        }
+        _ => (r, g, b),
+    };
+    Some(Value::Color(srgb_to_byte_color(sr, sg, sb, a)))
 }
 
 fn parse_hex(hex: &str) -> Option<Color> {

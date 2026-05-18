@@ -309,18 +309,27 @@ fn intersection_observe(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
         read_intersect_idx(this, ctx),
         node_id_from_handle(args.first(), ctx),
     ) {
+        let mut fire_synchronously = false;
         JS_OBSERVERS.with(|slot| {
             if let Some(rc) = slot.borrow().as_ref() {
                 if let Some(entry) = rc.borrow_mut().intersection_observers.get_mut(idx) {
                     if !entry.targets.contains(&target) {
                         entry.targets.push(target);
+                        // Seed last_state with (true, 1.0) so the
+                        // first layout tick only re-fires when the
+                        // real geometry actually differs. Spec
+                        // schedules the initial callback as a
+                        // microtask; we fire synchronously which is
+                        // close enough for the toy.
+                        entry.last_state.insert(target, (true, 1.0));
+                        fire_synchronously = true;
                     }
                 }
             }
         });
-        // Fire synchronously with isIntersecting=true. This matches the
-        // "let me know when X exists" pattern most pages use.
-        fire_intersection_callback_for(idx, target, ctx);
+        if fire_synchronously {
+            fire_intersection_batch(idx, &[(target, true, 1.0)], ctx);
+        }
     }
     Ok(JsValue::undefined())
 }
@@ -352,36 +361,6 @@ fn intersection_disconnect(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> 
         });
     }
     Ok(JsValue::undefined())
-}
-
-fn fire_intersection_callback_for(idx: usize, target: NodeId, ctx: &mut Context) {
-    let cb = JS_OBSERVERS.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .and_then(|rc| rc.borrow().intersection_observers.get(idx).map(|e| e.callback.clone()))
-    });
-    let Some(cb) = cb else { return };
-    let target_handle = js_dom::make_element_handle(ctx, target);
-    let entries = JsArray::new(ctx);
-    let entry = ObjectInitializer::new(ctx)
-        .property(
-            js_string!("isIntersecting"),
-            JsValue::from(true),
-            Attribute::READONLY,
-        )
-        .property(
-            js_string!("intersectionRatio"),
-            JsValue::from(1.0_f64),
-            Attribute::READONLY,
-        )
-        .property(
-            js_string!("target"),
-            JsValue::from(target_handle),
-            Attribute::READONLY,
-        )
-        .build();
-    let _ = entries.push(JsValue::from(entry), ctx);
-    let _ = cb.call(&JsValue::undefined(), &[entries.into()], ctx);
 }
 
 // ============= ResizeObserver =============
@@ -432,16 +411,21 @@ fn resize_observe(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResu
         read_resize_idx(this, ctx),
         node_id_from_handle(args.first(), ctx),
     ) {
+        let mut fire_synchronously = false;
         JS_OBSERVERS.with(|slot| {
             if let Some(rc) = slot.borrow().as_ref() {
                 if let Some(entry) = rc.borrow_mut().resize_observers.get_mut(idx) {
                     if !entry.targets.contains(&target) {
                         entry.targets.push(target);
+                        entry.last_size.insert(target, (0.0, 0.0));
+                        fire_synchronously = true;
                     }
                 }
             }
         });
-        fire_resize_callback_for(idx, target, ctx);
+        if fire_synchronously {
+            fire_resize_batch(idx, &[(target, 0.0, 0.0)], ctx);
+        }
     }
     Ok(JsValue::undefined())
 }
@@ -475,44 +459,47 @@ fn resize_disconnect(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResu
     Ok(JsValue::undefined())
 }
 
-fn fire_resize_callback_for(idx: usize, target: NodeId, ctx: &mut Context) {
-    let cb = JS_OBSERVERS.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .and_then(|rc| rc.borrow().resize_observers.get(idx).map(|e| e.callback.clone()))
-    });
-    let Some(cb) = cb else { return };
-    let target_handle = js_dom::make_element_handle(ctx, target);
-    let content_rect = ObjectInitializer::new(ctx)
-        .property(
-            js_string!("width"),
-            JsValue::from(0.0_f64),
-            Attribute::READONLY,
-        )
-        .property(
-            js_string!("height"),
-            JsValue::from(0.0_f64),
-            Attribute::READONLY,
-        )
-        .build();
-    let entries = JsArray::new(ctx);
-    let entry = ObjectInitializer::new(ctx)
-        .property(
-            js_string!("target"),
-            JsValue::from(target_handle),
-            Attribute::READONLY,
-        )
-        .property(
-            js_string!("contentRect"),
-            JsValue::from(content_rect),
-            Attribute::READONLY,
-        )
-        .build();
-    let _ = entries.push(JsValue::from(entry), ctx);
-    let _ = cb.call(&JsValue::undefined(), &[entries.into()], ctx);
-}
-
 // ============= helpers + drain =============
+
+fn parse_thresholds(opts: Option<&JsValue>, ctx: &mut Context) -> Vec<f64> {
+    let default = vec![0.0_f64];
+    let Some(opts) = opts else { return default };
+    let Some(obj) = opts.as_object() else { return default };
+    let Ok(t) = obj.get(js_string!("threshold"), ctx) else {
+        return default;
+    };
+    if t.is_undefined() || t.is_null() {
+        return default;
+    }
+    // Either an array or a single number.
+    if let Some(o) = t.as_object() {
+        if let Ok(arr) = boa_engine::object::builtins::JsArray::from_object(o.clone()) {
+            let len = arr.length(ctx).unwrap_or(0) as usize;
+            let mut out = Vec::with_capacity(len);
+            for i in 0..len {
+                if let Ok(v) = arr.get(i as u64, ctx) {
+                    if let Ok(n) = v.to_number(ctx) {
+                        if (0.0..=1.0).contains(&n) {
+                            out.push(n);
+                        }
+                    }
+                }
+            }
+            if out.is_empty() {
+                return default;
+            }
+            out.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            out.dedup();
+            return out;
+        }
+    }
+    if let Ok(n) = t.to_number(ctx) {
+        if (0.0..=1.0).contains(&n) {
+            return vec![n];
+        }
+    }
+    default
+}
 
 fn extract_fn(v: &JsValue) -> Option<JsFunction> {
     let obj = v.as_object()?;
@@ -608,6 +595,236 @@ pub fn drain_mutation_records(ctx: &mut Context) {
         }
         let _ = cb.call(&JsValue::undefined(), &[arr.into()], ctx);
     }
+}
+
+/// Recompute IntersectionObserver / ResizeObserver state against
+/// the current layout box tree. Should be called after every layout
+/// pass — initial render, scroll, resize, DOM mutation that
+/// invalidates layout.
+///
+/// Fires JS callbacks for any observers whose target crossed a
+/// threshold (Intersection) or changed size (Resize) since the
+/// previous tick.
+pub fn tick_layout_observers(box_tree: &BoxTree, ctx: &mut Context) {
+    // Snapshot the targets + thresholds we need from the observer
+    // state, compute fresh ratios, then commit updates + collect
+    // callbacks-to-fire. Doing it in two passes keeps the borrow on
+    // the observer state away from `cb.call()` which may need it
+    // again (timers, nested observers, etc.).
+    let viewport = box_tree.viewport;
+    let snapshot = JS_OBSERVERS.with(|slot| -> Option<ObserverSnapshot> {
+        let rc = slot.borrow().as_ref().cloned()?;
+        let s = rc.borrow();
+        let intersect = s
+            .intersection_observers
+            .iter()
+            .enumerate()
+            .map(|(idx, e)| IntersectSnap {
+                idx,
+                targets: e.targets.clone(),
+                thresholds: e.thresholds.clone(),
+                last_state: e.last_state.clone(),
+            })
+            .collect();
+        let resize = s
+            .resize_observers
+            .iter()
+            .enumerate()
+            .map(|(idx, e)| ResizeSnap {
+                idx,
+                targets: e.targets.clone(),
+                last_size: e.last_size.clone(),
+            })
+            .collect();
+        Some(ObserverSnapshot { intersect, resize })
+    });
+    let Some(snapshot) = snapshot else { return };
+
+    // ---- Intersection ----
+    for snap in &snapshot.intersect {
+        let mut to_fire: Vec<(NodeId, bool, f64)> = Vec::new();
+        let mut new_state: HashMap<NodeId, (bool, f64)> = snap.last_state.clone();
+        for target in &snap.targets {
+            let Some(b) = box_tree.get(*target) else {
+                continue;
+            };
+            let ratio = intersection_ratio(b.rect, viewport);
+            let is_intersecting = ratio > 0.0;
+            let prev = snap.last_state.get(target).copied();
+            let crossed = match prev {
+                None => true, // first observation always fires
+                Some((prev_intersecting, prev_ratio)) => {
+                    prev_intersecting != is_intersecting
+                        || crossed_threshold(&snap.thresholds, prev_ratio, ratio)
+                }
+            };
+            if crossed {
+                to_fire.push((*target, is_intersecting, ratio));
+            }
+            new_state.insert(*target, (is_intersecting, ratio));
+        }
+        if to_fire.is_empty() {
+            continue;
+        }
+        // Commit new state.
+        JS_OBSERVERS.with(|slot| {
+            if let Some(rc) = slot.borrow().as_ref() {
+                if let Some(e) =
+                    rc.borrow_mut().intersection_observers.get_mut(snap.idx)
+                {
+                    e.last_state = new_state;
+                }
+            }
+        });
+        // Fire callback once with all matching entries.
+        fire_intersection_batch(snap.idx, &to_fire, ctx);
+    }
+
+    // ---- Resize ----
+    for snap in &snapshot.resize {
+        let mut to_fire: Vec<(NodeId, f32, f32)> = Vec::new();
+        let mut new_sizes: HashMap<NodeId, (f32, f32)> = snap.last_size.clone();
+        for target in &snap.targets {
+            let Some(b) = box_tree.get(*target) else {
+                continue;
+            };
+            let (w, h) = (b.rect.width, b.rect.height);
+            let prev = snap.last_size.get(target).copied();
+            let changed = match prev {
+                None => true,
+                Some((pw, ph)) => (pw - w).abs() > 0.5 || (ph - h).abs() > 0.5,
+            };
+            if changed {
+                to_fire.push((*target, w, h));
+            }
+            new_sizes.insert(*target, (w, h));
+        }
+        if to_fire.is_empty() {
+            continue;
+        }
+        JS_OBSERVERS.with(|slot| {
+            if let Some(rc) = slot.borrow().as_ref() {
+                if let Some(e) = rc.borrow_mut().resize_observers.get_mut(snap.idx) {
+                    e.last_size = new_sizes;
+                }
+            }
+        });
+        fire_resize_batch(snap.idx, &to_fire, ctx);
+    }
+}
+
+struct ObserverSnapshot {
+    intersect: Vec<IntersectSnap>,
+    resize: Vec<ResizeSnap>,
+}
+
+struct IntersectSnap {
+    idx: usize,
+    targets: Vec<NodeId>,
+    thresholds: Vec<f64>,
+    last_state: HashMap<NodeId, (bool, f64)>,
+}
+
+struct ResizeSnap {
+    idx: usize,
+    targets: Vec<NodeId>,
+    last_size: HashMap<NodeId, (f32, f32)>,
+}
+
+fn intersection_ratio(target: crate::layout::Rect, root: crate::layout::Rect) -> f64 {
+    let target_area = (target.width as f64).max(0.0) * (target.height as f64).max(0.0);
+    if target_area <= 0.0 {
+        return 0.0;
+    }
+    let ix = target.x.max(root.x);
+    let iy = target.y.max(root.y);
+    let ir = (target.x + target.width).min(root.x + root.width);
+    let ib = (target.y + target.height).min(root.y + root.height);
+    let iw = (ir - ix).max(0.0);
+    let ih = (ib - iy).max(0.0);
+    let inter = iw as f64 * ih as f64;
+    (inter / target_area).clamp(0.0, 1.0)
+}
+
+fn crossed_threshold(thresholds: &[f64], prev: f64, curr: f64) -> bool {
+    let (lo, hi) = if prev <= curr { (prev, curr) } else { (curr, prev) };
+    thresholds.iter().any(|&t| t >= lo && t <= hi && (t - prev).abs() > f64::EPSILON)
+}
+
+fn fire_intersection_batch(idx: usize, hits: &[(NodeId, bool, f64)], ctx: &mut Context) {
+    let cb = JS_OBSERVERS.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|rc| {
+                rc.borrow()
+                    .intersection_observers
+                    .get(idx)
+                    .map(|e| e.callback.clone())
+            })
+    });
+    let Some(cb) = cb else { return };
+    let entries = JsArray::new(ctx);
+    for (target, is_intersecting, ratio) in hits {
+        let target_handle = js_dom::make_element_handle(ctx, *target);
+        let entry = ObjectInitializer::new(ctx)
+            .property(
+                js_string!("isIntersecting"),
+                JsValue::from(*is_intersecting),
+                Attribute::READONLY,
+            )
+            .property(
+                js_string!("intersectionRatio"),
+                JsValue::from(*ratio),
+                Attribute::READONLY,
+            )
+            .property(
+                js_string!("target"),
+                JsValue::from(target_handle),
+                Attribute::READONLY,
+            )
+            .build();
+        let _ = entries.push(JsValue::from(entry), ctx);
+    }
+    let _ = cb.call(&JsValue::undefined(), &[entries.into()], ctx);
+}
+
+fn fire_resize_batch(idx: usize, hits: &[(NodeId, f32, f32)], ctx: &mut Context) {
+    let cb = JS_OBSERVERS.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|rc| rc.borrow().resize_observers.get(idx).map(|e| e.callback.clone()))
+    });
+    let Some(cb) = cb else { return };
+    let entries = JsArray::new(ctx);
+    for (target, w, h) in hits {
+        let target_handle = js_dom::make_element_handle(ctx, *target);
+        let content_rect = ObjectInitializer::new(ctx)
+            .property(
+                js_string!("width"),
+                JsValue::from(*w as f64),
+                Attribute::READONLY,
+            )
+            .property(
+                js_string!("height"),
+                JsValue::from(*h as f64),
+                Attribute::READONLY,
+            )
+            .build();
+        let entry = ObjectInitializer::new(ctx)
+            .property(
+                js_string!("target"),
+                JsValue::from(target_handle),
+                Attribute::READONLY,
+            )
+            .property(
+                js_string!("contentRect"),
+                JsValue::from(content_rect),
+                Attribute::READONLY,
+            )
+            .build();
+        let _ = entries.push(JsValue::from(entry), ctx);
+    }
+    let _ = cb.call(&JsValue::undefined(), &[entries.into()], ctx);
 }
 
 fn watch_matches(watch: &MutationWatch, rec: &MutationRecord) -> bool {

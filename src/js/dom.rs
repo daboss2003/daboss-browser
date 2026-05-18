@@ -342,6 +342,11 @@ pub(crate) fn make_element_handle(ctx: &mut Context, id: NodeId) -> JsObject {
         0,
     );
     init.function(
+        NativeFunction::from_fn_ptr(super::shadow_dom::element_attach_shadow),
+        js_string!("attachShadow"),
+        1,
+    );
+    init.function(
         NativeFunction::from_fn_ptr(super::visibility::element_request_pointer_lock),
         js_string!("requestPointerLock"),
         0,
@@ -405,6 +410,13 @@ pub(crate) fn make_element_handle(ctx: &mut Context, id: NodeId) -> JsObject {
     init.accessor(
         js_string!("validationMessage"),
         Some(validation_msg_get),
+        None,
+        Attribute::ENUMERABLE,
+    );
+    let shadow_root_get = getter(super::shadow_dom::element_get_shadow_root);
+    init.accessor(
+        js_string!("shadowRoot"),
+        Some(shadow_root_get),
         None,
         Attribute::ENUMERABLE,
     );
@@ -787,7 +799,7 @@ fn query_selector_all(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRes
 
 // ---------- JS-callable shims: Element.* ----------
 
-fn read_self_node_id(this: &JsValue, ctx: &mut Context) -> Option<NodeId> {
+pub(crate) fn read_self_node_id(this: &JsValue, ctx: &mut Context) -> Option<NodeId> {
     let obj = this.as_object()?;
     let val = obj.get(js_string!(NODE_ID_KEY), ctx).ok()?;
     let n = val.to_u32(ctx).ok()?;

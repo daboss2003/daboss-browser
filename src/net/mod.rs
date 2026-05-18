@@ -330,7 +330,7 @@ impl Client {
         let is_get = matches!(method, Method::Get);
         if is_get {
             let now = std::time::Instant::now();
-            let cached = self.cache.borrow().lookup(&cache_key).cloned();
+            let cached = self.cache.borrow_mut().lookup(&cache_key).cloned();
             if let Some(entry) = cached {
                 if entry.is_fresh(now) {
                     tracing::debug!(%url, "cache: fresh hit");
@@ -355,7 +355,7 @@ impl Client {
 
         // If we have a stale-with-validator entry, send the validators.
         if is_get {
-            let entry = self.cache.borrow().lookup(&cache_key).cloned();
+            let entry = self.cache.borrow_mut().lookup(&cache_key).cloned();
             if let Some(entry) = entry {
                 if let Some(etag) = entry.etag {
                     request.headers.push(("If-None-Match".to_string(), etag));

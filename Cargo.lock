@@ -1229,6 +1229,7 @@ dependencies = [
  "nokhwa",
  "pollster 0.3.0",
  "resvg",
+ "ring",
  "rustls",
  "softbuffer",
  "symphonia",

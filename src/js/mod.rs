@@ -43,6 +43,7 @@ use crate::dom::{Dom, NodeId, NodeKind};
 
 pub(crate) mod audio_ctx;
 pub(crate) mod canvas;
+pub(crate) mod crypto;
 pub(crate) mod dom;
 pub mod engine;
 pub(crate) mod idb;

@@ -1037,9 +1037,60 @@ impl Browser {
             let Some(page) = self.page.as_mut() else {
                 return;
             };
+            // Fire pointerdown / pointerup before click so listeners
+            // installed via PointerEvent see the input first. Each
+            // event carries the same coords but stamps the pointer
+            // surface (pointerId / pressure / pointerType=mouse).
+            let mut pdown = js::engine::EventInit::bubbling();
+            pdown.client_x = Some(x);
+            pdown.client_y = Some(page_y);
+            pdown.button = Some(0);
+            pdown.pointer_id = Some(1);
+            pdown.pointer_type = Some("mouse".to_string());
+            pdown.is_primary = Some(true);
+            pdown.pressure = Some(0.5);
+            let _ = page.js.dispatch_event_with(
+                &mut page.dom,
+                "pointerdown",
+                hit_node,
+                pdown.clone(),
+            );
+            let _ = page.js.dispatch_event_with(
+                &mut page.dom,
+                "pointerup",
+                hit_node,
+                pdown,
+            );
+            // Touch parity: emit touchstart/touchend with a single
+            // synthesized touch point so mobile-style libraries get a
+            // signal even when the real source was a mouse click.
+            let mut touch_init = js::engine::EventInit::bubbling();
+            touch_init.client_x = Some(x);
+            touch_init.client_y = Some(page_y);
+            touch_init.touch_points = Some(vec![js::engine::TouchPoint {
+                identifier: 0,
+                client_x: x,
+                client_y: page_y,
+                radius_x: 1.0,
+                radius_y: 1.0,
+                force: 0.5,
+            }]);
+            let _ = page.js.dispatch_event_with(
+                &mut page.dom,
+                "touchstart",
+                hit_node,
+                touch_init.clone(),
+            );
+            let _ = page.js.dispatch_event_with(
+                &mut page.dom,
+                "touchend",
+                hit_node,
+                touch_init,
+            );
             let mut init = js::engine::EventInit::bubbling();
             init.client_x = Some(x);
             init.client_y = Some(page_y);
+            init.button = Some(0);
             page.js
                 .dispatch_event_with(&mut page.dom, "click", hit_node, init)
         };

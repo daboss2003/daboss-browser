@@ -792,6 +792,20 @@ fn element_set_attribute(this: &JsValue, args: &[JsValue], ctx: &mut Context) ->
     };
     let name = name_val.to_string(ctx)?.to_std_string_escaped();
     let value = val_val.to_string(ctx)?.to_std_string_escaped();
+    // If a `<video>` (or `<audio>`) element is being pointed at a
+    // MediaSource via `blob:mediasource/...`, attach the page node to
+    // the MediaSource instead of going through the network prefetch.
+    if name.eq_ignore_ascii_case("src") && value.starts_with("blob:mediasource/") {
+        if super::mse::try_attach(&value, id, ctx) {
+            super::with_dom_mut(|dom| dom.set_attribute(id, &name, value.clone()));
+            super::observers::push_mutation_record(super::observers::MutationRecord {
+                kind: super::observers::MutationKind::Attributes,
+                target: id,
+                attribute_name: Some(name),
+            });
+            return Ok(JsValue::undefined());
+        }
+    }
     with_dom_mut(|dom| dom.set_attribute(id, &name, value));
     super::observers::push_mutation_record(super::observers::MutationRecord {
         kind: super::observers::MutationKind::Attributes,

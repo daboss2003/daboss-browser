@@ -268,6 +268,8 @@ pub struct EventInit {
     /// MouseEvent.clientX / clientY
     pub client_x: Option<f32>,
     pub client_y: Option<f32>,
+    /// MouseEvent.button (0 = primary / 1 = aux / 2 = secondary).
+    pub button: Option<u32>,
     /// KeyboardEvent.key / code / modifier flags
     pub key: Option<String>,
     pub code: Option<String>,
@@ -277,6 +279,29 @@ pub struct EventInit {
     pub meta: bool,
     /// InputEvent.data (the inserted text) and input.value at time of fire.
     pub input_data: Option<String>,
+    /// PointerEvent / TouchEvent fields. When `pointer_id` is set we
+    /// stamp the PointerEvent surface; when `touch_points` is set we
+    /// stamp the TouchEvent surface.
+    pub pointer_id: Option<i32>,
+    pub pointer_type: Option<String>,
+    pub is_primary: Option<bool>,
+    pub pressure: Option<f32>,
+    pub tilt_x: Option<f32>,
+    pub tilt_y: Option<f32>,
+    pub width: Option<f32>,
+    pub height: Option<f32>,
+    /// TouchEvent.changedTouches list. Each entry is one touch point.
+    pub touch_points: Option<Vec<TouchPoint>>,
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct TouchPoint {
+    pub identifier: i32,
+    pub client_x: f32,
+    pub client_y: f32,
+    pub radius_x: f32,
+    pub radius_y: f32,
+    pub force: f32,
 }
 
 impl EventInit {
@@ -285,6 +310,7 @@ impl EventInit {
             bubbles: true,
             client_x: None,
             client_y: None,
+            button: None,
             key: None,
             code: None,
             ctrl: false,
@@ -292,6 +318,15 @@ impl EventInit {
             alt: false,
             meta: false,
             input_data: None,
+            pointer_id: None,
+            pointer_type: None,
+            is_primary: None,
+            pressure: None,
+            tilt_x: None,
+            tilt_y: None,
+            width: None,
+            height: None,
+            touch_points: None,
         }
     }
     #[allow(dead_code)] // used by load/focus/blur dispatch when wired
@@ -300,6 +335,7 @@ impl EventInit {
             bubbles: false,
             client_x: None,
             client_y: None,
+            button: None,
             key: None,
             code: None,
             ctrl: false,
@@ -307,6 +343,15 @@ impl EventInit {
             alt: false,
             meta: false,
             input_data: None,
+            pointer_id: None,
+            pointer_type: None,
+            is_primary: None,
+            pressure: None,
+            tilt_x: None,
+            tilt_y: None,
+            width: None,
+            height: None,
+            touch_points: None,
         }
     }
 }
@@ -381,6 +426,8 @@ impl JsEngine {
         install_selection_globals(&mut ctx);
         super::animations::install(&mut ctx);
         super::webauthn::install(&mut ctx);
+        super::mse::install(&mut ctx);
+        super::performance::install(&mut ctx);
 
         let listeners: Rc<RefCell<ListenerMap>> = Rc::new(RefCell::new(HashMap::new()));
         let timers: Rc<RefCell<TimerState>> = Rc::new(RefCell::new(TimerState::default()));
@@ -631,6 +678,7 @@ impl JsEngine {
             super::animations::advance_animations(now_ms);
         }
         super::animations::drain_finished(&mut self.ctx);
+        super::performance::drain_observers(&mut self.ctx);
         super::worker::drain_worker_messages(&mut self.ctx);
         self.ctx.run_jobs();
 
@@ -681,6 +729,7 @@ impl JsEngine {
             super::animations::advance_animations(now_ms);
         }
         super::animations::drain_finished(&mut self.ctx);
+        super::performance::drain_observers(&mut self.ctx);
         super::worker::drain_worker_messages(&mut self.ctx);
         self.ctx.run_jobs();
         self.uninstall_thread_locals(dom, rc, listeners_rc);
@@ -779,6 +828,7 @@ impl JsEngine {
             super::animations::advance_animations(now_ms);
         }
         super::animations::drain_finished(&mut self.ctx);
+        super::performance::drain_observers(&mut self.ctx);
         super::worker::drain_worker_messages(&mut self.ctx);
         self.ctx.run_jobs();
 
@@ -1422,35 +1472,10 @@ fn install_navigator_screen_performance(ctx: &mut Context) {
         Attribute::WRITABLE | Attribute::CONFIGURABLE,
     );
 
-    // performance.now()
-    let now_fn = boa_engine::object::FunctionObjectBuilder::new(
-        &realm,
-        NativeFunction::from_fn_ptr(performance_now),
-    )
-    .build();
-    let performance = ObjectInitializer::new(ctx)
-        .property(
-            js_string!("now"),
-            JsValue::from(now_fn),
-            Attribute::READONLY,
-        )
-        .build();
-    let _ = ctx.register_global_property(
-        js_string!("performance"),
-        performance,
-        Attribute::WRITABLE | Attribute::CONFIGURABLE,
-    );
-}
-
-fn performance_now(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
-    // Use process-relative high-resolution time. Real browsers expose a
-    // page-load-relative origin; close enough for the toy.
-    let ms = PERF_ORIGIN.with(|t| t.elapsed().as_secs_f64() * 1000.0);
-    Ok(JsValue::from(ms))
-}
-
-thread_local! {
-    static PERF_ORIGIN: Instant = Instant::now();
+    // The richer `performance` surface — marks, measures,
+    // PerformanceObserver — is installed via `super::performance::install`
+    // in the engine setup. This shell just stops here.
+    let _ = realm;
 }
 
 fn install_location_and_history_globals(ctx: &mut Context) {
@@ -2257,8 +2282,191 @@ fn build_event_object_with(
             Attribute::READONLY,
         );
     }
+    if let Some(btn) = init.button {
+        b.property(
+            js_string!("button"),
+            JsValue::from(btn),
+            Attribute::READONLY,
+        );
+        b.property(
+            js_string!("buttons"),
+            JsValue::from(1u32 << btn),
+            Attribute::READONLY,
+        );
+    }
+    // PointerEvent surface — present when pointer_id is set.
+    if let Some(pid) = init.pointer_id {
+        b.property(
+            js_string!("pointerId"),
+            JsValue::from(pid),
+            Attribute::READONLY,
+        );
+        b.property(
+            js_string!("pointerType"),
+            JsValue::from(js_string!(
+                init.pointer_type.clone().unwrap_or_else(|| "mouse".into())
+            )),
+            Attribute::READONLY,
+        );
+        b.property(
+            js_string!("isPrimary"),
+            JsValue::from(init.is_primary.unwrap_or(true)),
+            Attribute::READONLY,
+        );
+        b.property(
+            js_string!("pressure"),
+            JsValue::from(init.pressure.unwrap_or(0.5) as f64),
+            Attribute::READONLY,
+        );
+        b.property(
+            js_string!("tangentialPressure"),
+            JsValue::from(0.0_f64),
+            Attribute::READONLY,
+        );
+        b.property(
+            js_string!("tiltX"),
+            JsValue::from(init.tilt_x.unwrap_or(0.0) as f64),
+            Attribute::READONLY,
+        );
+        b.property(
+            js_string!("tiltY"),
+            JsValue::from(init.tilt_y.unwrap_or(0.0) as f64),
+            Attribute::READONLY,
+        );
+        b.property(
+            js_string!("twist"),
+            JsValue::from(0.0_f64),
+            Attribute::READONLY,
+        );
+        b.property(
+            js_string!("width"),
+            JsValue::from(init.width.unwrap_or(1.0) as f64),
+            Attribute::READONLY,
+        );
+        b.property(
+            js_string!("height"),
+            JsValue::from(init.height.unwrap_or(1.0) as f64),
+            Attribute::READONLY,
+        );
+    }
+    // TouchEvent surface — `changedTouches` / `touches` /
+    // `targetTouches` are all the same list for the toy. Empty lists
+    // mean nothing is currently down (e.g. on touchend after the
+    // last finger lifts).
+    if let Some(points) = init.touch_points.as_ref() {
+        // We can't easily build a JsArray here without ending the
+        // ObjectInitializer borrow. Stash on the registry and read it
+        // back via a getter… actually the cleaner path is to break
+        // out: build the arrays first, then add properties.
+        let touch_objs: Vec<boa_engine::JsObject> = points
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                ObjectInitializer::new(&mut Default::default())
+                    .property(
+                        js_string!("identifier"),
+                        JsValue::from(i as i32),
+                        Attribute::READONLY,
+                    )
+                    .build()
+            })
+            .collect();
+        let _ = touch_objs;
+        // Build placeholder properties; the real lists are appended
+        // post-build below to avoid the double-borrow.
+        b.property(
+            js_string!("__touch_count"),
+            JsValue::from(points.len() as u32),
+            Attribute::READONLY,
+        );
+    }
 
-    b.build()
+    let event_obj = b.build();
+    // Post-build touch-list assembly (avoids the ObjectInitializer
+    // double-borrow on ctx).
+    if let Some(points) = init.touch_points.as_ref() {
+        let touches = build_touch_list(ctx, points);
+        let _ = event_obj.set(
+            js_string!("touches"),
+            touches.clone(),
+            false,
+            ctx,
+        );
+        let _ = event_obj.set(
+            js_string!("targetTouches"),
+            touches.clone(),
+            false,
+            ctx,
+        );
+        let _ = event_obj.set(
+            js_string!("changedTouches"),
+            touches,
+            false,
+            ctx,
+        );
+    }
+    event_obj
+}
+
+fn build_touch_list(ctx: &mut Context, points: &[TouchPoint]) -> JsValue {
+    use boa_engine::object::builtins::JsArray;
+    let arr = JsArray::new(ctx);
+    for p in points {
+        let touch = ObjectInitializer::new(ctx)
+            .property(
+                js_string!("identifier"),
+                JsValue::from(p.identifier),
+                Attribute::READONLY,
+            )
+            .property(
+                js_string!("clientX"),
+                JsValue::from(p.client_x as f64),
+                Attribute::READONLY,
+            )
+            .property(
+                js_string!("clientY"),
+                JsValue::from(p.client_y as f64),
+                Attribute::READONLY,
+            )
+            .property(
+                js_string!("pageX"),
+                JsValue::from(p.client_x as f64),
+                Attribute::READONLY,
+            )
+            .property(
+                js_string!("pageY"),
+                JsValue::from(p.client_y as f64),
+                Attribute::READONLY,
+            )
+            .property(
+                js_string!("screenX"),
+                JsValue::from(p.client_x as f64),
+                Attribute::READONLY,
+            )
+            .property(
+                js_string!("screenY"),
+                JsValue::from(p.client_y as f64),
+                Attribute::READONLY,
+            )
+            .property(
+                js_string!("radiusX"),
+                JsValue::from(p.radius_x as f64),
+                Attribute::READONLY,
+            )
+            .property(
+                js_string!("radiusY"),
+                JsValue::from(p.radius_y as f64),
+                Attribute::READONLY,
+            )
+            .property(
+                js_string!("force"),
+                JsValue::from(p.force as f64),
+                Attribute::READONLY,
+            )
+            .build();
+        let _ = arr.push(JsValue::from(touch), ctx);
+    }
+    JsValue::from(arr)
 }
 
 fn event_prevent_default(

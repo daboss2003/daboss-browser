@@ -665,6 +665,12 @@ fn url_create_object_url(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> Js
     let Some(arg) = args.first() else {
         return Ok(JsValue::null());
     };
+    // MediaSource gets its own `blob:mediasource/<id>` form so the
+    // `<video>` src setter can detect MSE attachments without a
+    // separate registry lookup.
+    if let Some(url) = super::mse::object_url_for(arg, ctx) {
+        return Ok(JsValue::from(js_string!(url)));
+    }
     let Some(id) = blob_id_of(arg, ctx) else {
         return Ok(JsValue::null());
     };

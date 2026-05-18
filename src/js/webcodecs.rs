@@ -672,9 +672,21 @@ fn video_decoder_configure(
         .and_then(|v| v.to_string(ctx).ok())
         .map(|s| s.to_std_string_escaped())
         .unwrap_or_default();
+    let coded_width = opts
+        .get(js_string!("codedWidth"), ctx)
+        .ok()
+        .and_then(|v| v.to_u32(ctx).ok())
+        .unwrap_or(0);
+    let coded_height = opts
+        .get(js_string!("codedHeight"), ctx)
+        .ok()
+        .and_then(|v| v.to_u32(ctx).ok())
+        .unwrap_or(0);
     VIDEO_DECODERS.with(|r| {
         if let Some(e) = r.borrow_mut().get_mut(&id) {
             e.codec = codec;
+            e.width = coded_width;
+            e.height = coded_height;
             e.configured = true;
         }
     });
@@ -1410,6 +1422,15 @@ fn ffmpeg_decode_video_chunk(
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};
     let (_, fmt) = map_video_codec(&state.codec);
+    // If JS gave us codedWidth/codedHeight on configure(), trust
+    // them. Otherwise probe the encoded chunk with ffprobe — much
+    // more reliable than the old "sqrt of byte count" guess that
+    // was wrong for any non-square output.
+    let (width, height) = if state.width > 0 && state.height > 0 {
+        (state.width, state.height)
+    } else {
+        probe_encoded_dimensions(fmt, &chunk.bytes).unwrap_or((640, 480))
+    };
     let mut cmd = Command::new("ffmpeg");
     cmd.args([
         "-hide_banner",
@@ -1423,6 +1444,8 @@ fn ffmpeg_decode_video_chunk(
         "rawvideo",
         "-pix_fmt",
         "rgba",
+        "-s",
+        &format!("{width}x{height}"),
         "-",
     ]);
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
@@ -1435,11 +1458,45 @@ fn ffmpeg_decode_video_chunk(
         let _ = stdout.read_to_end(&mut out);
     }
     let _ = child.wait();
-    // We don't know the decoded dims without a probe; default to a
-    // square ratio derived from byte count for the toy.
-    let total = out.len() as u32 / 4;
-    let side = (total as f32).sqrt() as u32;
-    Some((out, side, side))
+    Some((out, width, height))
+}
+
+/// Pipe the encoded chunk into ffprobe and parse
+/// `stream=width,height` out of the output. Falls back to None on
+/// any parse / process error; the caller treats that as the
+/// 640×480 default.
+fn probe_encoded_dimensions(input_fmt: &str, bytes: &[u8]) -> Option<(u32, u32)> {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new("ffprobe");
+    cmd.args([
+        "-v",
+        "error",
+        "-f",
+        input_fmt,
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "csv=s=x:p=0",
+        "-",
+    ]);
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(bytes);
+    }
+    let mut s = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout.read_to_string(&mut s);
+    }
+    let _ = child.wait();
+    let s = s.trim();
+    let mut parts = s.split('x');
+    let w = parts.next()?.parse::<u32>().ok()?;
+    let h = parts.next()?.parse::<u32>().ok()?;
+    Some((w, h))
 }
 
 fn ffmpeg_encode_audio(

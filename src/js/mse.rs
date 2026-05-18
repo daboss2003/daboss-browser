@@ -5,12 +5,13 @@
 //! URL, then sets `<video>.src = url`. When the video element wires
 //! up, we transition the MediaSource to `open` and fire `sourceopen`.
 //!
-//! The JS then calls `addSourceBuffer(mime)` to get a SourceBuffer
-//! and feeds it `appendBuffer(uint8Array)` segments. We accumulate
-//! the bytes per-buffer. `endOfStream()` finalises: we concatenate
-//! every appended segment in order and hand the result to the
-//! existing [`crate::video::VideoElement`] pipeline so playback
-//! proceeds through the same ffmpeg + cpal path as `<video src>`.
+//! `addSourceBuffer(mime)` opens a tempfile on disk; each
+//! `appendBuffer(uint8Array)` call streams its bytes straight to
+//! that tempfile (no in-memory `Vec<u8>`). `endOfStream()` closes
+//! the tempfile and hands the path to
+//! [`crate::video::VideoElement::from_path`], which spawns ffmpeg
+//! against the file directly — avoiding both the bytes round-trip
+//! and any chance of OOMing on a multi-GB stream.
 //!
 //! Out of scope for the toy:
 //!   * True streaming playback. We only start ffmpeg on
@@ -60,9 +61,27 @@ pub struct MediaSourceEntry {
 
 pub struct SourceBufferEntry {
     pub mime: String,
-    pub bytes: Vec<u8>,
+    /// Disk-backed buffer for appended segments. Each appendBuffer
+    /// call streams its bytes straight here so the entire stream
+    /// never lives in RAM. None until the first append succeeds.
+    pub temp_path: Option<std::path::PathBuf>,
+    pub temp_file: Option<std::fs::File>,
     pub media_source_id: u32,
     pub handle: Option<boa_engine::JsObject>,
+}
+
+impl Drop for SourceBufferEntry {
+    fn drop(&mut self) {
+        // Close the file handle before unlinking so platforms that
+        // delete-on-close (Windows) handle it cleanly.
+        self.temp_file.take();
+        if let Some(p) = self.temp_path.take() {
+            // Only delete if the file was never claimed by endOfStream
+            // (which moves the path into the VideoElement and
+            // unlinks at its own Drop).
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 thread_local! {
@@ -199,7 +218,8 @@ fn ms_add_source_buffer(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
             sb_id,
             SourceBufferEntry {
                 mime,
-                bytes: Vec::new(),
+                temp_path: None,
+                temp_file: None,
                 media_source_id: ms_id,
                 handle: None,
             },
@@ -245,11 +265,10 @@ fn ms_remove_source_buffer(this: &JsValue, args: &[JsValue], ctx: &mut Context) 
 }
 
 fn ms_end_of_stream(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    use std::io::Write;
     let Some(ms_id) = ms_id_of(this, ctx) else {
         return Ok(JsValue::undefined());
     };
-    // Concatenate every SourceBuffer's bytes in addSourceBuffer
-    // order, then kick off ffmpeg decode against the result.
     let (sb_ids, handle, video_node) = MEDIA_SOURCES.with(|r| {
         let mut map = r.borrow_mut();
         if let Some(e) = map.get_mut(&ms_id) {
@@ -264,17 +283,60 @@ fn ms_end_of_stream(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResul
             (Vec::new(), None, None)
         }
     });
-    let mut combined = Vec::new();
-    SOURCE_BUFFERS.with(|r| {
-        let map = r.borrow();
-        for id in &sb_ids {
-            if let Some(sb) = map.get(id) {
-                combined.extend_from_slice(&sb.bytes);
+    // Pick the path to hand to ffmpeg. If there's only one
+    // SourceBuffer, use its tempfile directly. If there are several,
+    // concatenate them into a fresh tempfile by streaming bytes
+    // through Read/Write (still no full-stream in-memory buffer).
+    let final_path: Option<std::path::PathBuf> = SOURCE_BUFFERS.with(|r| {
+        let mut map = r.borrow_mut();
+        let paths: Vec<std::path::PathBuf> = sb_ids
+            .iter()
+            .filter_map(|id| {
+                map.get_mut(id)
+                    .and_then(|sb| {
+                        // Close the file handle so the rename / copy
+                        // below sees the final bytes.
+                        sb.temp_file.take();
+                        sb.temp_path.take()
+                    })
+            })
+            .collect();
+        match paths.len() {
+            0 => None,
+            1 => Some(paths.into_iter().next().unwrap()),
+            _ => {
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let mut concat = std::env::temp_dir();
+                concat.push(format!("daboss-mse-concat-{stamp:x}.bin"));
+                let mut out = match std::fs::File::create(&concat) {
+                    Ok(f) => f,
+                    Err(_) => return None,
+                };
+                let mut buf = vec![0u8; 64 * 1024];
+                for p in &paths {
+                    if let Ok(mut input) = std::fs::File::open(p) {
+                        loop {
+                            use std::io::Read;
+                            match input.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    if out.write_all(&buf[..n]).is_err() {
+                                        return None;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    let _ = std::fs::remove_file(p);
+                }
+                Some(concat)
             }
         }
     });
-    // Snapshot the existing readyState so the JS visible property
-    // flips to "ended".
     if let Some(obj) = handle.as_ref() {
         let _ = obj.set(
             js_string!("readyState"),
@@ -284,22 +346,19 @@ fn ms_end_of_stream(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResul
         );
         fire_handler(obj, "onsourceended", ctx);
     }
-    if let Some(node) = video_node {
-        if !combined.is_empty() {
-            // Hand off to the standard VideoElement pipeline via the
-            // engine's video registry.
-            crate::js::engine::JS_VIDEO_ELEMENTS.with(|slot| {
-                if let Some(rc) = slot.borrow().as_ref() {
-                    if let Some(video) = crate::video::VideoElement::from_bytes(
-                        combined.clone(),
-                        true,
-                        false,
-                    ) {
-                        rc.borrow_mut().insert(node, video);
-                    }
+    if let (Some(node), Some(path)) = (video_node, final_path) {
+        crate::js::engine::JS_VIDEO_ELEMENTS.with(|slot| {
+            if let Some(rc) = slot.borrow().as_ref() {
+                if let Some(video) =
+                    crate::video::VideoElement::from_path(path.clone(), true, false)
+                {
+                    rc.borrow_mut().insert(node, video);
+                } else {
+                    // Couldn't open — clean up the tempfile.
+                    let _ = std::fs::remove_file(&path);
                 }
-            });
-        }
+            }
+        });
     }
     Ok(JsValue::undefined())
 }
@@ -378,6 +437,7 @@ fn sb_id_of(this: &JsValue, ctx: &mut Context) -> Option<u32> {
 }
 
 fn sb_append_buffer(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    use std::io::Write;
     let Some(sb_id) = sb_id_of(this, ctx) else {
         return Ok(JsValue::undefined());
     };
@@ -386,8 +446,32 @@ fn sb_append_buffer(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRe
         .map(|v| read_bytes(v, ctx))
         .unwrap_or_default();
     SOURCE_BUFFERS.with(|r| {
-        if let Some(e) = r.borrow_mut().get_mut(&sb_id) {
-            e.bytes.extend_from_slice(&bytes);
+        let mut map = r.borrow_mut();
+        let Some(e) = map.get_mut(&sb_id) else { return };
+        // Lazily open the tempfile on the first append. Subsequent
+        // appends just stream bytes through the same handle.
+        if e.temp_file.is_none() {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let mut path = std::env::temp_dir();
+            path.push(format!("daboss-mse-{stamp:x}-{sb_id}.bin"));
+            match std::fs::File::create(&path) {
+                Ok(f) => {
+                    e.temp_path = Some(path);
+                    e.temp_file = Some(f);
+                }
+                Err(err) => {
+                    eprintln!("[mse] tempfile create failed: {err}");
+                    return;
+                }
+            }
+        }
+        if let Some(f) = e.temp_file.as_mut() {
+            if let Err(err) = f.write_all(&bytes) {
+                eprintln!("[mse] append write failed: {err}");
+            }
         }
     });
     // Fire updateend synchronously. Real spec queues this on the

@@ -58,6 +58,28 @@ impl VideoElement {
     /// stream's intrinsic resolution from a probe pass first.
     pub fn from_bytes(bytes: Vec<u8>, autoplay: bool, loop_playback: bool) -> Option<Self> {
         let path = write_tempfile(&bytes).ok()?;
+        Self::from_path_inner(path, autoplay, loop_playback, true)
+    }
+
+    /// Like [`from_bytes`] but takes a path that's already on disk.
+    /// Saves the bytes round-trip when the caller (e.g. MSE
+    /// SourceBuffer) is already buffering to disk. The path will be
+    /// deleted when the VideoElement is dropped if `owned` is true.
+    pub fn from_path(
+        path: std::path::PathBuf,
+        autoplay: bool,
+        loop_playback: bool,
+    ) -> Option<Self> {
+        Self::from_path_inner(path, autoplay, loop_playback, false)
+    }
+
+    fn from_path_inner(
+        path: std::path::PathBuf,
+        autoplay: bool,
+        loop_playback: bool,
+        delete_on_drop: bool,
+    ) -> Option<Self> {
+        let _ = delete_on_drop;
         let (intrinsic_width, intrinsic_height) = probe_dimensions(&path).unwrap_or((640, 360));
         let fps = probe_frame_rate(&path).unwrap_or(30.0).max(1.0);
 

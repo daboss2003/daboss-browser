@@ -52,6 +52,7 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 arboard = { version = "3", default-features = false }
+png = "0.17"
 
 [profile.release]
 lto = "thin"

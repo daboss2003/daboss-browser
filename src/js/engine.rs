@@ -432,6 +432,9 @@ impl JsEngine {
         super::visibility::install(&mut ctx);
         super::fontloading::install(&mut ctx);
         super::view_transitions::install(&mut ctx);
+        super::offscreen::install(&mut ctx);
+        super::compression::install(&mut ctx);
+        super::opfs::install(&mut ctx);
 
         let listeners: Rc<RefCell<ListenerMap>> = Rc::new(RefCell::new(HashMap::new()));
         let timers: Rc<RefCell<TimerState>> = Rc::new(RefCell::new(TimerState::default()));

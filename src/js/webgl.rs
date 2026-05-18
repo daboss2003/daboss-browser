@@ -1,22 +1,29 @@
 //! WebGL 1.0 binding backed by `naga` + `wgpu`.
 //!
-//! The JS facade still exposes the full stub surface (so feature
-//! detection probes don't crash), but the load-bearing methods now
-//! drive real GPU work:
-//!   * `shaderSource` / `compileShader` translate GLSL ES → WGSL via
-//!     `naga`'s glsl frontend. Compile errors surface through
-//!     `getShaderInfoLog` so libraries that gate behaviour on that
-//!     string see real diagnostics.
-//!   * `linkProgram` records which vertex + fragment shader pair is
-//!     active.
-//!   * `bufferData` stores vertex bytes against a buffer handle.
-//!   * `drawArrays(TRIANGLES, first, count)` builds a wgpu pipeline,
-//!     submits a render pass into a per-canvas texture, copies the
-//!     result back into the canvas pixmap so paint can composite.
+//! Real-API behaviours implemented here:
+//!   * Shaders: GLSL ES → WGSL via `naga`. `compileShader` records
+//!     compile errors; `getShaderInfoLog` reads them back.
+//!   * Programs: track vertex+fragment shader pair, link status,
+//!     per-name uniform / attribute locations.
+//!   * Buffers: `bufferData` stores raw bytes against ARRAY_BUFFER or
+//!     ELEMENT_ARRAY_BUFFER handles.
+//!   * Vertex attributes: `vertexAttribPointer` records (buffer,
+//!     size, type, stride, offset); `enableVertexAttribArray` toggles
+//!     active slots.
+//!   * Uniforms: `uniform1f` / `uniform2f` / `uniform3f` / `uniform4f`
+//!     / `uniform1i` / `uniform1fv` / `uniformMatrix4fv` write into a
+//!     per-program packed uniform buffer. The toy uses a single
+//!     `@group(0) @binding(0)` block for all uniforms.
+//!   * Textures: `createTexture` + `texImage2D` upload RGBA bytes;
+//!     `bindTexture` + `activeTexture` track active binding for the
+//!     fragment stage at draw time.
+//!   * `drawArrays` and `drawElements` build a real wgpu pipeline +
+//!     bind group from the above state and render into the canvas
+//!     pixmap.
 //!
-//! Limitations remain (uniforms, textures, multi-attribute layouts —
-//! see the `webgl_gpu` module header). Triangle-clear and
-//! single-position-attribute draws are what's verified to work.
+//! Not yet wired: framebuffer objects, renderbuffers, cube maps,
+//! anisotropic filtering, multi-sample render targets, vertex array
+//! objects, getError flow beyond stubs.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -30,17 +37,17 @@ use boa_engine::{
 };
 
 use crate::dom::NodeId;
-use crate::webgl_gpu::{self, CanvasTarget, ShaderStage, WebGlGpu};
+use crate::webgl_gpu::{
+    self, AttribComponent, AttribLayout, CanvasTarget, DrawDesc, IndexFormat, ShaderStage,
+    TranslatedShader, UploadedTexture, WebGlGpu,
+};
 
 #[derive(Clone)]
 struct ShaderEntry {
     stage: ShaderStage,
     source: String,
-    /// Set when `compileShader` succeeds. Empty string when not yet
-    /// compiled; non-empty error log when it fails.
     info_log: String,
-    /// Translated WGSL on success.
-    wgsl: Option<String>,
+    translated: Option<TranslatedShader>,
 }
 
 #[derive(Default, Clone)]
@@ -49,26 +56,56 @@ struct ProgramEntry {
     fragment_shader: Option<u32>,
     info_log: String,
     linked: bool,
+    /// Name → packed-uniform-buffer byte offset. Filled on `getUniformLocation`.
+    uniform_offsets: HashMap<String, u32>,
+    /// Name → vertex attribute location. Filled on `getAttribLocation`.
+    attrib_locations: HashMap<String, u32>,
+    /// Next uniform offset to hand out, in bytes. Round up to 16 per
+    /// allocation to keep std140-like alignment.
+    next_uniform_offset: u32,
+    /// Next attribute location index.
+    next_attrib_location: u32,
+}
+
+#[derive(Clone)]
+struct AttribState {
+    buffer_id: u32,
+    size: u32,
+    component: AttribComponent,
+    stride: u32,
+    offset: u64,
+    enabled: bool,
+}
+
+#[derive(Clone)]
+struct TextureEntry {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
 }
 
 #[derive(Default)]
 pub struct WebGlState {
     pub clear_color: [f32; 4],
     pub viewport: [i32; 4],
-    /// Counter handing out fake handle ids for shaders / programs /
-    /// buffers — pages that round-trip values through these calls
-    /// expect distinct integers.
     pub next_handle: u32,
-    #[allow(dead_code)] // reserved for uniform binding once we wire bind groups
-    pub uniform_locations: HashMap<(u32, String), u32>,
-    #[allow(dead_code)] // reserved for attribute binding once we wire vertex layouts
-    pub attrib_locations: HashMap<(u32, String), u32>,
 
     shaders: HashMap<u32, ShaderEntry>,
     programs: HashMap<u32, ProgramEntry>,
+    /// Buffer handles → raw bytes. Stores both ARRAY_BUFFER and
+    /// ELEMENT_ARRAY_BUFFER data; the binding state tracks which.
     buffers: HashMap<u32, Vec<u8>>,
     bound_array_buffer: Option<u32>,
+    bound_element_array_buffer: Option<u32>,
     current_program: Option<u32>,
+    /// 8 attribute slots (WebGL 1's `MAX_VERTEX_ATTRIBS` is at least 8).
+    attribs: [Option<AttribState>; 8],
+    /// Per-program uniform buffer bytes. Indexed by program handle.
+    uniform_buffers: HashMap<u32, Vec<u8>>,
+    textures: HashMap<u32, TextureEntry>,
+    active_texture_unit: u32,
+    /// Per-unit bound texture (only unit 0 is consulted at draw time).
+    bound_textures: HashMap<u32, u32>,
     target: Option<CanvasTarget>,
 }
 
@@ -76,18 +113,12 @@ pub type WebGlContexts = Rc<RefCell<HashMap<NodeId, Rc<RefCell<WebGlState>>>>>;
 
 thread_local! {
     pub(crate) static JS_WEBGL: RefCell<Option<WebGlContexts>> = const { RefCell::new(None) };
-    /// Lazily-initialised wgpu device shared across canvases on the
-    /// page. Created on the first `drawArrays`, never destroyed (kept
-    /// alive for the engine's lifetime via the per-page thread-local
-    /// teardown pattern).
     pub(crate) static JS_WEBGL_GPU: RefCell<Option<Rc<WebGlGpu>>> =
         const { RefCell::new(None) };
 }
 
 const CTX_NODE_KEY: &str = "__webgl_node";
 
-/// Build a WebGL rendering context for the given `<canvas>` node.
-/// Returns the JS handle.
 pub fn get_or_create_context(ctx: &mut Context, node: NodeId) -> JsValue {
     let state = JS_WEBGL.with(|slot| {
         let map = slot.borrow();
@@ -98,9 +129,9 @@ pub fn get_or_create_context(ctx: &mut Context, node: NodeId) -> JsValue {
                 .clone()
         })
     });
-    let Some(_state) = state else {
+    if state.is_none() {
         return JsValue::null();
-    };
+    }
 
     let mut b = ObjectInitializer::new(ctx);
     b.property(
@@ -109,38 +140,20 @@ pub fn get_or_create_context(ctx: &mut Context, node: NodeId) -> JsValue {
         Attribute::READONLY,
     );
 
-    // Methods that record handle allocations but don't produce GPU
-    // work yet. Each returns a fresh integer so JS round-trips between
-    // create / attach / bind continue to compare distinct values.
     let stubs: &[&str] = &[
         "deleteBuffer",
         "bufferSubData",
         "deleteShader",
         "deleteProgram",
-        "getAttribLocation",
-        "vertexAttribPointer",
-        "enableVertexAttribArray",
         "disableVertexAttribArray",
-        "getUniformLocation",
-        "uniform1f",
-        "uniform2f",
-        "uniform3f",
-        "uniform4f",
         "uniform1i",
-        "uniform1fv",
-        "uniformMatrix4fv",
-        "createTexture",
-        "deleteTexture",
-        "bindTexture",
-        "texImage2D",
         "texParameteri",
-        "activeTexture",
+        "deleteTexture",
         "enable",
         "disable",
         "blendFunc",
         "depthFunc",
         "cullFace",
-        "drawElements",
         "getParameter",
         "getError",
         "getExtension",
@@ -157,103 +170,48 @@ pub fn get_or_create_context(ctx: &mut Context, node: NodeId) -> JsValue {
         );
     }
 
-    // Methods backed by real state / GPU work.
-    b.function(
-        NativeFunction::from_fn_ptr(webgl_create_buffer),
-        js_string!("createBuffer"),
-        0,
-    );
-    b.function(
-        NativeFunction::from_fn_ptr(webgl_bind_buffer),
-        js_string!("bindBuffer"),
-        2,
-    );
-    b.function(
-        NativeFunction::from_fn_ptr(webgl_buffer_data),
-        js_string!("bufferData"),
-        3,
-    );
-    b.function(
-        NativeFunction::from_fn_ptr(webgl_create_shader),
-        js_string!("createShader"),
-        1,
-    );
-    b.function(
-        NativeFunction::from_fn_ptr(webgl_shader_source),
-        js_string!("shaderSource"),
-        2,
-    );
-    b.function(
-        NativeFunction::from_fn_ptr(webgl_compile_shader),
-        js_string!("compileShader"),
-        1,
-    );
-    b.function(
-        NativeFunction::from_fn_ptr(webgl_get_shader_parameter),
-        js_string!("getShaderParameter"),
-        2,
-    );
-    b.function(
-        NativeFunction::from_fn_ptr(webgl_get_shader_info_log),
-        js_string!("getShaderInfoLog"),
-        1,
-    );
-    b.function(
-        NativeFunction::from_fn_ptr(webgl_create_program),
-        js_string!("createProgram"),
-        0,
-    );
-    b.function(
-        NativeFunction::from_fn_ptr(webgl_attach_shader),
-        js_string!("attachShader"),
-        2,
-    );
-    b.function(
-        NativeFunction::from_fn_ptr(webgl_link_program),
-        js_string!("linkProgram"),
-        1,
-    );
-    b.function(
-        NativeFunction::from_fn_ptr(webgl_get_program_parameter),
-        js_string!("getProgramParameter"),
-        2,
-    );
-    b.function(
-        NativeFunction::from_fn_ptr(webgl_get_program_info_log),
-        js_string!("getProgramInfoLog"),
-        1,
-    );
-    b.function(
-        NativeFunction::from_fn_ptr(webgl_use_program),
-        js_string!("useProgram"),
-        1,
-    );
-    b.function(
-        NativeFunction::from_fn_ptr(webgl_clear_color),
-        js_string!("clearColor"),
-        4,
-    );
-    b.function(
-        NativeFunction::from_fn_ptr(webgl_clear),
-        js_string!("clear"),
-        1,
-    );
-    b.function(
-        NativeFunction::from_fn_ptr(webgl_viewport),
-        js_string!("viewport"),
-        4,
-    );
-    b.function(
-        NativeFunction::from_fn_ptr(webgl_draw_arrays),
-        js_string!("drawArrays"),
-        3,
-    );
+    let bindings: &[(&str, NativeFunction, usize)] = &[
+        ("createBuffer", NativeFunction::from_fn_ptr(webgl_create_buffer), 0),
+        ("bindBuffer", NativeFunction::from_fn_ptr(webgl_bind_buffer), 2),
+        ("bufferData", NativeFunction::from_fn_ptr(webgl_buffer_data), 3),
+        ("createShader", NativeFunction::from_fn_ptr(webgl_create_shader), 1),
+        ("shaderSource", NativeFunction::from_fn_ptr(webgl_shader_source), 2),
+        ("compileShader", NativeFunction::from_fn_ptr(webgl_compile_shader), 1),
+        ("getShaderParameter", NativeFunction::from_fn_ptr(webgl_get_shader_parameter), 2),
+        ("getShaderInfoLog", NativeFunction::from_fn_ptr(webgl_get_shader_info_log), 1),
+        ("createProgram", NativeFunction::from_fn_ptr(webgl_create_program), 0),
+        ("attachShader", NativeFunction::from_fn_ptr(webgl_attach_shader), 2),
+        ("linkProgram", NativeFunction::from_fn_ptr(webgl_link_program), 1),
+        ("getProgramParameter", NativeFunction::from_fn_ptr(webgl_get_program_parameter), 2),
+        ("getProgramInfoLog", NativeFunction::from_fn_ptr(webgl_get_program_info_log), 1),
+        ("useProgram", NativeFunction::from_fn_ptr(webgl_use_program), 1),
+        ("clearColor", NativeFunction::from_fn_ptr(webgl_clear_color), 4),
+        ("clear", NativeFunction::from_fn_ptr(webgl_clear), 1),
+        ("viewport", NativeFunction::from_fn_ptr(webgl_viewport), 4),
+        ("drawArrays", NativeFunction::from_fn_ptr(webgl_draw_arrays), 3),
+        ("drawElements", NativeFunction::from_fn_ptr(webgl_draw_elements), 4),
+        ("getAttribLocation", NativeFunction::from_fn_ptr(webgl_get_attrib_location), 2),
+        ("vertexAttribPointer", NativeFunction::from_fn_ptr(webgl_vertex_attrib_pointer), 6),
+        ("enableVertexAttribArray", NativeFunction::from_fn_ptr(webgl_enable_vertex_attrib_array), 1),
+        ("getUniformLocation", NativeFunction::from_fn_ptr(webgl_get_uniform_location), 2),
+        ("uniform1f", NativeFunction::from_fn_ptr(webgl_uniform_1f), 2),
+        ("uniform2f", NativeFunction::from_fn_ptr(webgl_uniform_2f), 3),
+        ("uniform3f", NativeFunction::from_fn_ptr(webgl_uniform_3f), 4),
+        ("uniform4f", NativeFunction::from_fn_ptr(webgl_uniform_4f), 5),
+        ("uniform1fv", NativeFunction::from_fn_ptr(webgl_uniform_1fv), 2),
+        ("uniformMatrix4fv", NativeFunction::from_fn_ptr(webgl_uniform_matrix_4fv), 3),
+        ("createTexture", NativeFunction::from_fn_ptr(webgl_create_texture), 0),
+        ("bindTexture", NativeFunction::from_fn_ptr(webgl_bind_texture), 2),
+        ("texImage2D", NativeFunction::from_fn_ptr(webgl_tex_image_2d), 9),
+        ("activeTexture", NativeFunction::from_fn_ptr(webgl_active_texture), 1),
+    ];
+    for (name, f, arity) in bindings {
+        b.function(f.clone(), js_string!(*name), *arity);
+    }
 
-    // Constant enum-style properties scripts pull from the context.
     for (k, v) in webgl_constants() {
         b.property(js_string!(k), JsValue::from(v), Attribute::READONLY);
     }
-
     JsValue::from(b.build())
 }
 
@@ -298,9 +256,11 @@ fn webgl_bind_buffer(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
     };
     let target = args.first().and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
     let handle = args.get(1).and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
-    // ARRAY_BUFFER = 0x8892
-    if target == 0x8892 {
-        state.borrow_mut().bound_array_buffer = if handle == 0 { None } else { Some(handle) };
+    let opt = if handle == 0 { None } else { Some(handle) };
+    match target {
+        0x8892 => state.borrow_mut().bound_array_buffer = opt,
+        0x8893 => state.borrow_mut().bound_element_array_buffer = opt,
+        _ => {}
     }
     Ok(JsValue::undefined())
 }
@@ -309,14 +269,16 @@ fn webgl_buffer_data(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
     let Some(state) = state_for(this, ctx) else {
         return Ok(JsValue::undefined());
     };
-    // bufferData(target, data, usage)
     let target = args.first().and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
-    if target != 0x8892 {
-        return Ok(JsValue::undefined());
-    }
     let data_arg = args.get(1).cloned().unwrap_or(JsValue::undefined());
-    let bytes = extract_typed_array_bytes(&data_arg, ctx);
-    let Some(buf_id) = state.borrow().bound_array_buffer else {
+    let element_kind = ElementKind::from_u32(target);
+    let bytes = extract_typed_array_bytes(&data_arg, ctx, element_kind);
+    let buf_id = match target {
+        0x8892 => state.borrow().bound_array_buffer,
+        0x8893 => state.borrow().bound_element_array_buffer,
+        _ => None,
+    };
+    let Some(buf_id) = buf_id else {
         return Ok(JsValue::undefined());
     };
     if let Some(slot) = state.borrow_mut().buffers.get_mut(&buf_id) {
@@ -325,10 +287,30 @@ fn webgl_buffer_data(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
     Ok(JsValue::undefined())
 }
 
-fn extract_typed_array_bytes(val: &JsValue, ctx: &mut Context) -> Vec<u8> {
-    // Boa exposes Float32Array as an object with `length` and indexed
-    // numeric properties; reading via `buffer` requires more plumbing.
-    // For our toy: iterate index keys, write each value as f32 LE.
+enum ElementKind {
+    F32,
+    U16,
+    U32,
+    U8,
+}
+
+impl ElementKind {
+    fn from_u32(target: u32) -> Self {
+        // ELEMENT_ARRAY_BUFFER usually carries u16 (default) but we
+        // accept u32 too. Default to u16 for index buffers; f32 for
+        // anything else.
+        if target == 0x8893 {
+            Self::U16
+        } else {
+            Self::F32
+        }
+    }
+}
+
+/// Best-effort byte extraction from a TypedArray-like JS object. We
+/// look at the constructor's name (Float32Array / Uint16Array / etc)
+/// to choose width; falls back to floats.
+fn extract_typed_array_bytes(val: &JsValue, ctx: &mut Context, default_kind: ElementKind) -> Vec<u8> {
     let Some(obj) = val.as_object() else {
         return Vec::new();
     };
@@ -337,14 +319,39 @@ fn extract_typed_array_bytes(val: &JsValue, ctx: &mut Context) -> Vec<u8> {
         .ok()
         .and_then(|v| v.to_u32(ctx).ok())
         .unwrap_or(0);
-    let mut out = Vec::with_capacity(len as usize * 4);
+    if len == 0 {
+        return Vec::new();
+    }
+    let kind = match obj
+        .get(js_string!("BYTES_PER_ELEMENT"), ctx)
+        .ok()
+        .and_then(|v| v.to_u32(ctx).ok())
+    {
+        Some(4) => {
+            // Could be Float32 or Uint32. We default Float32 for
+            // ARRAY_BUFFER and Uint32 for element buffers.
+            match default_kind {
+                ElementKind::U16 | ElementKind::U32 => ElementKind::U32,
+                _ => ElementKind::F32,
+            }
+        }
+        Some(2) => ElementKind::U16,
+        Some(1) => ElementKind::U8,
+        _ => default_kind,
+    };
+    let mut out = Vec::new();
     for i in 0..len {
         let v = obj
             .get(i, ctx)
             .ok()
             .and_then(|v| v.to_number(ctx).ok())
-            .unwrap_or(0.0) as f32;
-        out.extend_from_slice(&v.to_le_bytes());
+            .unwrap_or(0.0);
+        match kind {
+            ElementKind::F32 => out.extend_from_slice(&(v as f32).to_le_bytes()),
+            ElementKind::U16 => out.extend_from_slice(&(v as u16).to_le_bytes()),
+            ElementKind::U32 => out.extend_from_slice(&(v as u32).to_le_bytes()),
+            ElementKind::U8 => out.push(v as u8),
+        }
     }
     out
 }
@@ -366,7 +373,7 @@ fn webgl_create_shader(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> J
             stage,
             source: String::new(),
             info_log: String::new(),
-            wgsl: None,
+            translated: None,
         },
     );
     Ok(JsValue::from(id))
@@ -384,7 +391,7 @@ fn webgl_shader_source(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> J
         .unwrap_or_default();
     if let Some(s) = state.borrow_mut().shaders.get_mut(&id) {
         s.source = src;
-        s.wgsl = None;
+        s.translated = None;
         s.info_log.clear();
     }
     Ok(JsValue::undefined())
@@ -403,15 +410,15 @@ fn webgl_compile_shader(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
         }
     };
     match webgl_gpu::glsl_to_wgsl(&source, stage) {
-        Ok(wgsl) => {
+        Ok(translated) => {
             if let Some(e) = state.borrow_mut().shaders.get_mut(&id) {
-                e.wgsl = Some(wgsl);
+                e.translated = Some(translated);
                 e.info_log.clear();
             }
         }
         Err(log) => {
             if let Some(e) = state.borrow_mut().shaders.get_mut(&id) {
-                e.wgsl = None;
+                e.translated = None;
                 e.info_log = log;
             }
         }
@@ -429,13 +436,12 @@ fn webgl_get_shader_parameter(
     };
     let id = args.first().and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
     let pname = args.get(1).and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
-    // COMPILE_STATUS = 0x8B81
     if pname == 0x8B81 {
         let ok = state
             .borrow()
             .shaders
             .get(&id)
-            .map(|e| e.wgsl.is_some())
+            .map(|e| e.translated.is_some())
             .unwrap_or(false);
         return Ok(JsValue::from(ok));
     }
@@ -495,8 +501,14 @@ fn webgl_link_program(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> Js
         Some(p) => (p.vertex_shader, p.fragment_shader),
         None => return Ok(JsValue::undefined()),
     };
-    let vs_ok = vs.and_then(|id| s.shaders.get(&id)).map(|e| e.wgsl.is_some()).unwrap_or(false);
-    let fs_ok = fs.and_then(|id| s.shaders.get(&id)).map(|e| e.wgsl.is_some()).unwrap_or(false);
+    let vs_ok = vs
+        .and_then(|id| s.shaders.get(&id))
+        .map(|e| e.translated.is_some())
+        .unwrap_or(false);
+    let fs_ok = fs
+        .and_then(|id| s.shaders.get(&id))
+        .map(|e| e.translated.is_some())
+        .unwrap_or(false);
     drop(s);
     if let Some(p) = state.borrow_mut().programs.get_mut(&prog) {
         p.linked = vs_ok && fs_ok;
@@ -519,7 +531,6 @@ fn webgl_get_program_parameter(
     };
     let prog = args.first().and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
     let pname = args.get(1).and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
-    // LINK_STATUS = 0x8B82
     if pname == 0x8B82 {
         let ok = state
             .borrow()
@@ -613,14 +624,338 @@ fn webgl_viewport(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResu
     Ok(JsValue::undefined())
 }
 
+// ---------- attributes ----------
+
+fn webgl_get_attrib_location(
+    this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(state) = state_for(this, ctx) else {
+        return Ok(JsValue::from(-1_i32));
+    };
+    let prog = args.first().and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
+    let name = args
+        .get(1)
+        .map(|v| v.to_string(ctx).map(|s| s.to_std_string_escaped()))
+        .transpose()?
+        .unwrap_or_default();
+    let mut s = state.borrow_mut();
+    let Some(p) = s.programs.get_mut(&prog) else {
+        return Ok(JsValue::from(-1_i32));
+    };
+    if let Some(loc) = p.attrib_locations.get(&name) {
+        return Ok(JsValue::from(*loc as i32));
+    }
+    if p.next_attrib_location >= 8 {
+        return Ok(JsValue::from(-1_i32));
+    }
+    let loc = p.next_attrib_location;
+    p.attrib_locations.insert(name, loc);
+    p.next_attrib_location += 1;
+    Ok(JsValue::from(loc as i32))
+}
+
+fn webgl_vertex_attrib_pointer(
+    this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(state) = state_for(this, ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    let loc = args.first().and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0) as usize;
+    let size = args.get(1).and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
+    let ty = args.get(2).and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
+    let normalized = args
+        .get(3)
+        .map(|v| v.to_boolean())
+        .unwrap_or(false);
+    let stride = args.get(4).and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
+    let offset = args.get(5).and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
+    let buf = state.borrow().bound_array_buffer.unwrap_or(0);
+    if loc >= 8 {
+        return Ok(JsValue::undefined());
+    }
+    let component = match (ty, normalized) {
+        // UNSIGNED_BYTE = 0x1401, normalized → Unorm8x4 etc.
+        (0x1401, true) => AttribComponent::UnsignedByteNormalized,
+        _ => AttribComponent::Float,
+    };
+    state.borrow_mut().attribs[loc] = Some(AttribState {
+        buffer_id: buf,
+        size,
+        component,
+        stride,
+        offset: offset as u64,
+        enabled: state.borrow().attribs[loc].as_ref().map(|a| a.enabled).unwrap_or(false),
+    });
+    Ok(JsValue::undefined())
+}
+
+fn webgl_enable_vertex_attrib_array(
+    this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(state) = state_for(this, ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    let loc = args.first().and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0) as usize;
+    if loc >= 8 {
+        return Ok(JsValue::undefined());
+    }
+    let mut s = state.borrow_mut();
+    if let Some(a) = s.attribs[loc].as_mut() {
+        a.enabled = true;
+    } else {
+        s.attribs[loc] = Some(AttribState {
+            buffer_id: 0,
+            size: 0,
+            component: AttribComponent::Float,
+            stride: 0,
+            offset: 0,
+            enabled: true,
+        });
+    }
+    Ok(JsValue::undefined())
+}
+
+// ---------- uniforms ----------
+
+fn webgl_get_uniform_location(
+    this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(state) = state_for(this, ctx) else {
+        return Ok(JsValue::null());
+    };
+    let prog = args.first().and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
+    let name = args
+        .get(1)
+        .map(|v| v.to_string(ctx).map(|s| s.to_std_string_escaped()))
+        .transpose()?
+        .unwrap_or_default();
+    let mut s = state.borrow_mut();
+    let Some(p) = s.programs.get_mut(&prog) else {
+        return Ok(JsValue::null());
+    };
+    if let Some(off) = p.uniform_offsets.get(&name) {
+        return Ok(JsValue::from(*off));
+    }
+    // Reserve 64 bytes (mat4) per uniform — coarse but keeps any
+    // type fit. Real reflection would size per-uniform.
+    let off = p.next_uniform_offset;
+    p.uniform_offsets.insert(name, off);
+    p.next_uniform_offset += 64;
+    Ok(JsValue::from(off))
+}
+
+fn write_uniform_bytes(state: &Rc<RefCell<WebGlState>>, offset: u32, bytes: &[u8]) {
+    let mut s = state.borrow_mut();
+    let Some(prog) = s.current_program else {
+        return;
+    };
+    let buf = s.uniform_buffers.entry(prog).or_default();
+    let end = offset as usize + bytes.len();
+    if buf.len() < end {
+        buf.resize(end, 0);
+    }
+    buf[offset as usize..end].copy_from_slice(bytes);
+}
+
+fn webgl_uniform_1f(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(state) = state_for(this, ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    let off = args.first().and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
+    let v = args.get(1).and_then(|v| v.to_number(ctx).ok()).unwrap_or(0.0) as f32;
+    write_uniform_bytes(&state, off, &v.to_le_bytes());
+    Ok(JsValue::undefined())
+}
+
+fn webgl_uniform_2f(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(state) = state_for(this, ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    let off = args.first().and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
+    let x = args.get(1).and_then(|v| v.to_number(ctx).ok()).unwrap_or(0.0) as f32;
+    let y = args.get(2).and_then(|v| v.to_number(ctx).ok()).unwrap_or(0.0) as f32;
+    let mut bytes = Vec::with_capacity(8);
+    bytes.extend_from_slice(&x.to_le_bytes());
+    bytes.extend_from_slice(&y.to_le_bytes());
+    write_uniform_bytes(&state, off, &bytes);
+    Ok(JsValue::undefined())
+}
+
+fn webgl_uniform_3f(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(state) = state_for(this, ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    let off = args.first().and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
+    let x = args.get(1).and_then(|v| v.to_number(ctx).ok()).unwrap_or(0.0) as f32;
+    let y = args.get(2).and_then(|v| v.to_number(ctx).ok()).unwrap_or(0.0) as f32;
+    let z = args.get(3).and_then(|v| v.to_number(ctx).ok()).unwrap_or(0.0) as f32;
+    let mut bytes = Vec::with_capacity(12);
+    bytes.extend_from_slice(&x.to_le_bytes());
+    bytes.extend_from_slice(&y.to_le_bytes());
+    bytes.extend_from_slice(&z.to_le_bytes());
+    write_uniform_bytes(&state, off, &bytes);
+    Ok(JsValue::undefined())
+}
+
+fn webgl_uniform_4f(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(state) = state_for(this, ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    let off = args.first().and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
+    let x = args.get(1).and_then(|v| v.to_number(ctx).ok()).unwrap_or(0.0) as f32;
+    let y = args.get(2).and_then(|v| v.to_number(ctx).ok()).unwrap_or(0.0) as f32;
+    let z = args.get(3).and_then(|v| v.to_number(ctx).ok()).unwrap_or(0.0) as f32;
+    let w = args.get(4).and_then(|v| v.to_number(ctx).ok()).unwrap_or(0.0) as f32;
+    let mut bytes = Vec::with_capacity(16);
+    bytes.extend_from_slice(&x.to_le_bytes());
+    bytes.extend_from_slice(&y.to_le_bytes());
+    bytes.extend_from_slice(&z.to_le_bytes());
+    bytes.extend_from_slice(&w.to_le_bytes());
+    write_uniform_bytes(&state, off, &bytes);
+    Ok(JsValue::undefined())
+}
+
+fn webgl_uniform_1fv(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(state) = state_for(this, ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    let off = args.first().and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
+    let Some(arr) = args.get(1).and_then(|v| v.as_object()) else {
+        return Ok(JsValue::undefined());
+    };
+    let len = arr
+        .get(js_string!("length"), ctx)
+        .ok()
+        .and_then(|v| v.to_u32(ctx).ok())
+        .unwrap_or(0);
+    let mut bytes = Vec::with_capacity(len as usize * 4);
+    for i in 0..len {
+        let v = arr.get(i, ctx).ok().and_then(|v| v.to_number(ctx).ok()).unwrap_or(0.0) as f32;
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    write_uniform_bytes(&state, off, &bytes);
+    Ok(JsValue::undefined())
+}
+
+fn webgl_uniform_matrix_4fv(
+    this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(state) = state_for(this, ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    let off = args.first().and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
+    let _transpose = args.get(1).map(|v| v.to_boolean()).unwrap_or(false);
+    let Some(arr) = args.get(2).and_then(|v| v.as_object()) else {
+        return Ok(JsValue::undefined());
+    };
+    let len = arr
+        .get(js_string!("length"), ctx)
+        .ok()
+        .and_then(|v| v.to_u32(ctx).ok())
+        .unwrap_or(0);
+    let mut bytes = Vec::with_capacity(len as usize * 4);
+    for i in 0..len {
+        let v = arr.get(i, ctx).ok().and_then(|v| v.to_number(ctx).ok()).unwrap_or(0.0) as f32;
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    write_uniform_bytes(&state, off, &bytes);
+    Ok(JsValue::undefined())
+}
+
+// ---------- textures ----------
+
+fn webgl_create_texture(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(state) = state_for(this, ctx) else {
+        return Ok(JsValue::from(0));
+    };
+    let id = new_handle(&state);
+    state.borrow_mut().textures.insert(
+        id,
+        TextureEntry {
+            width: 0,
+            height: 0,
+            rgba: Vec::new(),
+        },
+    );
+    Ok(JsValue::from(id))
+}
+
+fn webgl_bind_texture(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(state) = state_for(this, ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    let _target = args.first().and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
+    let tex = args.get(1).and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
+    let unit = state.borrow().active_texture_unit;
+    if tex == 0 {
+        state.borrow_mut().bound_textures.remove(&unit);
+    } else {
+        state.borrow_mut().bound_textures.insert(unit, tex);
+    }
+    Ok(JsValue::undefined())
+}
+
+fn webgl_active_texture(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(state) = state_for(this, ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    let unit_enum = args.first().and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0x84C0);
+    // TEXTURE0 = 0x84C0; convert enum to integer unit index.
+    let unit = unit_enum.saturating_sub(0x84C0);
+    state.borrow_mut().active_texture_unit = unit;
+    Ok(JsValue::undefined())
+}
+
+fn webgl_tex_image_2d(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    // texImage2D(target, level, internalformat, width, height, border, format, type, pixels)
+    // OR texImage2D(target, level, internalformat, format, type, source) for HTMLImageElement-style.
+    let Some(state) = state_for(this, ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    // Support only the 9-arg flat-buffer form for the toy.
+    if args.len() < 9 {
+        return Ok(JsValue::undefined());
+    }
+    let _target = args[0].to_u32(ctx).unwrap_or(0);
+    let _level = args[1].to_u32(ctx).unwrap_or(0);
+    let _internal_format = args[2].to_u32(ctx).unwrap_or(0);
+    let width = args[3].to_u32(ctx).unwrap_or(0);
+    let height = args[4].to_u32(ctx).unwrap_or(0);
+    let _border = args[5].to_u32(ctx).unwrap_or(0);
+    let _format = args[6].to_u32(ctx).unwrap_or(0);
+    let _type_ = args[7].to_u32(ctx).unwrap_or(0);
+    let pixels = &args[8];
+    let bytes = extract_typed_array_bytes(pixels, ctx, ElementKind::U8);
+    let unit = state.borrow().active_texture_unit;
+    let Some(tex_id) = state.borrow().bound_textures.get(&unit).copied() else {
+        return Ok(JsValue::undefined());
+    };
+    if let Some(entry) = state.borrow_mut().textures.get_mut(&tex_id) {
+        entry.width = width;
+        entry.height = height;
+        entry.rgba = bytes;
+    }
+    Ok(JsValue::undefined())
+}
+
+// ---------- drawArrays / drawElements ----------
+
 fn webgl_draw_arrays(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let Some(state) = state_for(this, ctx) else {
         return Ok(JsValue::undefined());
     };
-    // drawArrays(mode, first, count)
     let mode = args.first().and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
     if mode != 0x0004 {
-        // Only TRIANGLES wired in toy.
         return Ok(JsValue::undefined());
     }
     let first = args.get(1).and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
@@ -628,12 +963,53 @@ fn webgl_draw_arrays(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
     if count == 0 {
         return Ok(JsValue::undefined());
     }
+    do_draw(&state, this, ctx, first, count, None)
+}
+
+fn webgl_draw_elements(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(state) = state_for(this, ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    let mode = args.first().and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
+    if mode != 0x0004 {
+        return Ok(JsValue::undefined());
+    }
+    let count = args.get(1).and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
+    let ty = args.get(2).and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0x1403);
+    let _offset = args.get(3).and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
+    if count == 0 {
+        return Ok(JsValue::undefined());
+    }
+    let fmt = match ty {
+        // UNSIGNED_INT = 0x1405
+        0x1405 => IndexFormat::Uint32,
+        // UNSIGNED_SHORT = 0x1403 (default)
+        _ => IndexFormat::Uint16,
+    };
+    do_draw(&state, this, ctx, 0, count, Some(fmt))
+}
+
+fn do_draw(
+    state: &Rc<RefCell<WebGlState>>,
+    this: &JsValue,
+    ctx: &mut Context,
+    first: u32,
+    count: u32,
+    index_fmt: Option<IndexFormat>,
+) -> JsResult<JsValue> {
     let Some(node) = node_for(this, ctx) else {
         return Ok(JsValue::undefined());
     };
 
-    // Pull the wgsl + buffer bytes out of the state map.
-    let (vertex_wgsl, fragment_wgsl, vbuf_bytes, clear_color) = {
+    let (
+        vertex_shader,
+        fragment_shader,
+        attribs,
+        uniform_bytes,
+        texture,
+        clear_color,
+        index_bytes,
+    ) = {
         let s = state.borrow();
         let Some(prog_id) = s.current_program else {
             return Ok(JsValue::undefined());
@@ -646,21 +1022,41 @@ fn webgl_draw_arrays(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
         let (Some(vs), Some(fs)) = (vs, fs) else {
             return Ok(JsValue::undefined());
         };
-        let (Some(vs_wgsl), Some(fs_wgsl)) = (vs.wgsl.clone(), fs.wgsl.clone()) else {
+        let (Some(vs_t), Some(fs_t)) = (vs.translated.clone(), fs.translated.clone()) else {
             return Ok(JsValue::undefined());
         };
-        let buf_id = match s.bound_array_buffer {
-            Some(id) => id,
-            None => return Ok(JsValue::undefined()),
+        let mut attribs = Vec::new();
+        for (i, slot) in s.attribs.iter().enumerate() {
+            if let Some(a) = slot {
+                if a.enabled && a.size > 0 {
+                    attribs.push(AttribLayout {
+                        location: i as u32,
+                        buffer_id: a.buffer_id,
+                        size: a.size,
+                        component: a.component,
+                        stride: a.stride,
+                        offset: a.offset,
+                    });
+                }
+            }
+        }
+        let uniform_bytes = s.uniform_buffers.get(&prog_id).cloned().unwrap_or_default();
+        let texture = s
+            .bound_textures
+            .get(&0)
+            .copied()
+            .and_then(|id| s.textures.get(&id))
+            .cloned();
+        let index_bytes = if index_fmt.is_some() {
+            s.bound_element_array_buffer
+                .and_then(|id| s.buffers.get(&id))
+                .cloned()
+        } else {
+            None
         };
-        let bytes = s.buffers.get(&buf_id).cloned().unwrap_or_default();
-        (vs_wgsl, fs_wgsl, bytes, s.clear_color)
+        (vs_t, fs_t, attribs, uniform_bytes, texture, s.clear_color, index_bytes)
     };
-    if vbuf_bytes.is_empty() {
-        return Ok(JsValue::undefined());
-    }
 
-    // Find the canvas pixmap; its dimensions define the render target.
     let dims = super::canvas::JS_CANVAS_SURFACES.with(|slot| -> Option<(u32, u32)> {
         let rc = slot.borrow().as_ref().cloned()?;
         let map = rc.borrow();
@@ -671,13 +1067,10 @@ fn webgl_draw_arrays(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
         return Ok(JsValue::undefined());
     };
 
-    let gpu = ensure_gpu();
-    let Some(gpu) = gpu else {
+    let Some(gpu) = ensure_gpu() else {
         return Ok(JsValue::undefined());
     };
 
-    // Lazily build the per-canvas target once, then reuse for
-    // subsequent draws at the same dimensions.
     let target_dims_changed = state
         .borrow()
         .target
@@ -689,19 +1082,36 @@ fn webgl_draw_arrays(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
         state.borrow_mut().target = Some(t);
     }
 
+    // Clone buffer map so we can pass a stable reference to draw().
+    let buffers: HashMap<u32, Vec<u8>> = state.borrow().buffers.clone();
+    let tex_upload = texture.map(|t| UploadedTexture {
+        width: t.width,
+        height: t.height,
+        rgba: t.rgba,
+    });
+    let index_buffer_view = index_bytes.as_deref().and_then(|b| {
+        index_fmt.map(|f| (f, b))
+    });
+
     let mut rgba = vec![0u8; (width * height * 4) as usize];
     let ok = {
         let s = state.borrow();
         let target = s.target.as_ref().unwrap();
-        webgl_gpu::draw_arrays(
+        webgl_gpu::draw(
             &gpu,
             target,
-            &vertex_wgsl,
-            &fragment_wgsl,
-            &vbuf_bytes,
-            first,
-            count,
-            clear_color,
+            &DrawDesc {
+                vertex_shader: &vertex_shader,
+                fragment_shader: &fragment_shader,
+                attribs: &attribs,
+                buffers: &buffers,
+                uniform_bytes: &uniform_bytes,
+                texture: tex_upload.as_ref(),
+                clear_color,
+                first,
+                count,
+                index_buffer: index_buffer_view,
+            },
             &mut rgba,
         )
     };
@@ -709,7 +1119,6 @@ fn webgl_draw_arrays(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
         return Ok(JsValue::undefined());
     }
 
-    // Copy our rendered pixels into the canvas pixmap.
     super::canvas::JS_CANVAS_SURFACES.with(|slot| {
         let Some(rc) = slot.borrow().as_ref().cloned() else {
             return;
@@ -722,9 +1131,6 @@ fn webgl_draw_arrays(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
     Ok(JsValue::undefined())
 }
 
-/// Return the shared `WebGlGpu`, creating it on first use. Returns
-/// `None` if no usable adapter is available (e.g. CI environment
-/// without a GPU); the draw call falls back to a no-op.
 fn ensure_gpu() -> Option<Rc<WebGlGpu>> {
     JS_WEBGL_GPU.with(|slot| {
         if let Some(g) = slot.borrow().as_ref() {
@@ -755,12 +1161,16 @@ fn webgl_constants() -> Vec<(&'static str, u32)> {
         ("FLOAT", 0x1406),
         ("UNSIGNED_BYTE", 0x1401),
         ("UNSIGNED_SHORT", 0x1403),
+        ("UNSIGNED_INT", 0x1405),
         ("VERTEX_SHADER", 0x8B31),
         ("FRAGMENT_SHADER", 0x8B30),
         ("COMPILE_STATUS", 0x8B81),
         ("LINK_STATUS", 0x8B82),
         ("TEXTURE_2D", 0x0DE1),
         ("TEXTURE0", 0x84C0),
+        ("TEXTURE1", 0x84C1),
+        ("TEXTURE2", 0x84C2),
+        ("TEXTURE3", 0x84C3),
         ("BLEND", 0x0BE2),
         ("CULL_FACE", 0x0B44),
         ("DEPTH_TEST", 0x0B71),

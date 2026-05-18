@@ -371,6 +371,8 @@ impl JsEngine {
         super::wasm::install(&mut ctx);
         super::crypto::install(&mut ctx);
         super::sse::install(&mut ctx);
+        super::abort::install(&mut ctx);
+        super::streams::install(&mut ctx);
 
         let listeners: Rc<RefCell<ListenerMap>> = Rc::new(RefCell::new(HashMap::new()));
         let timers: Rc<RefCell<TimerState>> = Rc::new(RefCell::new(TimerState::default()));
@@ -1720,6 +1722,7 @@ fn js_fetch(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
 
     let mut method = "GET".to_string();
     let mut body: Option<Vec<u8>> = None;
+    let mut signal: Option<JsValue> = None;
     if let Some(init_val) = args.get(1) {
         if let Some(obj) = init_val.as_object() {
             if let Ok(m) = obj.get(js_string!("method"), ctx) {
@@ -1732,6 +1735,23 @@ fn js_fetch(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
                     body = Some(b.to_string(ctx)?.to_std_string_escaped().into_bytes());
                 }
             }
+            if let Ok(s) = obj.get(js_string!("signal"), ctx) {
+                if !s.is_undefined() && !s.is_null() {
+                    signal = Some(s);
+                }
+            }
+        }
+    }
+    // If the caller's AbortSignal is already aborted, reject the
+    // returned promise immediately with the signal's reason.
+    if let Some(sig) = signal.as_ref() {
+        if super::abort::signal_is_aborted(sig, ctx) {
+            let reason = JsValue::from(js_string!("AbortError: fetch aborted"));
+            return Ok(JsPromise::reject(
+                boa_engine::JsError::from_opaque(reason),
+                ctx,
+            )
+            .into());
         }
     }
 
@@ -1798,6 +1818,9 @@ fn make_response_object(
 ) -> boa_engine::JsObject {
     let ok = (200..300).contains(&resp.status);
     let body_str = String::from_utf8_lossy(&resp.body).into_owned();
+    // Build the body ReadableStream first so the ObjectInitializer
+    // doesn't double-borrow ctx.
+    let body_stream = super::streams::body_to_stream(ctx, &resp.body);
 
     ObjectInitializer::new(ctx)
         .property(js_string!("ok"), JsValue::from(ok), Attribute::READONLY)
@@ -1820,6 +1843,16 @@ fn make_response_object(
             js_string!("__body"),
             JsValue::from(js_string!(body_str)),
             Attribute::READONLY,
+        )
+        .property(
+            js_string!("body"),
+            body_stream,
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("bodyUsed"),
+            JsValue::from(false),
+            Attribute::all(),
         )
         .function(
             NativeFunction::from_fn_ptr(response_text),

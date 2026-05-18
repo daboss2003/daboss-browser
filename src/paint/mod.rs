@@ -180,7 +180,92 @@ impl Painter {
                 return;
             }
         }
+        // Non-trivial 2D transform (rotate / scale / skew / matrix /
+        // a 3D form we flattened). Translation-only transforms travel
+        // the fast `transform_translate` path on `PaintCtx`.
+        if let Some(t) = style.transform.as_ref().filter(|t| !t.is_pure_translate()) {
+            if let Some(b) = tree.get(node) {
+                self.paint_subtree_with_transform(
+                    dom, styles, tree, images, node, parent_ctx, b.rect, *t,
+                );
+                return;
+            }
+        }
         self.paint_subtree_inner(dom, styles, tree, images, node, parent_ctx)
+    }
+
+    /// Paint a transformed subtree by redirecting its drawing into an
+    /// offscreen pixmap, then `draw_pixmap`-ing it back with a matrix
+    /// that rotates/scales/skews around the element's center
+    /// (CSS `transform-origin: 50% 50%` default).
+    #[allow(clippy::too_many_arguments)]
+    fn paint_subtree_with_transform(
+        &mut self,
+        dom: &Dom,
+        styles: &StyleTree,
+        tree: &BoxTree,
+        images: &ImageCache,
+        node: NodeId,
+        parent_ctx: PaintCtx,
+        box_rect: Rect,
+        transform: crate::css::Transform2D,
+    ) {
+        let style = styles.get(node);
+        let ctx = parent_ctx.with(style);
+        // Round to integer pixel dims to keep the offscreen tight.
+        // Widen by a small margin so rotated/skewed edges aren't
+        // clipped at the corners.
+        let pad = 8u32;
+        let off_w = (box_rect.width.ceil() as u32).max(1) + pad * 2;
+        let off_h = (box_rect.height.ceil() as u32).max(1) + pad * 2;
+        let Some(offscreen) = Pixmap::new(off_w, off_h) else {
+            self.paint_subtree_inner(dom, styles, tree, images, node, parent_ctx);
+            return;
+        };
+        let saved = std::mem::replace(&mut self.pixmap, offscreen);
+        let inner_ctx = PaintCtx {
+            alpha: parent_ctx.alpha,
+            tx: -box_rect.x + pad as f32,
+            ty: -box_rect.y + pad as f32,
+        };
+        self.paint_subtree_inner(dom, styles, tree, images, node, inner_ctx);
+        let offscreen = std::mem::replace(&mut self.pixmap, saved);
+
+        // Compose the screen-space matrix:
+        //   T(box_origin + pre-existing-translate) ∘
+        //   T(+cx, +cy) ∘ M ∘ T(-cx, -cy) ∘ T(-pad, -pad)
+        // i.e. translate so the box's pre-transform center sits at
+        // the origin, apply the matrix, then translate back out to
+        // the final on-screen position.
+        let cx = box_rect.width / 2.0 + pad as f32;
+        let cy = box_rect.height / 2.0 + pad as f32;
+        let screen_x = box_rect.x + ctx.tx;
+        let screen_y = box_rect.y + ctx.ty;
+        // tiny_skia's `Transform` is row-major in the same order as
+        // our `Transform2D`: sx, ky, kx, sy, tx, ty (from_row).
+        let m = Transform::from_row(
+            transform.sx,
+            transform.kx,
+            transform.ky,
+            transform.sy,
+            transform.tx,
+            transform.ty,
+        );
+        // Build: T(screen + center) ∘ M ∘ T(-center)
+        let pre = Transform::from_translate(-cx, -cy);
+        let post = Transform::from_translate(screen_x + cx, screen_y + cy);
+        let final_xform = post.pre_concat(m).pre_concat(pre);
+
+        let mut paint = PixmapPaint::default();
+        paint.opacity = ctx.alpha;
+        self.pixmap.draw_pixmap(
+            0,
+            0,
+            offscreen.as_ref(),
+            &paint,
+            final_xform,
+            None,
+        );
     }
 
     fn paint_subtree_inner(

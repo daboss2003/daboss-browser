@@ -12,8 +12,8 @@ pub use types::{
     BoxSizing, Color, ComputedStyle, Dimension, Direction, Display, FilterFunction,
     FlexDirection, FlexWrap, FontStyle, GridAutoFlow, GridLine, GridPlacement, GridTrack,
     JustifyContent, MediaCondition, MediaQuery, Overflow, Position, Selector, Stylesheet,
-    TableLayout, TextAlign, TextDecoration, TextOverflow, TimingFunction, TransitionRule,
-    Viewport, WhiteSpace,
+    TableLayout, TextAlign, TextDecoration, TextOverflow, TimingFunction, Transform2D,
+    TransitionRule, Viewport, WhiteSpace,
 };
 
 use crate::dom::{Dom, NodeId, NodeKind};

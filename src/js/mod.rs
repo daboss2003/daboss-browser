@@ -41,6 +41,7 @@ use boa_engine::{
 
 use crate::dom::{Dom, NodeId, NodeKind};
 
+pub(crate) mod abort;
 pub(crate) mod audio_ctx;
 pub(crate) mod canvas;
 pub(crate) mod crypto;
@@ -52,6 +53,7 @@ pub(crate) mod observers;
 pub(crate) mod rtc;
 pub(crate) mod storage;
 pub(crate) mod sse;
+pub(crate) mod streams;
 pub(crate) mod sw;
 pub(crate) mod wasm;
 pub(crate) mod web_classes;

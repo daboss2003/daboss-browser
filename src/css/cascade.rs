@@ -1635,7 +1635,80 @@ fn transform_matrix_from(
                     continue;
                 }
             }
-            // 3D variants and unknown functions: best-effort skip.
+            // 3D variants: approximated against the 2D plane (no
+            // perspective projection). `rotateZ` is a true 2D rotate;
+            // `rotateX`/`rotateY` flatten to scale-along-axis using
+            // `cos(angle)`; `rotate3d(x, y, z, a)` picks one of those
+            // depending on which axis dominates.
+            "rotatex" => {
+                let raw = args.first().and_then(as_angle_rad).unwrap_or(0.0);
+                let a = angle_to_radians(raw, args.first());
+                Transform2D::scale(1.0, a.cos())
+            }
+            "rotatey" => {
+                let raw = args.first().and_then(as_angle_rad).unwrap_or(0.0);
+                let a = angle_to_radians(raw, args.first());
+                Transform2D::scale(a.cos(), 1.0)
+            }
+            "rotate3d" => {
+                let x = args.first().and_then(as_number).unwrap_or(0.0);
+                let y = args.get(1).and_then(as_number).unwrap_or(0.0);
+                let z = args.get(2).and_then(as_number).unwrap_or(0.0);
+                let raw = args.get(3).and_then(as_angle_rad).unwrap_or(0.0);
+                let a = angle_to_radians(raw, args.get(3));
+                let ax = x.abs();
+                let ay = y.abs();
+                let az = z.abs();
+                if az >= ax && az >= ay {
+                    Transform2D::rotate(a * z.signum())
+                } else if ax >= ay {
+                    Transform2D::scale(1.0, a.cos())
+                } else {
+                    Transform2D::scale(a.cos(), 1.0)
+                }
+            }
+            "translate3d" => {
+                // Drop the z component; xy translate is well-defined.
+                Transform2D::translate(
+                    args.first().map(resolve_len).unwrap_or(0.0),
+                    args.get(1).map(resolve_len).unwrap_or(0.0),
+                )
+            }
+            "scale3d" => {
+                // Drop the z scale; xy is well-defined.
+                let a = args.first().and_then(as_number).unwrap_or(1.0);
+                let b = args.get(1).and_then(as_number).unwrap_or(1.0);
+                Transform2D::scale(a, b)
+            }
+            "matrix3d" => {
+                // 4x4 matrix in column-major order. Project onto 2D
+                // by taking m11/m12/m21/m22 (the upper-left of the
+                // rotation/scale block) plus m41/m42 (translation).
+                if args.len() >= 16 {
+                    let nums: Vec<f32> = args.iter().filter_map(as_number).collect();
+                    if nums.len() >= 16 {
+                        Transform2D {
+                            sx: nums[0],
+                            kx: nums[1],
+                            ky: nums[4],
+                            sy: nums[5],
+                            tx: nums[12],
+                            ty: nums[13],
+                        }
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+            "perspective" => {
+                // Pure perspective is a viewing transform; with no 3D
+                // pipeline it's identity. Skip silently so a
+                // `perspective(800px) rotateY(30deg)` chain still
+                // contributes its rotateY component.
+                continue;
+            }
             _ => continue,
         };
         composed = composed.then(&step);

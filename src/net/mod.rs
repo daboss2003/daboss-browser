@@ -5,6 +5,7 @@ mod csp;
 mod dns;
 mod error;
 mod h2c;
+mod h3c;
 mod http;
 pub(crate) mod transport;
 
@@ -87,6 +88,11 @@ pub struct Client {
     /// Hosts known to prefer HTTP/1.1 (we tried h2 ALPN and the server
     /// negotiated http/1.1 or refused). Keyed by `(host_lower, port)`.
     h2_blacklist: RefCell<HashSet<(String, u16)>>,
+    /// Hosts that refused our HTTP/3 attempt — or for which QUIC is
+    /// blocked locally. Same shape / lifetime as `h2_blacklist`. We
+    /// only try h3 once per host before falling back permanently for
+    /// the lifetime of the client.
+    h3_blacklist: RefCell<HashSet<(String, u16)>>,
 }
 
 impl Default for Client {
@@ -110,6 +116,7 @@ impl Client {
             cache: RefCell::new(cache::HttpCache::new()),
             pool: RefCell::new(std::collections::HashMap::new()),
             h2_blacklist: RefCell::new(HashSet::new()),
+            h3_blacklist: RefCell::new(HashSet::new()),
         }
     }
 
@@ -386,13 +393,48 @@ impl Client {
             }
         }
 
-        // Try HTTP/2 first for HTTPS hosts we haven't yet seen reject
-        // the `h2` ALPN. Falls back transparently to the HTTP/1.1
-        // keep-alive path on negotiation failure.
+        // Try HTTP/3 → HTTP/2 → HTTP/1.1 in order for HTTPS hosts.
+        // Each tier blacklists the host on failure for the rest of
+        // the client's lifetime so subsequent requests skip straight
+        // to whichever protocol the server actually speaks.
         let pool_key = (host.to_ascii_lowercase(), port, use_tls);
         let h2_key = (host.to_ascii_lowercase(), port);
-        let response = if use_tls && !self.h2_blacklist.borrow().contains(&h2_key) {
-            match h2c::request_h2(
+        let h3_key = (host.to_ascii_lowercase(), port);
+
+        // 1) HTTP/3 over QUIC.
+        let h3_response = if use_tls && !self.h3_blacklist.borrow().contains(&h3_key) {
+            match h3c::request_h3(
+                &self.tls,
+                &host,
+                port,
+                &request.method,
+                &request.path,
+                &request.headers,
+                request.body.clone(),
+                self.connect_timeout,
+                self.read_timeout,
+                self.max_response_bytes,
+            ) {
+                h3c::H3Outcome::Ok(resp) => Some(resp),
+                h3c::H3Outcome::Fallback => {
+                    self.h3_blacklist.borrow_mut().insert(h3_key.clone());
+                    None
+                }
+                h3c::H3Outcome::Err(e) => {
+                    tracing::debug!(?e, "h3 request failed; falling back");
+                    self.h3_blacklist.borrow_mut().insert(h3_key.clone());
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // 2) HTTP/2 if h3 didn't take.
+        let response = if let Some(r) = h3_response {
+            r
+        } else if use_tls && !self.h2_blacklist.borrow().contains(&h2_key) {
+            let h2_response = match h2c::request_h2(
                 &self.tls,
                 &host,
                 port,
@@ -414,13 +456,14 @@ impl Client {
                     self.h2_blacklist.borrow_mut().insert(h2_key.clone());
                     None
                 }
+            };
+            match h2_response {
+                Some(r) => r,
+                None => self.send_via_pool(&pool_key, &host, port, use_tls, &request)?,
             }
         } else {
-            None
-        };
-        let response = match response {
-            Some(r) => r,
-            None => self.send_via_pool(&pool_key, &host, port, use_tls, &request)?,
+            // 3) Plain HTTP/1.1.
+            self.send_via_pool(&pool_key, &host, port, use_tls, &request)?
         };
 
         // Ingest any Set-Cookie headers before deciding whether to follow

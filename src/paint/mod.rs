@@ -35,6 +35,38 @@ use crate::css::{
 use crate::dom::{Dom, NodeId, NodeKind};
 use crate::layout::{BoxTree, ImageCache, ImageInfo, ImageSlot, LayoutBox, PseudoKind, Rect};
 
+/// View of a single capture frame the painter wants to draw. Lets
+/// `paint_video` treat camera and ffmpeg-decoded frames uniformly.
+struct CaptureFrameView {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
+/// Pull the latest camera frame for `node` if `<video>.srcObject` was
+/// bound to a `getUserMedia` stream. Returns `None` if either the
+/// per-paint thread-locals aren't installed or the element has no
+/// capture binding.
+fn capture_frame_for_node(node: NodeId) -> Option<CaptureFrameView> {
+    let idx = PAINT_CAPTURE_BINDINGS.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|rc| rc.borrow().get(&node).copied())
+    })?;
+    PAINT_CAPTURES.with(|slot| {
+        let rc = slot.borrow().as_ref().cloned()?;
+        let reg = rc.borrow();
+        let stream = reg.get(idx)?.as_ref()?;
+        let guard = stream.latest_frame.lock().ok()?;
+        let frame = guard.as_ref()?;
+        Some(CaptureFrameView {
+            width: frame.width,
+            height: frame.height,
+            rgba: frame.rgba.clone(),
+        })
+    })
+}
+
 pub fn paint(
     dom: &Dom,
     styles: &StyleTree,
@@ -62,6 +94,19 @@ thread_local! {
     /// box rect.
     pub static PAINT_VIDEO_ELEMENTS:
         std::cell::RefCell<Option<crate::js::VideoElements>> =
+        const { std::cell::RefCell::new(None) };
+
+    /// Live `getUserMedia` capture registry. Set per-paint so the
+    /// painter can pull camera frames for `<video>` elements whose
+    /// `srcObject` was assigned a MediaStream.
+    pub static PAINT_CAPTURES:
+        std::cell::RefCell<Option<crate::js::media::CaptureRegistry>> =
+        const { std::cell::RefCell::new(None) };
+
+    /// Per-element `srcObject` → capture-index bindings. Paired with
+    /// `PAINT_CAPTURES` above to resolve a node to a live camera frame.
+    pub static PAINT_CAPTURE_BINDINGS:
+        std::cell::RefCell<Option<crate::js::media::CaptureBindings>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -465,12 +510,25 @@ impl Painter {
     /// box rect. Pulls from `PAINT_VIDEO_ELEMENTS`; falls back to a
     /// no-op when no decoder exists yet (loading state).
     fn paint_video(&mut self, dest: Rect, node: NodeId, ctx: PaintCtx) {
-        let Some(frame) = PAINT_VIDEO_ELEMENTS.with(|slot| {
-            let rc = slot.borrow().as_ref().cloned()?;
-            let map = rc.borrow();
-            map.get(&node).and_then(|v| v.current_frame())
-        }) else {
-            return;
+        // 1) `<video>.srcObject = stream` path — pull the latest
+        // camera frame from the capture registry.
+        let camera_frame = capture_frame_for_node(node);
+        let frame = match camera_frame {
+            Some(f) => f,
+            None => {
+                let Some(f) = PAINT_VIDEO_ELEMENTS.with(|slot| {
+                    let rc = slot.borrow().as_ref().cloned()?;
+                    let map = rc.borrow();
+                    map.get(&node).and_then(|v| v.current_frame())
+                }) else {
+                    return;
+                };
+                CaptureFrameView {
+                    width: f.width,
+                    height: f.height,
+                    rgba: f.rgba,
+                }
+            }
         };
         if frame.width == 0 || frame.height == 0 {
             return;
@@ -478,8 +536,9 @@ impl Painter {
         let Some(mut src) = Pixmap::new(frame.width, frame.height) else {
             return;
         };
-        // ffmpeg emits straight (non-premultiplied) RGBA; premultiply
-        // before draw_pixmap to match the rest of our paint output.
+        // ffmpeg / nokhwa emit straight (non-premultiplied) RGBA;
+        // premultiply before draw_pixmap to match the rest of our
+        // paint output.
         let data = src.data_mut();
         for (i, chunk) in frame.rgba.chunks_exact(4).enumerate() {
             let r = chunk[0];

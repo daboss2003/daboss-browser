@@ -1,16 +1,15 @@
-//! `navigator.mediaDevices.getUserMedia` (toy).
+//! `navigator.mediaDevices.getUserMedia` backed by `nokhwa`
+//! (camera) + `cpal` input (microphone).
 //!
-//! Exposes the JS surface scripts probe for: `getUserMedia` returns a
-//! Promise. The toy resolves it with a `MediaStream` that contains no
-//! real tracks — equivalent to the user granting permission but the
-//! hardware enumerating empty. Pages don't crash on the API call;
-//! demos that actually exercise the video frames just get nothing.
-//!
-//! Real camera/mic capture requires platform-specific crates
-//! (`nokhwa` for cameras, cpal capture mode for mic) plus per-frame
-//! delivery into a pixmap pipeline. That's a focused follow-up — the
-//! API contract here is in place so a Service Worker or WebRTC peer
-//! can already construct streams without errors at the JS layer.
+//! The constructor opens whichever hardware tracks the constraints
+//! ask for, then hands JS a `MediaStream` whose `__capture_idx`
+//! identifies a `CaptureStream` in a per-engine registry. Paint
+//! reads the live frame from that registry when a `<video>` element
+//! has `srcObject` set to the stream.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 
 use boa_engine::{
     js_string,
@@ -18,6 +17,22 @@ use boa_engine::{
     property::Attribute,
     Context, JsResult, JsValue, NativeFunction,
 };
+
+use crate::capture::CaptureStream;
+use crate::dom::NodeId;
+
+pub type CaptureRegistry = Rc<RefCell<Vec<Option<CaptureStream>>>>;
+/// Maps a `<video>` (or `<audio>`) element to the capture index its
+/// `srcObject` was set to. Paint consults this to pull live camera
+/// frames from the [`CaptureRegistry`].
+pub type CaptureBindings = Rc<RefCell<HashMap<NodeId, usize>>>;
+
+thread_local! {
+    pub(crate) static JS_CAPTURE_REGISTRY: RefCell<Option<CaptureRegistry>> =
+        const { RefCell::new(None) };
+    pub(crate) static JS_CAPTURE_BINDINGS: RefCell<Option<CaptureBindings>> =
+        const { RefCell::new(None) };
+}
 
 pub fn install(ctx: &mut Context) {
     let realm = ctx.realm().clone();
@@ -59,8 +74,48 @@ pub fn install(ctx: &mut Context) {
     }
 }
 
-fn get_user_media(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let stream = make_media_stream(ctx);
+fn get_user_media(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    // Parse the constraints — `{video: true, audio: true}` is the
+    // common form. Anything truthy on either axis turns the device
+    // on; explicit `false` skips it.
+    let (want_video, want_audio) = match args.first() {
+        Some(v) => {
+            let obj = v.as_object();
+            let mut truthy = |name| -> bool {
+                obj.as_ref()
+                    .and_then(|o| o.get(js_string!(name), ctx).ok())
+                    .map(|val| val.to_boolean())
+                    .unwrap_or(false)
+            };
+            (truthy("video"), truthy("audio"))
+        }
+        None => (true, false),
+    };
+    let stream_idx = match CaptureStream::open(want_video, want_audio) {
+        Some(s) => {
+            JS_CAPTURE_REGISTRY.with(|slot| -> Option<usize> {
+                let rc = slot.borrow().as_ref().cloned()?;
+                let mut reg = rc.borrow_mut();
+                reg.push(Some(s));
+                Some(reg.len() - 1)
+            })
+        }
+        None => None,
+    };
+    let stream = match stream_idx {
+        Some(idx) => make_media_stream(ctx, Some(idx as u32)),
+        None => {
+            return Ok(JsPromise::reject(
+                boa_engine::JsError::from_opaque(
+                    JsValue::from(js_string!(
+                        "NotAllowedError: getUserMedia hardware unavailable"
+                    )),
+                ),
+                ctx,
+            )
+            .into());
+        }
+    };
     Ok(JsPromise::resolve(stream, ctx).into())
 }
 
@@ -69,7 +124,7 @@ fn enumerate_devices(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<
     Ok(JsPromise::resolve(JsValue::from(arr), ctx).into())
 }
 
-fn make_media_stream(ctx: &mut Context) -> JsValue {
+fn make_media_stream(ctx: &mut Context, capture_idx: Option<u32>) -> JsValue {
     let id = format!(
         "stream-{}",
         std::time::SystemTime::now()
@@ -88,6 +143,13 @@ fn make_media_stream(ctx: &mut Context) -> JsValue {
         JsValue::from(js_string!(id)),
         Attribute::READONLY,
     );
+    if let Some(idx) = capture_idx {
+        b.property(
+            js_string!("__capture_idx"),
+            JsValue::from(idx),
+            Attribute::READONLY,
+        );
+    }
     b.function(
         NativeFunction::from_fn_ptr(stream_empty_array),
         js_string!("getTracks"),

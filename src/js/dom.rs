@@ -295,6 +295,8 @@ pub(crate) fn make_element_handle(ctx: &mut Context, id: NodeId) -> JsObject {
     let class_list_get = getter(element_get_class_list);
     let style_get = getter(element_get_style);
     let dataset_get = getter(element_get_dataset);
+    let src_object_get = getter(element_get_src_object);
+    let src_object_set = getter(element_set_src_object);
 
     init.accessor(
         js_string!("innerHTML"),
@@ -326,7 +328,82 @@ pub(crate) fn make_element_handle(ctx: &mut Context, id: NodeId) -> JsObject {
         None,
         Attribute::ENUMERABLE,
     );
+    init.accessor(
+        js_string!("srcObject"),
+        Some(src_object_get),
+        Some(src_object_set),
+        Attribute::ENUMERABLE,
+    );
     init.build()
+}
+
+/// `<video>.srcObject = stream` — read the MediaStream's
+/// `__capture_idx` and remember which capture this element renders.
+fn element_set_src_object(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(id) = read_self_node_id(this, ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    let Some(stream_val) = args.first() else {
+        return Ok(JsValue::undefined());
+    };
+    // `null` clears any binding.
+    if stream_val.is_null() || stream_val.is_undefined() {
+        super::media::JS_CAPTURE_BINDINGS.with(|slot| {
+            if let Some(rc) = slot.borrow().as_ref() {
+                rc.borrow_mut().remove(&id);
+            }
+        });
+        return Ok(JsValue::undefined());
+    }
+    let Some(obj) = stream_val.as_object() else {
+        return Ok(JsValue::undefined());
+    };
+    let idx_val = obj.get(js_string!("__capture_idx"), ctx).ok();
+    let Some(idx_value) = idx_val else {
+        return Ok(JsValue::undefined());
+    };
+    let idx = match idx_value.to_u32(ctx) {
+        Ok(n) => n as usize,
+        Err(_) => return Ok(JsValue::undefined()),
+    };
+    super::media::JS_CAPTURE_BINDINGS.with(|slot| {
+        if let Some(rc) = slot.borrow().as_ref() {
+            rc.borrow_mut().insert(id, idx);
+        }
+    });
+    Ok(JsValue::undefined())
+}
+
+/// `<video>.srcObject` getter — for now reflects whether a binding
+/// exists. Real spec returns the stream object; we synthesise a
+/// minimal handle so JS can compare against `null`.
+fn element_get_src_object(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(id) = read_self_node_id(this, ctx) else {
+        return Ok(JsValue::null());
+    };
+    let bound = super::media::JS_CAPTURE_BINDINGS.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|rc| rc.borrow().get(&id).copied())
+    });
+    match bound {
+        Some(idx) => {
+            let obj = ObjectInitializer::new(ctx)
+                .property(
+                    js_string!("__capture_idx"),
+                    JsValue::from(idx as u32),
+                    Attribute::READONLY,
+                )
+                .property(
+                    js_string!("active"),
+                    JsValue::from(true),
+                    Attribute::READONLY,
+                )
+                .build();
+            Ok(JsValue::from(obj))
+        }
+        None => Ok(JsValue::null()),
+    }
 }
 
 // ---------- DOM tree helpers (Rust-side) ----------

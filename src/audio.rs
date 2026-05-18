@@ -381,6 +381,39 @@ impl AudioElement {
             s.loop_playback = on;
         }
     }
+
+    /// Hand out a lightweight clock the video decoder uses to pace
+    /// frame presentation. Reads the same `cursor` cpal advances on
+    /// the output thread, so playback drift on either side stays in
+    /// sync to within a single output buffer.
+    pub fn clock(&self) -> AudioClock {
+        AudioClock {
+            state: self.state.clone(),
+        }
+    }
+}
+
+/// Wall-clock view of an [`AudioElement`]. Cheap to clone and read
+/// from any thread; the video decoder takes one and queries it once
+/// per frame to decide whether to present, sleep, or drop.
+#[derive(Clone)]
+pub struct AudioClock {
+    state: Arc<Mutex<PlaybackState>>,
+}
+
+impl AudioClock {
+    /// Current decoded-audio playhead in seconds, or `None` if audio
+    /// is paused / not yet started. The video decoder falls back to a
+    /// wall clock when we return `None`.
+    pub fn now_secs(&self) -> Option<f64> {
+        let s = self.state.lock().ok()?;
+        if !s.playing {
+            return None;
+        }
+        let channels = s.channels.max(1) as f64;
+        let rate = s.sample_rate.max(1) as f64;
+        Some(s.cursor as f64 / (rate * channels))
+    }
 }
 
 /// Fill the device's output buffer by pulling samples from the

@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
 mod audio;
+mod capture;
 mod css;
 mod dom;
 mod gpu;
+mod webgl_gpu;
 mod html;
 mod js;
 mod layout;
@@ -555,6 +557,12 @@ impl Browser {
         paint::PAINT_VIDEO_ELEMENTS.with(|slot| {
             *slot.borrow_mut() = Some(js_engine.video_elements());
         });
+        paint::PAINT_CAPTURES.with(|slot| {
+            *slot.borrow_mut() = Some(js_engine.captures());
+        });
+        paint::PAINT_CAPTURE_BINDINGS.with(|slot| {
+            *slot.borrow_mut() = Some(js_engine.capture_bindings());
+        });
         let painted = paint::paint(
             &dom,
             &style_tree,
@@ -567,6 +575,12 @@ impl Browser {
             slot.borrow_mut().take();
         });
         paint::PAINT_VIDEO_ELEMENTS.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        paint::PAINT_CAPTURES.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        paint::PAINT_CAPTURE_BINDINGS.with(|slot| {
             slot.borrow_mut().take();
         });
         let mut pixmap = match painted {
@@ -882,6 +896,12 @@ impl Browser {
         paint::PAINT_VIDEO_ELEMENTS.with(|slot| {
             *slot.borrow_mut() = Some(page.js.video_elements());
         });
+        paint::PAINT_CAPTURES.with(|slot| {
+            *slot.borrow_mut() = Some(page.js.captures());
+        });
+        paint::PAINT_CAPTURE_BINDINGS.with(|slot| {
+            *slot.borrow_mut() = Some(page.js.capture_bindings());
+        });
         let painted = paint::paint(
             &page.dom,
             &page.styles,
@@ -894,6 +914,12 @@ impl Browser {
             slot.borrow_mut().take();
         });
         paint::PAINT_VIDEO_ELEMENTS.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        paint::PAINT_CAPTURES.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        paint::PAINT_CAPTURE_BINDINGS.with(|slot| {
             slot.borrow_mut().take();
         });
         if let Some(mut pixmap) = painted {
@@ -1190,6 +1216,12 @@ impl Browser {
         paint::PAINT_VIDEO_ELEMENTS.with(|slot| {
             *slot.borrow_mut() = Some(page.js.video_elements());
         });
+        paint::PAINT_CAPTURES.with(|slot| {
+            *slot.borrow_mut() = Some(page.js.captures());
+        });
+        paint::PAINT_CAPTURE_BINDINGS.with(|slot| {
+            *slot.borrow_mut() = Some(page.js.capture_bindings());
+        });
         let painted = paint::paint(
             &page.dom,
             &page.styles,
@@ -1202,6 +1234,12 @@ impl Browser {
             slot.borrow_mut().take();
         });
         paint::PAINT_VIDEO_ELEMENTS.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        paint::PAINT_CAPTURES.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        paint::PAINT_CAPTURE_BINDINGS.with(|slot| {
             slot.borrow_mut().take();
         });
         if let Some(mut pixmap) = painted {

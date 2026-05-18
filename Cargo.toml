@@ -41,9 +41,11 @@ bytes = "1"
 # Video decode rides the system `ffmpeg` binary via std::process,
 # no crate needed beyond the FFmpeg CLI itself being on PATH.
 wgpu = { version = "22", features = ["wgsl"] }
+naga = { version = "22", features = ["glsl-in", "wgsl-out"] }
 pollster = "0.3"
 webrtc = "0.13"
 tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "handshake"] }
+nokhwa = { version = "0.10", default-features = false, features = ["input-native", "input-avfoundation", "output-threaded"] }
 
 [profile.release]
 lto = "thin"

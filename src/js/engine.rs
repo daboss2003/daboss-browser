@@ -237,6 +237,13 @@ pub struct JsEngine {
     /// Cache API storage shared across the page (per-origin in
     /// future).
     caches: super::sw::Caches,
+    /// Live `getUserMedia` capture streams. Each entry owns the
+    /// underlying camera + mic handles.
+    captures: super::media::CaptureRegistry,
+    /// `<video>`/`<audio>` element → capture index map for elements
+    /// whose `srcObject` was assigned a MediaStream. Paint reads this
+    /// to pull camera frames.
+    capture_bindings: super::media::CaptureBindings,
 }
 
 /// Outcome of an event dispatch — informs the caller whether to skip the
@@ -356,6 +363,7 @@ impl JsEngine {
         super::idb::install(&mut ctx);
         super::worker::install(&mut ctx);
         super::media::install(&mut ctx);
+        super::audio_ctx::install(&mut ctx);
         super::sw::install(&mut ctx);
 
         let listeners: Rc<RefCell<ListenerMap>> = Rc::new(RefCell::new(HashMap::new()));
@@ -399,6 +407,9 @@ impl JsEngine {
             Rc::new(RefCell::new(std::collections::HashMap::new()));
         let caches: super::sw::Caches =
             Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let captures: super::media::CaptureRegistry = Rc::new(RefCell::new(Vec::new()));
+        let capture_bindings: super::media::CaptureBindings =
+            Rc::new(RefCell::new(std::collections::HashMap::new()));
         let mut engine = JsEngine {
             ctx,
             listeners,
@@ -425,6 +436,8 @@ impl JsEngine {
             workers,
             webgl_contexts,
             caches,
+            captures,
+            capture_bindings,
         };
         if allow_inline_scripts {
             engine.run_initial_scripts(dom);
@@ -455,6 +468,18 @@ impl JsEngine {
     /// Shared handle to the page's `<video>` instances.
     pub fn video_elements(&self) -> super::VideoElements {
         self.video_elements.clone()
+    }
+
+    /// Shared handle to the live `getUserMedia` capture registry.
+    pub fn captures(&self) -> super::media::CaptureRegistry {
+        self.captures.clone()
+    }
+
+    /// Shared handle to the per-element `srcObject` → capture-index
+    /// map. Paint consults this to pull camera frames for `<video>`
+    /// elements whose `srcObject` was assigned a MediaStream.
+    pub fn capture_bindings(&self) -> super::media::CaptureBindings {
+        self.capture_bindings.clone()
     }
 
     /// Replace the per-element computed-style snapshot consumed by
@@ -817,6 +842,12 @@ impl JsEngine {
         super::sw::JS_CACHES.with(|slot| {
             *slot.borrow_mut() = Some(self.caches.clone());
         });
+        super::media::JS_CAPTURE_REGISTRY.with(|slot| {
+            *slot.borrow_mut() = Some(self.captures.clone());
+        });
+        super::media::JS_CAPTURE_BINDINGS.with(|slot| {
+            *slot.borrow_mut() = Some(self.capture_bindings.clone());
+        });
         (dom_rc, listeners_rc)
     }
 
@@ -866,6 +897,12 @@ impl JsEngine {
             slot.borrow_mut().take();
         });
         super::sw::JS_CACHES.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        super::media::JS_CAPTURE_REGISTRY.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        super::media::JS_CAPTURE_BINDINGS.with(|slot| {
             slot.borrow_mut().take();
         });
         JS_NAV_REQUESTS.with(|slot| {
@@ -1679,6 +1716,26 @@ fn js_fetch(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
                 }
             }
         }
+    }
+
+    // Service Worker fetch interception: if any SW has registered a
+    // `fetch` handler, give it first dibs. If it calls
+    // `event.respondWith(...)` we synthesise a Response from its body
+    // and short-circuit the network round-trip.
+    if let Some(body_str) =
+        super::sw::try_intercept_fetch(ctx, target_url.as_str(), &method)
+    {
+        let resp = net::Response {
+            status: 200,
+            reason: "OK".to_string(),
+            body: body_str.into_bytes(),
+            headers: Vec::new(),
+        };
+        return Ok(JsPromise::resolve(
+            JsValue::from(make_response_object(ctx, target_url.as_str(), resp)),
+            ctx,
+        )
+        .into());
     }
 
     let response = JS_FETCH_CLIENT.with(|slot| -> Option<net::Result<net::Response>> {

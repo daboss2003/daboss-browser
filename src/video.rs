@@ -59,6 +59,7 @@ impl VideoElement {
     pub fn from_bytes(bytes: Vec<u8>, autoplay: bool, loop_playback: bool) -> Option<Self> {
         let path = write_tempfile(&bytes).ok()?;
         let (intrinsic_width, intrinsic_height) = probe_dimensions(&path).unwrap_or((640, 360));
+        let fps = probe_frame_rate(&path).unwrap_or(30.0).max(1.0);
 
         let mut cmd = Command::new("ffmpeg");
         if loop_playback {
@@ -97,6 +98,13 @@ impl VideoElement {
         let stop = Arc::new(AtomicBool::new(false));
         let child_handle = Arc::new(Mutex::new(Some(child)));
 
+        // Parallel-decode the audio track to PCM via a second ffmpeg
+        // pass and pipe it through cpal. The audio's PlaybackState
+        // doubles as our master clock: video frame presentation paces
+        // against `AudioClock::now_secs()` below.
+        let audio_element = decode_audio_via_ffmpeg(&path, autoplay, loop_playback);
+        let audio_clock = audio_element.as_ref().map(|a| a.clock());
+
         let state_for_thread = state.clone();
         let stop_for_thread = stop.clone();
         let child_for_thread = child_handle.clone();
@@ -106,9 +114,14 @@ impl VideoElement {
         let decoder_thread = std::thread::spawn(move || {
             let mut reader = stdout;
             let mut buf = vec![0u8; frame_bytes];
-            // Pace the producer at ~30 fps unless the upstream is
-            // faster. ffmpeg streams at decode rate by default; we
-            // don't model presentation time.
+            let mut frame_index: u64 = 0;
+            let video_start = std::time::Instant::now();
+            // ~5ms / 200ms tolerance windows: tight enough to keep lip
+            // sync, loose enough that a single jittery sleep doesn't
+            // trigger spurious frame drops.
+            const AHEAD_TOLERANCE_S: f64 = 0.005;
+            const BEHIND_DROP_THRESHOLD_S: f64 = 0.200;
+
             loop {
                 if stop_for_thread.load(Ordering::Relaxed) {
                     break;
@@ -123,6 +136,39 @@ impl VideoElement {
                 }
                 match reader.read_exact(&mut buf) {
                     Ok(()) => {
+                        // Compute this frame's presentation time
+                        // against the master clock (audio if running,
+                        // wall clock otherwise). Sleep if early; drop
+                        // (without writing the frame) if very late.
+                        let video_pts = frame_index as f64 / fps;
+                        let master_now = audio_clock
+                            .as_ref()
+                            .and_then(|c| c.now_secs())
+                            .unwrap_or_else(|| video_start.elapsed().as_secs_f64());
+
+                        if video_pts > master_now + AHEAD_TOLERANCE_S {
+                            // Ahead of clock — wait for master to
+                            // catch up. Cap any single sleep so a
+                            // paused master doesn't strand us.
+                            let lag = (video_pts - master_now).min(1.0);
+                            std::thread::sleep(
+                                std::time::Duration::from_secs_f64(lag),
+                            );
+                        }
+
+                        let still_behind = audio_clock
+                            .as_ref()
+                            .and_then(|c| c.now_secs())
+                            .unwrap_or_else(|| video_start.elapsed().as_secs_f64())
+                            - video_pts
+                            > BEHIND_DROP_THRESHOLD_S;
+                        if still_behind {
+                            // Drop this frame to let video catch up
+                            // without painting stale content.
+                            frame_index += 1;
+                            continue;
+                        }
+
                         if let Ok(mut s) = state_for_thread.lock() {
                             s.latest_frame = Some(DecodedFrame {
                                 width: intrinsic_width,
@@ -130,7 +176,7 @@ impl VideoElement {
                                 rgba: buf.clone(),
                             });
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(33));
+                        frame_index += 1;
                     }
                     Err(_) => {
                         // EOF or pipe broken — mark ended and exit.
@@ -150,11 +196,6 @@ impl VideoElement {
             }
             let _ = std::fs::remove_file(&path_for_thread);
         });
-
-        // Parallel-decode the audio track to PCM via a second ffmpeg
-        // pass and pipe it through cpal. No clock-based A/V sync —
-        // we accept whatever drift accumulates over a clip.
-        let audio_element = decode_audio_via_ffmpeg(&path, autoplay, loop_playback);
 
         Some(Self {
             state,
@@ -198,6 +239,37 @@ impl Drop for VideoElement {
             }
         }
     }
+}
+
+/// Read the average frame rate from ffprobe. ffprobe returns it as
+/// a rational like `30000/1001`; we parse that to an f64. Falls back
+/// to `None` so the caller can default to 30fps.
+fn probe_frame_rate(path: &std::path::Path) -> Option<f64> {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=avg_frame_rate",
+            "-of",
+            "csv=p=0",
+            path.to_str()?,
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = std::str::from_utf8(&out.stdout).ok()?.trim();
+    if s.is_empty() || s == "0/0" {
+        return None;
+    }
+    let (num, den) = s.split_once('/').unwrap_or((s, "1"));
+    let n = num.parse::<f64>().ok()?;
+    let d = den.parse::<f64>().ok().filter(|d| *d != 0.0)?;
+    Some(n / d)
 }
 
 fn probe_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {

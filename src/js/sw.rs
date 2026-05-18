@@ -1,19 +1,21 @@
 //! Service Workers + Cache API (toy).
 //!
-//! `navigator.serviceWorker.register(url)` fetches the URL, builds a
-//! separate `boa::Context` for the worker scope, evaluates the
-//! source, and returns a Promise that resolves to a
-//! `ServiceWorkerRegistration`.
+//! `navigator.serviceWorker.register(url)` fetches the URL and
+//! evaluates the worker source *in the page's JS context* with a
+//! shadowed `self` / `addEventListener` so handlers register into a
+//! per-page handler table. A real browser runs SW in an isolated
+//! globalScope on its own thread; we trade isolation for the ability
+//! to call the registered fetch handler synchronously from
+//! `js_fetch()` and capture whatever the handler passes to
+//! `event.respondWith(...)`.
 //!
 //! Cache API: `caches.open(name)` returns a Cache wrapping an
 //! origin-scoped key/value store of (request URL → response body).
 //!
 //! Scope cut for the toy:
-//!  * fetch interception — registered service workers parse but
-//!    don't actually intercept `fetch()` calls yet. That requires
-//!    threading a synchronous worker round-trip into every
-//!    page-side fetch which is its own integration commit.
-//!  * No install / activate lifecycle events.
+//!  * SW shares the page Context, so SW code can see DOM globals.
+//!  * No install / activate lifecycle events (handlers fire only on
+//!    `fetch`).
 //!  * No update versioning.
 //!  * Cache match is exact-URL only (no Vary handling).
 
@@ -35,11 +37,173 @@ pub type Caches = Rc<RefCell<HashMap<String, CacheStore>>>;
 thread_local! {
     pub(crate) static JS_CACHES: RefCell<Option<Caches>> = const { RefCell::new(None) };
     pub(crate) static JS_SW_SOURCES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// Registered `fetch` event handlers. One Vec entry per
+    /// `self.addEventListener('fetch', cb)` call.
+    pub(crate) static SW_FETCH_HANDLERS: RefCell<Vec<JsFunction>> =
+        const { RefCell::new(Vec::new()) };
+    /// Captured `event.respondWith(body)` value, drained per fetch.
+    pub(crate) static SW_RESPONSE_SLOT: RefCell<Option<String>> =
+        const { RefCell::new(None) };
 }
 
 pub fn install(ctx: &mut Context) {
     install_caches(ctx);
     install_service_worker(ctx);
+    install_sw_register_handler(ctx);
+}
+
+/// Expose a global `__sw_register_handler__(type, handler)` that the
+/// SW IIFE wrapper calls in place of `self.addEventListener`. Pushes
+/// the handler into [`SW_FETCH_HANDLERS`] for later invocation by
+/// `try_intercept_fetch`.
+fn install_sw_register_handler(ctx: &mut Context) {
+    ctx.register_global_callable(
+        js_string!("__sw_register_handler__"),
+        2,
+        NativeFunction::from_fn_ptr(sw_register_handler),
+    )
+    .ok();
+}
+
+fn sw_register_handler(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(ty_val) = args.first() else {
+        return Ok(JsValue::undefined());
+    };
+    let ty = ty_val.to_string(ctx)?.to_std_string_escaped();
+    if ty != "fetch" {
+        // Other event types (install/activate/message) aren't wired
+        // in the toy; drop them silently.
+        return Ok(JsValue::undefined());
+    }
+    let Some(handler_val) = args.get(1) else {
+        return Ok(JsValue::undefined());
+    };
+    let Some(handler_obj) = handler_val.as_object() else {
+        return Ok(JsValue::undefined());
+    };
+    let Some(handler) = JsFunction::from_object(handler_obj.clone()) else {
+        return Ok(JsValue::undefined());
+    };
+    SW_FETCH_HANDLERS.with(|slot| slot.borrow_mut().push(handler));
+    Ok(JsValue::undefined())
+}
+
+/// Called from `js_fetch` before any network I/O. If a service worker
+/// has registered a `fetch` handler, run it with a synthetic FetchEvent
+/// and return whatever it passed to `event.respondWith(...)`. Returns
+/// `None` if no handler intercepted, signalling fetch should fall
+/// through to the network.
+pub fn try_intercept_fetch(ctx: &mut Context, url: &str, method: &str) -> Option<String> {
+    let handlers: Vec<JsFunction> =
+        SW_FETCH_HANDLERS.with(|slot| slot.borrow().iter().cloned().collect());
+    if handlers.is_empty() {
+        return None;
+    }
+    // Always clear the slot before invoking — a previous failed
+    // intercept must not leak its body.
+    SW_RESPONSE_SLOT.with(|slot| *slot.borrow_mut() = None);
+    let event = build_fetch_event(ctx, url, method);
+    let undef = JsValue::undefined();
+    for handler in handlers {
+        let _ = handler.call(&undef, &[JsValue::from(event.clone())], ctx);
+        let captured = SW_RESPONSE_SLOT.with(|slot| slot.borrow_mut().take());
+        if let Some(body) = captured {
+            return Some(body);
+        }
+    }
+    None
+}
+
+fn build_fetch_event(ctx: &mut Context, url: &str, method: &str) -> boa_engine::JsObject {
+    let request = ObjectInitializer::new(ctx)
+        .property(
+            js_string!("url"),
+            JsValue::from(js_string!(url.to_string())),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("method"),
+            JsValue::from(js_string!(method.to_string())),
+            Attribute::READONLY,
+        )
+        .build();
+    ObjectInitializer::new(ctx)
+        .property(
+            js_string!("request"),
+            JsValue::from(request),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("type"),
+            JsValue::from(js_string!("fetch")),
+            Attribute::READONLY,
+        )
+        .function(
+            NativeFunction::from_fn_ptr(fetch_event_respond_with),
+            js_string!("respondWith"),
+            1,
+        )
+        .build()
+}
+
+/// `event.respondWith(value)` — value may be a string, a Response
+/// object (we read `__body`), or a Promise resolving to either. For
+/// the toy we extract a body string and stash it for `js_fetch` to
+/// surface as the network response.
+fn fetch_event_respond_with(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(val) = args.first() else {
+        return Ok(JsValue::undefined());
+    };
+    let resolved = resolve_response_to_body(val, ctx);
+    if let Some(body) = resolved {
+        SW_RESPONSE_SLOT.with(|slot| *slot.borrow_mut() = Some(body));
+    }
+    Ok(JsValue::undefined())
+}
+
+/// Best-effort flattening of whatever `respondWith` received. Handles:
+///   * a raw string → use directly
+///   * a Response-shaped object → read `__body`
+///   * a Promise → drive it once with `then` to capture the resolved
+///     value (synchronous because boa's promise resolution is)
+fn resolve_response_to_body(val: &JsValue, ctx: &mut Context) -> Option<String> {
+    if val.is_string() {
+        return val.to_string(ctx).ok().map(|s| s.to_std_string_escaped());
+    }
+    let obj = val.as_object()?;
+    if let Ok(body_val) = obj.get(js_string!("__body"), ctx) {
+        if !body_val.is_undefined() && !body_val.is_null() {
+            return body_val.to_string(ctx).ok().map(|s| s.to_std_string_escaped());
+        }
+    }
+    // Treat as Promise: install a `then` continuation that stashes the
+    // resolved body into a local cell, then run the microtask queue.
+    if let Ok(then_val) = obj.get(js_string!("then"), ctx) {
+        if then_val.is_callable() {
+            let promise: JsPromise = match JsPromise::from_object(obj.clone()) {
+                Ok(p) => p,
+                Err(_) => return None,
+            };
+            let cb = NativeFunction::from_fn_ptr(promise_then_capture);
+            let realm = ctx.realm().clone();
+            let then_cb =
+                boa_engine::object::FunctionObjectBuilder::new(&realm, cb).build();
+            let _ = promise.then(Some(then_cb), None, ctx);
+            ctx.run_jobs();
+            return SW_RESPONSE_SLOT.with(|slot| slot.borrow_mut().take());
+        }
+    }
+    None
+}
+
+fn promise_then_capture(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(val) = args.first() else {
+        return Ok(JsValue::undefined());
+    };
+    if let Some(body) = resolve_response_to_body(val, ctx) {
+        SW_RESPONSE_SLOT.with(|slot| *slot.borrow_mut() = Some(body));
+    }
+    Ok(JsValue::undefined())
 }
 
 // ============ Cache API ============
@@ -295,19 +459,33 @@ fn sw_register(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsV
         None => return Ok(JsPromise::resolve(JsValue::null(), ctx).into()),
     };
 
-    // Spin up an isolated Context, run the worker source. Errors get
-    // logged but don't prevent registration.
-    let mut worker_ctx = Context::default();
-    super::install_console(&mut worker_ctx);
-    // Worker globals: `self.addEventListener`, no DOM. We provide a
-    // very thin stub so installs don't throw.
-    register_sw_self(&mut worker_ctx);
-    if let Err(e) = worker_ctx.eval(Source::from_bytes(source.as_bytes())) {
+    // Run the worker source in the *page* Context so the handlers it
+    // registers live in our SW_FETCH_HANDLERS table and can be called
+    // back synchronously from `js_fetch`. We shadow `addEventListener`
+    // and `self.addEventListener` with a forwarder to
+    // `__sw_register_handler__`, and shadow `self` with a local stub.
+    // Without this, an SW source that does
+    // `addEventListener('fetch', cb)` would either land on the page's
+    // global (wrong target) or throw.
+    let wrapped = format!(
+        "(function() {{ \
+            function addEventListener(t, cb) {{ \
+                return __sw_register_handler__(t, cb); \
+            }} \
+            var self = {{ \
+                addEventListener: addEventListener, \
+                skipWaiting: function() {{}}, \
+                clients: {{ claim: function() {{}} }} \
+            }}; \
+            try {{ {source} }} catch (e) {{ \
+                console && console.error && console.error('[sw] threw', e); \
+            }} \
+        }})();",
+        source = source
+    );
+    if let Err(e) = ctx.eval(Source::from_bytes(wrapped.as_bytes())) {
         eprintln!("[sw] register({url}) threw: {e}");
     }
-    // We don't keep the worker Context alive — the toy registration
-    // is parse-and-discard. A real implementation would persist it
-    // and route page fetches through its `fetch` event handlers.
     JS_SW_SOURCES.with(|slot| slot.borrow_mut().push(source));
 
     let active = ObjectInitializer::new(ctx).build();
@@ -330,55 +508,3 @@ fn sw_get_registrations(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResu
     Ok(JsPromise::resolve(JsValue::from(JsArray::new(ctx)), ctx).into())
 }
 
-fn register_sw_self(ctx: &mut Context) {
-    // Provide a stub `self.addEventListener` so SW scripts can call it
-    // without errors.
-    let realm = ctx.realm().clone();
-    let listener = boa_engine::object::FunctionObjectBuilder::new(
-        &realm,
-        NativeFunction::from_fn_ptr(sw_add_event_listener),
-    )
-    .build();
-    let skip_waiting = boa_engine::object::FunctionObjectBuilder::new(
-        &realm,
-        NativeFunction::from_fn_ptr(sw_skip_waiting),
-    )
-    .build();
-    let self_obj = ObjectInitializer::new(ctx)
-        .property(
-            js_string!("addEventListener"),
-            JsValue::from(listener),
-            Attribute::READONLY,
-        )
-        .property(
-            js_string!("skipWaiting"),
-            JsValue::from(skip_waiting),
-            Attribute::READONLY,
-        )
-        .build();
-    let global = ctx.global_object();
-    let _ = global.set(
-        js_string!("self"),
-        JsValue::from(self_obj),
-        false,
-        ctx,
-    );
-}
-
-fn sw_add_event_listener(_: &JsValue, args: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
-    // Real implementation would record the (type, handler) pair so
-    // page fetches could route through. Toy keeps it parse-clean.
-    let _ = args;
-    Ok(JsValue::undefined())
-}
-
-fn sw_skip_waiting(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    Ok(JsPromise::resolve(JsValue::undefined(), ctx).into())
-}
-
-/// Make a JsFunction wrapper available for the future fetch
-/// interception path. Currently unused.
-#[allow(dead_code)]
-pub fn dispatch_fetch_intercept(_ctx: &mut Context) -> Option<JsFunction> {
-    None
-}

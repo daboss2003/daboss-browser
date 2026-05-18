@@ -365,6 +365,7 @@ impl JsEngine {
         super::media::install(&mut ctx);
         super::audio_ctx::install(&mut ctx);
         super::sw::install(&mut ctx);
+        super::wasm::install(&mut ctx);
 
         let listeners: Rc<RefCell<ListenerMap>> = Rc::new(RefCell::new(HashMap::new()));
         let timers: Rc<RefCell<TimerState>> = Rc::new(RefCell::new(TimerState::default()));

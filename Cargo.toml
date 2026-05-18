@@ -46,6 +46,7 @@ pollster = "0.3"
 webrtc = "0.13"
 tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "handshake"] }
 nokhwa = { version = "0.10", default-features = false, features = ["input-native", "input-avfoundation", "output-threaded"] }
+wasmi = "0.51"
 
 [profile.release]
 lto = "thin"

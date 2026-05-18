@@ -51,6 +51,7 @@ pub(crate) mod observers;
 pub(crate) mod rtc;
 pub(crate) mod storage;
 pub(crate) mod sw;
+pub(crate) mod wasm;
 pub(crate) mod web_classes;
 pub(crate) mod webgl;
 pub(crate) mod websocket;

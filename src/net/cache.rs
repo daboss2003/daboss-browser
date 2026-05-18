@@ -155,6 +155,7 @@ mod tests {
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect(),
             body: b"hello".to_vec(),
+            body_path: None,
         }
     }
 

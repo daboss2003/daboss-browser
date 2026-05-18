@@ -210,5 +210,6 @@ async fn run_h2(
         reason: parts.status.canonical_reason().unwrap_or("").to_string(),
         headers,
         body: body_bytes,
+        body_path: None,
     }))
 }

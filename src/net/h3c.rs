@@ -259,6 +259,7 @@ async fn run_h3(
         reason: status.canonical_reason().unwrap_or("").to_string(),
         headers: headers_out,
         body,
+        body_path: None,
     };
     Ok(H3Outcome::Ok(resp))
 }

@@ -3394,8 +3394,14 @@ impl Browser {
             if !(200..300).contains(&resp.status) {
                 continue;
             }
-            let Some(element) =
-                video::VideoElement::from_bytes(resp.body, autoplay, loop_)
+            // Big videos likely spilled to disk — hand the path
+            // directly to ffmpeg instead of re-copying through RAM.
+            let element_opt = if let Some(path) = resp.body_path.clone() {
+                video::VideoElement::from_path(path, autoplay, loop_)
+            } else {
+                video::VideoElement::from_bytes(resp.body.clone(), autoplay, loop_)
+            };
+            let Some(element) = element_opt
             else {
                 eprintln!("[video] could not start decode for {url_str}");
                 continue;

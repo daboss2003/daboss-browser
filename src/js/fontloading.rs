@@ -288,7 +288,7 @@ fn fetch_font_bytes(url: &str) -> Option<Vec<u8>> {
         if !(200..300).contains(&resp.status) {
             return None;
         }
-        Some(resp.body)
+        Some(resp.body_bytes())
     })
 }
 

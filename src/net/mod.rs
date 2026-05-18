@@ -339,6 +339,7 @@ impl Client {
                         reason: entry.reason,
                         headers: entry.headers,
                         body: entry.body,
+                        body_path: None,
                     });
                 }
             }
@@ -502,8 +503,9 @@ impl Client {
                     return Ok(Response {
                         status: 200,
                         reason: "OK".into(),
-                        headers: response.headers,
+                        headers: response.headers.clone(),
                         body,
+                        body_path: None,
                     });
                 }
             } else if (200..400).contains(&response.status) {

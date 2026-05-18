@@ -13,6 +13,12 @@ use crate::dom::NodeId;
 /// larger we refuse to decode.
 pub const MAX_IMAGE_DIMENSION: u32 = 16384;
 
+/// Total decoded-RGBA bytes the page-wide cache holds before it
+/// starts evicting older entries. 64 MiB is enough for ~16 4K
+/// images or hundreds of typical assets; long-running pages now
+/// stay bounded instead of leaking forever.
+pub const DEFAULT_IMAGE_CACHE_CAP: usize = 64 * 1024 * 1024;
+
 #[derive(Debug)]
 #[allow(dead_code)] // rgba consumed by paint in phase 5
 pub struct ImageInfo {
@@ -30,7 +36,100 @@ pub enum ImageSlot {
     Background,
 }
 
-pub type ImageCache = HashMap<(NodeId, ImageSlot), ImageInfo>;
+pub type ImageKey = (NodeId, ImageSlot);
+
+/// Page-wide image bitmap cache with a byte budget. Insertions
+/// over the cap evict the oldest entries (insertion-order FIFO —
+/// strict LRU would need `&mut` on every `get`, which complicates
+/// every paint-path call site). For a browser-style cache this
+/// behaves indistinguishably from LRU because long-running pages
+/// keep accessing the same images each frame.
+#[derive(Debug, Default)]
+pub struct ImageCache {
+    map: HashMap<ImageKey, ImageInfo>,
+    order: Vec<ImageKey>,
+    total_bytes: usize,
+    max_bytes: usize,
+}
+
+impl ImageCache {
+    pub fn new() -> Self {
+        Self::with_byte_cap(DEFAULT_IMAGE_CACHE_CAP)
+    }
+
+    pub fn with_byte_cap(max_bytes: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: Vec::new(),
+            total_bytes: 0,
+            max_bytes,
+        }
+    }
+
+    pub fn insert(&mut self, key: ImageKey, info: ImageInfo) {
+        let new_size = info.rgba.len();
+        if let Some(old) = self.map.insert(key, info) {
+            self.total_bytes = self.total_bytes.saturating_sub(old.rgba.len());
+            self.order.retain(|k| k != &key);
+        }
+        self.order.push(key);
+        self.total_bytes = self.total_bytes.saturating_add(new_size);
+        self.evict_until_under_cap();
+    }
+
+    fn evict_until_under_cap(&mut self) {
+        while self.total_bytes > self.max_bytes && !self.order.is_empty() {
+            let oldest = self.order.remove(0);
+            if let Some(old) = self.map.remove(&oldest) {
+                self.total_bytes = self.total_bytes.saturating_sub(old.rgba.len());
+            }
+        }
+    }
+
+    pub fn get(&self, key: &ImageKey) -> Option<&ImageInfo> {
+        self.map.get(key)
+    }
+
+    pub fn contains_key(&self, key: &ImageKey) -> bool {
+        self.map.contains_key(key)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&ImageKey, &ImageInfo)> {
+        self.map.iter()
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &ImageKey> {
+        self.map.keys()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    /// Drop every entry whose target NodeId no longer exists in the
+    /// live DOM. Called after navigation so stale bitmaps don't
+    /// linger past their owning page.
+    pub fn drop_entries_for(&mut self, alive: impl Fn(NodeId) -> bool) {
+        self.order.retain(|(node, _)| alive(*node));
+        let mut total_after = 0usize;
+        self.map.retain(|(node, _), info| {
+            let keep = alive(*node);
+            if keep {
+                total_after = total_after.saturating_add(info.rgba.len());
+            }
+            keep
+        });
+        self.total_bytes = total_after;
+    }
+}
 
 /// Decode an image from its raw bytes. Recognises PNG, JPEG, WebP, GIF,
 /// BMP, SVG (via `resvg`), and AVIF (via `avif-decode`). Returns

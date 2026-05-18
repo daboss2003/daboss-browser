@@ -47,11 +47,110 @@ impl CanvasSurface {
     }
 }
 
-pub type CanvasSurfaces = Rc<RefCell<HashMap<NodeId, CanvasSurface>>>;
+/// Soft cap on total RGBA bytes held across every `<canvas>`
+/// element's pixmap on the page. Over-cap inserts evict the
+/// oldest entries (FIFO — strict LRU would need `&mut` on every
+/// read access). 128 MiB covers the vast majority of pages while
+/// still bounding long-running single-page apps that allocate
+/// many canvases.
+pub const CANVAS_SURFACE_BYTE_CAP: usize = 128 * 1024 * 1024;
+
+pub struct CanvasSurfacesInner {
+    pub map: HashMap<NodeId, CanvasSurface>,
+    pub order: Vec<NodeId>,
+    pub total_bytes: usize,
+    pub max_bytes: usize,
+}
+
+impl CanvasSurfacesInner {
+    pub fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            order: Vec::new(),
+            total_bytes: 0,
+            max_bytes: CANVAS_SURFACE_BYTE_CAP,
+        }
+    }
+
+    pub fn insert(&mut self, node: NodeId, surface: CanvasSurface) {
+        let size = pixmap_bytes(&surface);
+        if let Some(old) = self.map.insert(node, surface) {
+            self.total_bytes = self.total_bytes.saturating_sub(pixmap_bytes(&old));
+            self.order.retain(|n| *n != node);
+        }
+        self.order.push(node);
+        self.total_bytes = self.total_bytes.saturating_add(size);
+        self.evict_until_under_cap();
+    }
+
+    fn evict_until_under_cap(&mut self) {
+        while self.total_bytes > self.max_bytes && !self.order.is_empty() {
+            let oldest = self.order.remove(0);
+            if let Some(old) = self.map.remove(&oldest) {
+                self.total_bytes = self.total_bytes.saturating_sub(pixmap_bytes(&old));
+            }
+        }
+    }
+
+    pub fn get(&self, node: &NodeId) -> Option<&CanvasSurface> {
+        self.map.get(node)
+    }
+
+    pub fn get_mut(&mut self, node: &NodeId) -> Option<&mut CanvasSurface> {
+        self.map.get_mut(node)
+    }
+
+    pub fn remove(&mut self, node: &NodeId) -> Option<CanvasSurface> {
+        let surface = self.map.remove(node)?;
+        self.total_bytes = self.total_bytes.saturating_sub(pixmap_bytes(&surface));
+        self.order.retain(|n| n != node);
+        Some(surface)
+    }
+
+    /// Drop entries whose NodeId is no longer reachable from the
+    /// document root (i.e. the element was removed from the DOM).
+    /// Called from the engine after each tick.
+    pub fn drop_detached(&mut self, mut is_attached: impl FnMut(NodeId) -> bool) {
+        self.order.retain(|n| is_attached(*n));
+        let mut total_after = 0usize;
+        self.map.retain(|node, surface| {
+            let keep = is_attached(*node);
+            if keep {
+                total_after = total_after.saturating_add(pixmap_bytes(surface));
+            }
+            keep
+        });
+        self.total_bytes = total_after;
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&NodeId, &CanvasSurface)> {
+        self.map.iter()
+    }
+
+    pub fn contains_key(&self, node: &NodeId) -> bool {
+        self.map.contains_key(node)
+    }
+}
+
+fn pixmap_bytes(s: &CanvasSurface) -> usize {
+    (s.pixmap.width() as usize) * (s.pixmap.height() as usize) * 4
+}
+
+pub type CanvasSurfaces = Rc<RefCell<CanvasSurfacesInner>>;
 
 thread_local! {
     pub(crate) static JS_CANVAS_SURFACES: RefCell<Option<CanvasSurfaces>> =
         const { RefCell::new(None) };
+}
+
+/// Public hook for `main.rs`/`engine.rs` to GC canvas pixmaps
+/// whose owning `<canvas>` element has been removed from the DOM.
+pub fn drop_detached_surfaces(is_attached: impl FnMut(NodeId) -> bool) {
+    let rc = match JS_CANVAS_SURFACES.with(|slot| slot.borrow().clone()) {
+        Some(rc) => rc,
+        None => return,
+    };
+    rc.borrow_mut().drop_detached(is_attached);
 }
 
 const CTX_NODE_KEY: &str = "__canvas_node";

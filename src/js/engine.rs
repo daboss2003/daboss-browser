@@ -459,7 +459,7 @@ impl JsEngine {
         let bounding_rects: Rc<RefCell<std::collections::HashMap<NodeId, [f32; 4]>>> =
             Rc::new(RefCell::new(std::collections::HashMap::new()));
         let canvas_surfaces: super::CanvasSurfaces =
-            Rc::new(RefCell::new(std::collections::HashMap::new()));
+            Rc::new(RefCell::new(super::canvas::CanvasSurfacesInner::new()));
         let computed_styles: Rc<
             RefCell<std::collections::HashMap<NodeId, Vec<(String, String)>>>,
         > = Rc::new(RefCell::new(std::collections::HashMap::new()));
@@ -2004,6 +2004,7 @@ fn js_fetch(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
             reason: "OK".to_string(),
             body: body_str.into_bytes(),
             headers: Vec::new(),
+            body_path: None,
         };
         return Ok(JsPromise::resolve(
             JsValue::from(make_response_object(ctx, target_url.as_str(), resp)),
@@ -2056,21 +2057,27 @@ fn make_response_object(
     resp: net::Response,
 ) -> boa_engine::JsObject {
     let ok = (200..300).contains(&resp.status);
-    let body_str = String::from_utf8_lossy(&resp.body).into_owned();
+    let status = resp.status;
+    let reason = resp.reason.clone();
+    // Resolve the body once. If it spilled to disk, read it back —
+    // callers that don't want the whole buffer should use the stream
+    // accessor below.
+    let body_bytes = resp.body_bytes();
+    let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
     // Build the body ReadableStream first so the ObjectInitializer
     // doesn't double-borrow ctx.
-    let body_stream = super::streams::body_to_stream(ctx, &resp.body);
+    let body_stream = super::streams::body_to_stream(ctx, &body_bytes);
 
     ObjectInitializer::new(ctx)
         .property(js_string!("ok"), JsValue::from(ok), Attribute::READONLY)
         .property(
             js_string!("status"),
-            JsValue::from(resp.status as u32),
+            JsValue::from(status as u32),
             Attribute::READONLY,
         )
         .property(
             js_string!("statusText"),
-            JsValue::from(js_string!(resp.reason)),
+            JsValue::from(js_string!(reason)),
             Attribute::READONLY,
         )
         .property(

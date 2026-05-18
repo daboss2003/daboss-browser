@@ -48,12 +48,71 @@ pub struct BitmapEntry {
     pub rgba: Vec<u8>,
 }
 
+/// Combined byte cap covering both `OffscreenCanvas` pixmaps and
+/// decoded `ImageBitmap`s. JS calls `close()` to free explicitly,
+/// but many libraries forget; this floor stops orphan bitmaps from
+/// growing without bound. 128 MiB is enough for ~32 4K RGBA
+/// buffers — way past what any single page will actually use.
+pub const OFFSCREEN_TOTAL_BYTE_CAP: usize = 128 * 1024 * 1024;
+
 thread_local! {
     pub(crate) static OFFSCREEN_CANVASES: RefCell<HashMap<u32, OffscreenSurface>> =
         RefCell::new(HashMap::new());
+    pub(crate) static OFFSCREEN_ORDER: RefCell<Vec<u32>> = RefCell::new(Vec::new());
     pub(crate) static IMAGE_BITMAPS: RefCell<HashMap<u32, BitmapEntry>> =
         RefCell::new(HashMap::new());
+    pub(crate) static BITMAP_ORDER: RefCell<Vec<u32>> = RefCell::new(Vec::new());
     pub(crate) static OFFSCREEN_NEXT_ID: RefCell<u32> = const { RefCell::new(1) };
+}
+
+fn total_offscreen_bytes() -> usize {
+    let canvas_bytes = OFFSCREEN_CANVASES.with(|r| {
+        r.borrow()
+            .values()
+            .map(|s| (s.width as usize) * (s.height as usize) * 4)
+            .sum::<usize>()
+    });
+    let bitmap_bytes =
+        IMAGE_BITMAPS.with(|r| r.borrow().values().map(|b| b.rgba.len()).sum::<usize>());
+    canvas_bytes + bitmap_bytes
+}
+
+/// Evict oldest entries across both registries until total bytes
+/// drop under the cap. Called after each insertion that grows the
+/// pool. Prefers evicting the older registry-by-registry; in
+/// practice canvases and bitmaps live similarly long.
+fn evict_until_under_cap() {
+    while total_offscreen_bytes() > OFFSCREEN_TOTAL_BYTE_CAP {
+        let evicted_offscreen = OFFSCREEN_ORDER.with(|o| {
+            let mut order = o.borrow_mut();
+            if order.is_empty() {
+                None
+            } else {
+                Some(order.remove(0))
+            }
+        });
+        if let Some(id) = evicted_offscreen {
+            OFFSCREEN_CANVASES.with(|r| {
+                r.borrow_mut().remove(&id);
+            });
+            continue;
+        }
+        let evicted_bitmap = BITMAP_ORDER.with(|o| {
+            let mut order = o.borrow_mut();
+            if order.is_empty() {
+                None
+            } else {
+                Some(order.remove(0))
+            }
+        });
+        if let Some(id) = evicted_bitmap {
+            IMAGE_BITMAPS.with(|r| {
+                r.borrow_mut().remove(&id);
+            });
+            continue;
+        }
+        break;
+    }
 }
 
 fn next_id() -> u32 {
@@ -116,6 +175,8 @@ fn offscreen_ctor(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<
             },
         );
     });
+    OFFSCREEN_ORDER.with(|o| o.borrow_mut().push(id));
+    evict_until_under_cap();
     Ok(build_offscreen_object(ctx, id))
 }
 
@@ -541,6 +602,8 @@ pub fn store_image_bitmap(width: u32, height: u32, rgba: Vec<u8>) -> u32 {
             },
         );
     });
+    BITMAP_ORDER.with(|o| o.borrow_mut().push(id));
+    evict_until_under_cap();
     id
 }
 
@@ -568,6 +631,7 @@ fn image_bitmap_close(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsRes
                 IMAGE_BITMAPS.with(|r| {
                     r.borrow_mut().remove(&id);
                 });
+                BITMAP_ORDER.with(|o| o.borrow_mut().retain(|x| *x != id));
             }
         }
     }

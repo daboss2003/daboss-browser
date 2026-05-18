@@ -428,6 +428,8 @@ impl JsEngine {
         super::webauthn::install(&mut ctx);
         super::mse::install(&mut ctx);
         super::performance::install(&mut ctx);
+        super::webcodecs::install(&mut ctx);
+        super::visibility::install(&mut ctx);
 
         let listeners: Rc<RefCell<ListenerMap>> = Rc::new(RefCell::new(HashMap::new()));
         let timers: Rc<RefCell<TimerState>> = Rc::new(RefCell::new(TimerState::default()));

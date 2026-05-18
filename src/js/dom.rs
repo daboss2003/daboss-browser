@@ -296,6 +296,58 @@ pub(crate) fn make_element_handle(ctx: &mut Context, id: NodeId) -> JsObject {
         js_string!("getAnimations"),
         0,
     );
+    // Constraint Validation API + form methods. Installed on every
+    // element handle; the impls inspect the tag at call time and no-op
+    // when irrelevant.
+    init.function(
+        NativeFunction::from_fn_ptr(super::forms::element_check_validity),
+        js_string!("checkValidity"),
+        0,
+    );
+    init.function(
+        NativeFunction::from_fn_ptr(super::forms::element_report_validity),
+        js_string!("reportValidity"),
+        0,
+    );
+    init.function(
+        NativeFunction::from_fn_ptr(super::forms::element_set_custom_validity),
+        js_string!("setCustomValidity"),
+        1,
+    );
+    init.function(
+        NativeFunction::from_fn_ptr(super::forms::form_request_submit),
+        js_string!("requestSubmit"),
+        0,
+    );
+    init.function(
+        NativeFunction::from_fn_ptr(super::forms::form_request_submit),
+        js_string!("submit"),
+        0,
+    );
+    init.function(
+        NativeFunction::from_fn_ptr(super::visibility::element_request_fullscreen),
+        js_string!("requestFullscreen"),
+        0,
+    );
+    init.function(
+        NativeFunction::from_fn_ptr(super::visibility::element_request_pointer_lock),
+        js_string!("requestPointerLock"),
+        0,
+    );
+    let validity_get = getter(super::forms::element_get_validity);
+    let validation_msg_get = getter(super::forms::element_get_validation_message);
+    init.accessor(
+        js_string!("validity"),
+        Some(validity_get),
+        None,
+        Attribute::ENUMERABLE,
+    );
+    init.accessor(
+        js_string!("validationMessage"),
+        Some(validation_msg_get),
+        None,
+        Attribute::ENUMERABLE,
+    );
 
     // Live-ish helpers that build a fresh object on every access. Cheap
     // enough for a toy; real browsers cache.

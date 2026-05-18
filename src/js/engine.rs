@@ -377,6 +377,10 @@ impl JsEngine {
         super::formdata::install(&mut ctx);
         super::clipboard::install(&mut ctx);
         super::webgpu::install(&mut ctx);
+        super::selection::install(&mut ctx);
+        install_selection_globals(&mut ctx);
+        super::animations::install(&mut ctx);
+        super::webauthn::install(&mut ctx);
 
         let listeners: Rc<RefCell<ListenerMap>> = Rc::new(RefCell::new(HashMap::new()));
         let timers: Rc<RefCell<TimerState>> = Rc::new(RefCell::new(TimerState::default()));
@@ -622,6 +626,11 @@ impl JsEngine {
         super::rtc::drain_rtc_events(&mut self.ctx);
         super::websocket::drain_ws_inbound(&mut self.ctx);
         super::sse::drain_sse_events(&mut self.ctx);
+        {
+            let now_ms = self.perf_origin.elapsed().as_secs_f64() * 1000.0;
+            super::animations::advance_animations(now_ms);
+        }
+        super::animations::drain_finished(&mut self.ctx);
         super::worker::drain_worker_messages(&mut self.ctx);
         self.ctx.run_jobs();
 
@@ -667,6 +676,11 @@ impl JsEngine {
         super::rtc::drain_rtc_events(&mut self.ctx);
         super::websocket::drain_ws_inbound(&mut self.ctx);
         super::sse::drain_sse_events(&mut self.ctx);
+        {
+            let now_ms = self.perf_origin.elapsed().as_secs_f64() * 1000.0;
+            super::animations::advance_animations(now_ms);
+        }
+        super::animations::drain_finished(&mut self.ctx);
         super::worker::drain_worker_messages(&mut self.ctx);
         self.ctx.run_jobs();
         self.uninstall_thread_locals(dom, rc, listeners_rc);
@@ -760,6 +774,11 @@ impl JsEngine {
         super::rtc::drain_rtc_events(&mut self.ctx);
         super::websocket::drain_ws_inbound(&mut self.ctx);
         super::sse::drain_sse_events(&mut self.ctx);
+        {
+            let now_ms = self.perf_origin.elapsed().as_secs_f64() * 1000.0;
+            super::animations::advance_animations(now_ms);
+        }
+        super::animations::drain_finished(&mut self.ctx);
         super::worker::drain_worker_messages(&mut self.ctx);
         self.ctx.run_jobs();
 
@@ -973,6 +992,148 @@ impl JsEngine {
 /// Cheap because both are just `Attribute::WRITABLE` properties — direct
 /// assignments to `window.foo = ...` mutate the global, matching browser
 /// behaviour.
+/// Hang `getSelection` / `createRange` off both `document` and the
+/// global (so `window.getSelection()` and `document.getSelection()`
+/// reach the same Selection singleton). Adds `document.execCommand`
+/// for the legacy commands modern editors still call.
+fn install_selection_globals(ctx: &mut Context) {
+    let realm = ctx.realm().clone();
+    let get_selection = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(get_selection_global),
+    )
+    .build();
+    let create_range = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(create_range_global),
+    )
+    .build();
+    let exec_command = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(exec_command_global),
+    )
+    .build();
+    let query_command_supported = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(query_command_supported_global),
+    )
+    .build();
+    let global = ctx.global_object();
+    let _ = global.set(
+        js_string!("getSelection"),
+        JsValue::from(get_selection.clone()),
+        false,
+        ctx,
+    );
+    if let Ok(doc_val) = global.get(js_string!("document"), ctx) {
+        if let Some(doc) = doc_val.as_object() {
+            let _ = doc.set(
+                js_string!("getSelection"),
+                JsValue::from(get_selection),
+                false,
+                ctx,
+            );
+            let _ = doc.set(
+                js_string!("createRange"),
+                JsValue::from(create_range),
+                false,
+                ctx,
+            );
+            let _ = doc.set(
+                js_string!("execCommand"),
+                JsValue::from(exec_command),
+                false,
+                ctx,
+            );
+            let _ = doc.set(
+                js_string!("queryCommandSupported"),
+                JsValue::from(query_command_supported),
+                false,
+                ctx,
+            );
+            let get_anims = boa_engine::object::FunctionObjectBuilder::new(
+                &realm,
+                NativeFunction::from_fn_ptr(get_animations_global),
+            )
+            .build();
+            let _ = doc.set(
+                js_string!("getAnimations"),
+                JsValue::from(get_anims),
+                false,
+                ctx,
+            );
+        }
+    }
+}
+
+fn get_animations_global(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    Ok(super::animations::document_get_animations(ctx))
+}
+
+fn get_selection_global(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    Ok(super::selection::get_selection_object(ctx))
+}
+
+fn create_range_global(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let id = super::selection::store_range(super::selection::RangeState::collapsed(
+        super::with_dom(|dom| dom.document()).unwrap_or(crate::dom::NodeId::from_raw(0)),
+    ));
+    Ok(super::selection::build_range_object_public(ctx, id))
+}
+
+/// `document.execCommand(name, showUI, value)` — legacy editing
+/// interface. We honour the common subset that targets a
+/// contenteditable element:
+///   * `insertText` — replace selection with the value string.
+///   * `delete` / `forwardDelete` — remove selection.
+///   * `selectAll` — caret-up-to-end-of-document on the host element.
+/// Bold / italic / etc. would need style application — accepted but
+/// no-op for the toy.
+fn exec_command_global(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let name = args
+        .first()
+        .map(|v| v.to_string(ctx).map(|s| s.to_std_string_escaped()))
+        .transpose()?
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let value = args
+        .get(2)
+        .filter(|v| !v.is_undefined() && !v.is_null())
+        .map(|v| v.to_string(ctx).map(|s| s.to_std_string_escaped()))
+        .transpose()?
+        .unwrap_or_default();
+    match name.as_str() {
+        "inserttext" => {
+            super::selection::exec_insert_text(&value);
+        }
+        "delete" | "forwarddelete" => {
+            super::selection::exec_delete();
+        }
+        "selectall" => {
+            super::selection::exec_select_all();
+        }
+        _ => {}
+    }
+    Ok(JsValue::from(true))
+}
+
+fn query_command_supported_global(
+    _: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let name = args
+        .first()
+        .map(|v| v.to_string(ctx).map(|s| s.to_std_string_escaped()))
+        .transpose()?
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    Ok(JsValue::from(matches!(
+        name.as_str(),
+        "inserttext" | "delete" | "forwarddelete" | "selectall"
+    )))
+}
+
 fn install_window_alias(ctx: &mut Context) {
     let global = ctx.global_object();
     let global_val = JsValue::from(global);

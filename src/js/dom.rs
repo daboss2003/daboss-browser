@@ -40,7 +40,7 @@ use super::{with_dom, with_dom_mut};
 use crate::css::{parse_selector_list_str, selector_matches, Selector};
 use crate::dom::{Dom, NodeId, NodeKind};
 
-const NODE_ID_KEY: &str = "__nodeId";
+pub(crate) const NODE_ID_KEY: &str = "__nodeId";
 
 pub fn install(ctx: &mut Context) {
     let document = build_document(ctx);
@@ -286,6 +286,16 @@ pub(crate) fn make_element_handle(ctx: &mut Context, id: NodeId) -> JsObject {
         js_string!("querySelectorAll"),
         1,
     );
+    init.function(
+        NativeFunction::from_fn_ptr(element_animate),
+        js_string!("animate"),
+        2,
+    );
+    init.function(
+        NativeFunction::from_fn_ptr(element_get_animations),
+        js_string!("getAnimations"),
+        0,
+    );
 
     // Live-ish helpers that build a fresh object on every access. Cheap
     // enough for a toy; real browsers cache.
@@ -334,7 +344,116 @@ pub(crate) fn make_element_handle(ctx: &mut Context, id: NodeId) -> JsObject {
         Some(src_object_set),
         Attribute::ENUMERABLE,
     );
+
+    // contenteditable: a real getter/setter that maps to the
+    // `contenteditable` attribute, plus the read-only
+    // `isContentEditable` boolean which walks ancestors to determine
+    // effective editability. Reuses the `realm` cloned at the top of
+    // this function so we don't double-borrow ctx.
+    let ce_get = getter(element_get_content_editable);
+    let ce_set = getter(element_set_content_editable);
+    let is_ce_get = getter(element_get_is_content_editable);
+    init.accessor(
+        js_string!("contentEditable"),
+        Some(ce_get),
+        Some(ce_set),
+        Attribute::ENUMERABLE,
+    );
+    init.accessor(
+        js_string!("isContentEditable"),
+        Some(is_ce_get),
+        None,
+        Attribute::ENUMERABLE,
+    );
     init.build()
+}
+
+fn element_get_content_editable(
+    this: &JsValue,
+    _: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let val = read_attr(this, ctx, "contenteditable").unwrap_or_else(|| "inherit".to_string());
+    let normalised = match val.to_ascii_lowercase().as_str() {
+        "true" | "" => "true",
+        "false" => "false",
+        "plaintext-only" => "plaintext-only",
+        _ => "inherit",
+    };
+    Ok(JsValue::from(js_string!(normalised.to_string())))
+}
+
+fn element_set_content_editable(
+    this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(id) = read_self_node_id(this, ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    let val = args
+        .first()
+        .map(|v| v.to_string(ctx).map(|s| s.to_std_string_escaped()))
+        .transpose()?
+        .unwrap_or_default();
+    let normalised = match val.to_ascii_lowercase().as_str() {
+        "true" | "" => "true",
+        "false" => "false",
+        "plaintext-only" => "plaintext-only",
+        _ => "inherit",
+    };
+    super::with_dom_mut(|dom| dom.set_attribute(id, "contenteditable", normalised.to_string()));
+    Ok(JsValue::undefined())
+}
+
+fn element_get_is_content_editable(
+    this: &JsValue,
+    _: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(id) = read_self_node_id(this, ctx) else {
+        return Ok(JsValue::from(false));
+    };
+    let editable = super::with_dom(|dom| is_effectively_editable(dom, id)).unwrap_or(false);
+    Ok(JsValue::from(editable))
+}
+
+fn is_effectively_editable(dom: &Dom, mut id: NodeId) -> bool {
+    loop {
+        if let NodeKind::Element { attrs, .. } = &dom.node(id).kind {
+            if let Some((_, v)) = attrs
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("contenteditable"))
+            {
+                match v.to_ascii_lowercase().as_str() {
+                    "true" | "" | "plaintext-only" => return true,
+                    "false" => return false,
+                    _ => {}
+                }
+            }
+        }
+        let Some(parent) = dom.node(id).parent else {
+            return false;
+        };
+        id = parent;
+    }
+}
+
+/// `element.animate(keyframes, options)` — delegate to the Web
+/// Animations registry in `animations.rs`. Returns an `Animation`.
+fn element_animate(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(id) = read_self_node_id(this, ctx) else {
+        return Ok(JsValue::null());
+    };
+    let keyframes = args.first().cloned().unwrap_or(JsValue::undefined());
+    let options = args.get(1).cloned().unwrap_or(JsValue::undefined());
+    Ok(super::animations::element_animate(id, &keyframes, &options, ctx))
+}
+
+/// `element.getAnimations()` — returns Animations whose target is
+/// this element. We surface the global registry for the toy.
+fn element_get_animations(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    Ok(super::animations::document_get_animations(ctx))
 }
 
 /// `<video>.srcObject = stream` — read the MediaStream's

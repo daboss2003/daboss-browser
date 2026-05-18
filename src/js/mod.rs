@@ -42,6 +42,7 @@ use boa_engine::{
 use crate::dom::{Dom, NodeId, NodeKind};
 
 pub(crate) mod abort;
+pub(crate) mod animations;
 pub(crate) mod audio_ctx;
 pub(crate) mod canvas;
 pub(crate) mod clipboard;
@@ -54,12 +55,14 @@ pub(crate) mod idb;
 pub(crate) mod media;
 pub(crate) mod observers;
 pub(crate) mod rtc;
+pub(crate) mod selection;
 pub(crate) mod storage;
 pub(crate) mod sse;
 pub(crate) mod streams;
 pub(crate) mod sw;
 pub(crate) mod wasm;
 pub(crate) mod web_classes;
+pub(crate) mod webauthn;
 pub(crate) mod webgl;
 pub(crate) mod webgpu;
 pub(crate) mod websocket;

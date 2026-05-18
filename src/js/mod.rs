@@ -70,6 +70,7 @@ pub(crate) mod storage;
 pub(crate) mod view_transitions;
 pub(crate) mod visibility;
 pub(crate) mod sse;
+pub(crate) mod atomics;
 pub(crate) mod intl;
 pub(crate) mod streams;
 pub(crate) mod sw;

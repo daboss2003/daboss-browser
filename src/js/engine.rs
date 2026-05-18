@@ -439,6 +439,7 @@ impl JsEngine {
         super::shadow_dom::install(&mut ctx);
         super::intl::install(&mut ctx);
         super::web_apis::install(&mut ctx);
+        super::atomics::install(&mut ctx);
 
         let listeners: Rc<RefCell<ListenerMap>> = Rc::new(RefCell::new(HashMap::new()));
         let timers: Rc<RefCell<TimerState>> = Rc::new(RefCell::new(TimerState::default()));

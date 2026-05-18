@@ -334,6 +334,54 @@ pub(crate) fn make_element_handle(ctx: &mut Context, id: NodeId) -> JsObject {
         js_string!("requestPointerLock"),
         0,
     );
+    // <dialog> + Popover surface. Installed on every element handle
+    // — implementations no-op for elements where they don't apply.
+    init.function(
+        NativeFunction::from_fn_ptr(super::dialog::dialog_show),
+        js_string!("show"),
+        0,
+    );
+    init.function(
+        NativeFunction::from_fn_ptr(super::dialog::dialog_show_modal),
+        js_string!("showModal"),
+        0,
+    );
+    init.function(
+        NativeFunction::from_fn_ptr(super::dialog::dialog_close),
+        js_string!("close"),
+        1,
+    );
+    init.function(
+        NativeFunction::from_fn_ptr(super::dialog::element_show_popover),
+        js_string!("showPopover"),
+        0,
+    );
+    init.function(
+        NativeFunction::from_fn_ptr(super::dialog::element_hide_popover),
+        js_string!("hidePopover"),
+        0,
+    );
+    init.function(
+        NativeFunction::from_fn_ptr(super::dialog::element_toggle_popover),
+        js_string!("togglePopover"),
+        1,
+    );
+    let open_get = getter(super::dialog::dialog_get_open);
+    let open_set = getter(super::dialog::dialog_set_open);
+    let return_value_get = getter(super::dialog::dialog_get_return_value);
+    let return_value_set = getter(super::dialog::dialog_set_return_value);
+    init.accessor(
+        js_string!("open"),
+        Some(open_get),
+        Some(open_set),
+        Attribute::ENUMERABLE,
+    );
+    init.accessor(
+        js_string!("returnValue"),
+        Some(return_value_get),
+        Some(return_value_set),
+        Attribute::ENUMERABLE,
+    );
     let validity_get = getter(super::forms::element_get_validity);
     let validation_msg_get = getter(super::forms::element_get_validation_message);
     init.accessor(

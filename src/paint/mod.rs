@@ -145,10 +145,19 @@ struct Painter {
 
 impl Painter {
     fn new(width: u32, height: u32) -> Option<Self> {
-        Pixmap::new(width.max(1), height.max(1)).map(|pixmap| Self {
-            pixmap,
-            font_system: FontSystem::new(),
-            swash_cache: SwashCache::new(),
+        Pixmap::new(width.max(1), height.max(1)).map(|pixmap| {
+            let mut font_system = FontSystem::new();
+            // Pull any JS-registered fonts (FontFace.load, @font-face)
+            // into this fontdb so `font-family: <custom>` matches.
+            let fonts = crate::js::fontloading::registered_font_bytes();
+            for (_family, bytes) in fonts {
+                font_system.db_mut().load_font_data(bytes);
+            }
+            Self {
+                pixmap,
+                font_system,
+                swash_cache: SwashCache::new(),
+            }
         })
     }
 

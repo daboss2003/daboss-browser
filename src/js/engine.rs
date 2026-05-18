@@ -430,6 +430,8 @@ impl JsEngine {
         super::performance::install(&mut ctx);
         super::webcodecs::install(&mut ctx);
         super::visibility::install(&mut ctx);
+        super::fontloading::install(&mut ctx);
+        super::view_transitions::install(&mut ctx);
 
         let listeners: Rc<RefCell<ListenerMap>> = Rc::new(RefCell::new(HashMap::new()));
         let timers: Rc<RefCell<TimerState>> = Rc::new(RefCell::new(TimerState::default()));
@@ -681,6 +683,11 @@ impl JsEngine {
         }
         super::animations::drain_finished(&mut self.ctx);
         super::performance::drain_observers(&mut self.ctx);
+        // Default 16ms tick budget for view transition advance. Real
+        // browsers tie this to the rAF cadence; close enough for
+        // visual fades.
+        super::view_transitions::advance(16.0);
+        super::view_transitions::drain_finished(&mut self.ctx);
         super::worker::drain_worker_messages(&mut self.ctx);
         self.ctx.run_jobs();
 
@@ -732,6 +739,11 @@ impl JsEngine {
         }
         super::animations::drain_finished(&mut self.ctx);
         super::performance::drain_observers(&mut self.ctx);
+        // Default 16ms tick budget for view transition advance. Real
+        // browsers tie this to the rAF cadence; close enough for
+        // visual fades.
+        super::view_transitions::advance(16.0);
+        super::view_transitions::drain_finished(&mut self.ctx);
         super::worker::drain_worker_messages(&mut self.ctx);
         self.ctx.run_jobs();
         self.uninstall_thread_locals(dom, rc, listeners_rc);
@@ -831,6 +843,11 @@ impl JsEngine {
         }
         super::animations::drain_finished(&mut self.ctx);
         super::performance::drain_observers(&mut self.ctx);
+        // Default 16ms tick budget for view transition advance. Real
+        // browsers tie this to the rAF cadence; close enough for
+        // visual fades.
+        super::view_transitions::advance(16.0);
+        super::view_transitions::drain_finished(&mut self.ctx);
         super::worker::drain_worker_messages(&mut self.ctx);
         self.ctx.run_jobs();
 

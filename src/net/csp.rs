@@ -14,6 +14,11 @@ pub struct Csp {
     pub script_src: Vec<String>,
     /// `true` if no `script-src` directive was present.
     pub script_src_missing: bool,
+    /// `true` when the policy contains
+    /// `require-trusted-types-for 'script'`. Forces innerHTML /
+    /// outerHTML / similar DOM-XSS sinks to consume Trusted Types
+    /// objects rather than raw strings.
+    pub require_trusted_types_for_script: bool,
 }
 
 impl Default for Csp {
@@ -24,6 +29,7 @@ impl Default for Csp {
         Self {
             script_src: Vec::new(),
             script_src_missing: true,
+            require_trusted_types_for_script: false,
         }
     }
 }
@@ -33,6 +39,7 @@ impl Csp {
     pub fn parse(header: &str) -> Self {
         let mut script_src: Option<Vec<String>> = None;
         let mut default_src: Option<Vec<String>> = None;
+        let mut require_tt = false;
         for directive in header.split(';') {
             let parts: Vec<&str> = directive.split_ascii_whitespace().collect();
             if parts.is_empty() {
@@ -44,6 +51,13 @@ impl Csp {
             match name.as_str() {
                 "script-src" => script_src = Some(sources),
                 "default-src" => default_src = Some(sources),
+                "require-trusted-types-for" => {
+                    // Spec lists 'script' as the only currently
+                    // defined value.
+                    if sources.iter().any(|s| s == "'script'") {
+                        require_tt = true;
+                    }
+                }
                 _ => {}
             }
         }
@@ -51,10 +65,12 @@ impl Csp {
             Some(s) => Csp {
                 script_src: s,
                 script_src_missing: false,
+                require_trusted_types_for_script: require_tt,
             },
             None => Csp {
                 script_src: default_src.unwrap_or_default(),
                 script_src_missing: true,
+                require_trusted_types_for_script: require_tt,
             },
         }
     }
@@ -105,5 +121,13 @@ mod tests {
     fn default_src_unsafe_inline_propagates() {
         let c = Csp::parse("default-src 'unsafe-inline'");
         assert!(c.allows_inline_scripts());
+    }
+
+    #[test]
+    fn require_trusted_types_for_script_parses() {
+        let c = Csp::parse("require-trusted-types-for 'script'");
+        assert!(c.require_trusted_types_for_script);
+        let c = Csp::parse("default-src 'self'");
+        assert!(!c.require_trusted_types_for_script);
     }
 }

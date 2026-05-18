@@ -87,7 +87,10 @@ fn run_png_export(url_str: &str) -> Result<(), net::Error> {
     let allow_loopback = std::env::var("DABOSS_ALLOW_LOOPBACK").is_ok();
     let client = net::Client::new().with_allow_loopback(allow_loopback);
     let base_url = url::Url::parse(url_str).map_err(|e| net::Error::InvalidUrl(e.to_string()))?;
-    let response = client.get(url_str)?;
+    let response = client.get_with(
+        url_str,
+        net::RequestContext::new().with_top_level_navigation(true),
+    )?;
     eprintln!("HTTP/1.1 {} {}", response.status, response.reason);
     let body = String::from_utf8_lossy(&response.body);
     let mut dom = html::parse(&body);
@@ -100,14 +103,16 @@ fn run_png_export(url_str: &str) -> Result<(), net::Error> {
     for r in css::discover_stylesheets(&dom) {
         match r {
             css::StylesheetRef::Embedded(s) => sheets.push(s),
-            css::StylesheetRef::External(href) => {
+            css::StylesheetRef::External { href, integrity } => {
                 if ext_count >= MAX_EXTERNAL_STYLESHEETS {
                     continue;
                 }
                 ext_count += 1;
                 if let Ok(abs) = base_url.join(&href) {
                     if let Ok(r) = client.get(&abs.to_string()) {
-                        if (200..300).contains(&r.status) {
+                        if (200..300).contains(&r.status)
+                            && stylesheet_integrity_ok(&href, integrity.as_deref(), &r.body)
+                        {
                             sheets.push(css::parse(&String::from_utf8_lossy(&r.body)));
                         }
                     }
@@ -436,7 +441,10 @@ impl Browser {
             }
         }
 
-        let response = match self.client.get(url_str) {
+        let response = match self.client.get_with(
+            url_str,
+            net::RequestContext::new().with_top_level_navigation(true),
+        ) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("[nav] fetch failed: {e}");
@@ -451,7 +459,9 @@ impl Browser {
 
         // Parse Content-Security-Policy from the page response. Without
         // an unsafe-inline allowance, the JS engine skips running
-        // inline `<script>` content.
+        // inline `<script>` content. `require-trusted-types-for
+        // 'script'` flips the Trusted Types enforcement flag so DOM
+        // sinks like `innerHTML` reject raw strings.
         let csp = response
             .header("Content-Security-Policy")
             .map(net::Csp::parse)
@@ -460,6 +470,18 @@ impl Browser {
         if !inline_scripts_allowed {
             eprintln!("[csp] inline scripts blocked by Content-Security-Policy");
         }
+        js::trusted_types::set_required(csp.require_trusted_types_for_script);
+
+        // Parse Permissions-Policy and pipe it to the JS layer so
+        // `document.featurePolicy.allowsFeature(...)` answers
+        // truthfully. The page URL is the policy's "self" origin —
+        // `(self)` allowlists match the document.
+        let perm_policy = response
+            .header("Permissions-Policy")
+            .map(net::PermissionsPolicy::parse)
+            .unwrap_or_default()
+            .with_self_origin(parsed.origin());
+        js::permissions::set_policy(perm_policy);
 
         // Phase 7a/b/c/e: spin up a JS engine for the page and run its
         // inline `<script>` content. The engine persists on `Page` so
@@ -491,14 +513,20 @@ impl Browser {
         for r in css::discover_stylesheets(&dom) {
             match r {
                 css::StylesheetRef::Embedded(s) => sheets.push(s),
-                css::StylesheetRef::External(href) => {
+                css::StylesheetRef::External { href, integrity } => {
                     if ext_count >= MAX_EXTERNAL_STYLESHEETS {
                         continue;
                     }
                     ext_count += 1;
                     if let Ok(abs) = parsed.join(&href) {
                         if let Ok(resp) = self.client.get(&abs.to_string()) {
-                            if (200..300).contains(&resp.status) {
+                            if (200..300).contains(&resp.status)
+                                && stylesheet_integrity_ok(
+                                    &href,
+                                    integrity.as_deref(),
+                                    &resp.body,
+                                )
+                            {
                                 sheets.push(css::parse(&String::from_utf8_lossy(&resp.body)));
                             }
                         }
@@ -2317,14 +2345,20 @@ fn load_iframe_document(
     for r in css::discover_stylesheets(&dom) {
         match r {
             css::StylesheetRef::Embedded(s) => sheets.push(s),
-            css::StylesheetRef::External(href) => {
+            css::StylesheetRef::External { href, integrity } => {
                 if ext_count >= MAX_EXTERNAL_STYLESHEETS {
                     continue;
                 }
                 ext_count += 1;
                 if let Ok(child_abs) = abs.join(&href) {
                     if let Ok(resp) = client.get(&child_abs.to_string()) {
-                        if (200..300).contains(&resp.status) {
+                        if (200..300).contains(&resp.status)
+                            && stylesheet_integrity_ok(
+                                &href,
+                                integrity.as_deref(),
+                                &resp.body,
+                            )
+                        {
                             sheets.push(css::parse(&String::from_utf8_lossy(&resp.body)));
                         }
                     }
@@ -3559,6 +3593,26 @@ impl Browser {
             }
         }
     }
+}
+
+// ---------------- Subresource Integrity helper ----------------
+
+/// Centralised SRI gate for external resources. Returns `true` if the
+/// resource is allowed to load: either no integrity metadata was
+/// supplied, or the body matched one of the listed hashes.
+fn stylesheet_integrity_ok(href: &str, integrity: Option<&str>, body: &[u8]) -> bool {
+    let Some(spec) = integrity else {
+        return true;
+    };
+    let verdict = net::verify_integrity(spec, body);
+    if !verdict.allows_load() {
+        tracing::warn!(
+            href = %href,
+            integrity = %spec,
+            "SRI check failed; blocking stylesheet",
+        );
+    }
+    verdict.allows_load()
 }
 
 // ---------------- <link rel=preload|prefetch> warming ----------------

@@ -7,6 +7,8 @@ mod error;
 mod h2c;
 mod h3c;
 mod http;
+pub mod permissions_policy;
+pub mod sri;
 pub(crate) mod transport;
 
 pub use self::adblock::Blocklist;
@@ -16,6 +18,8 @@ pub use self::cookies::Cookie;
 pub use self::csp::Csp;
 pub use self::error::{Error, Result};
 pub use self::http::{Request, Response};
+pub use self::permissions_policy::PermissionsPolicy;
+pub use self::sri::{verify_integrity, SriVerdict};
 // `RequestContext` is defined directly in this module — see below.
 
 use std::cell::RefCell;
@@ -28,7 +32,7 @@ use url::Url;
 
 /// Caller-supplied context for an outgoing request. Carries the security
 /// state of whoever initiated the call so the network layer can enforce
-/// CORS, mixed content blocking, and Referrer-Policy.
+/// CORS, mixed content blocking, Referrer-Policy, and SameSite.
 #[derive(Default, Clone, Debug)]
 pub struct RequestContext {
     /// URL of the page that originated the request. Used to compute the
@@ -38,6 +42,12 @@ pub struct RequestContext {
     /// otherwise gated by CORS). Cross-origin reads fail unless the
     /// response carries a permissive `Access-Control-Allow-Origin`.
     pub cors_required: bool,
+    /// `true` when this is a user-initiated top-level navigation
+    /// (typed URL, link click) rather than a subresource fetch.
+    /// Affects which `SameSite=Lax` cookies are sent on the request
+    /// — Lax cookies travel with top-level GETs but not with
+    /// subresource loads.
+    pub is_top_level_navigation: bool,
 }
 
 impl RequestContext {
@@ -52,6 +62,11 @@ impl RequestContext {
 
     pub fn with_cors(mut self, on: bool) -> Self {
         self.cors_required = on;
+        self
+    }
+
+    pub fn with_top_level_navigation(mut self, on: bool) -> Self {
+        self.is_top_level_navigation = on;
         self
     }
 }
@@ -93,6 +108,12 @@ pub struct Client {
     /// only try h3 once per host before falling back permanently for
     /// the lifetime of the client.
     h3_blacklist: RefCell<HashSet<(String, u16)>>,
+    /// When `true`, drop all cookies (both Cookie header on outgoing
+    /// cross-site subresource requests, and incoming Set-Cookie from
+    /// cross-site subresource responses). Matches Safari/Firefox
+    /// default behaviour as of 2024. Top-level navigations and
+    /// same-site subresources are unaffected.
+    block_third_party_cookies: bool,
 }
 
 impl Default for Client {
@@ -117,11 +138,21 @@ impl Client {
             pool: RefCell::new(std::collections::HashMap::new()),
             h2_blacklist: RefCell::new(HashSet::new()),
             h3_blacklist: RefCell::new(HashSet::new()),
+            block_third_party_cookies: true,
         }
     }
 
     pub fn with_allow_loopback(mut self, allow: bool) -> Self {
         self.allow_loopback = allow;
+        self
+    }
+
+    /// Toggle third-party cookie blocking. Default `true` — matches
+    /// modern Safari/Firefox. Set `false` for sites that depend on
+    /// cross-site auth cookies (federated SSO, embedded chat).
+    #[allow(dead_code)]
+    pub fn with_third_party_cookies_blocked(mut self, on: bool) -> Self {
+        self.block_third_party_cookies = on;
         self
     }
 
@@ -134,11 +165,14 @@ impl Client {
 
     /// Build the `Cookie:` header value that we'd send to `url` right
     /// now. Exposed so the JS subsystem can implement `document.cookie`
-    /// readback. Returns an empty string if nothing matches.
+    /// readback. `document.cookie` reads always come from a script
+    /// running on the same page as the cookie's destination, so we
+    /// treat them as same-site / top-level / GET — every applicable
+    /// cookie is visible.
     pub fn cookies_for(&self, url: &Url) -> String {
         self.cookies
             .borrow()
-            .header_for(url)
+            .header_for(url, Some(url), true, true)
             .unwrap_or_default()
     }
 
@@ -333,6 +367,18 @@ impl Client {
             let cached_meta = self.cache.borrow_mut().lookup(&cache_key).cloned();
             if let Some(entry) = cached_meta {
                 if entry.is_fresh(now) {
+                    // Re-run CORS against the cached response's
+                    // headers before serving. Without this a cache
+                    // populated by a same-origin or no-CORS request
+                    // could leak a private body to a later
+                    // cross-origin reader.
+                    if !cors_allows(&entry.headers, &url, context) {
+                        tracing::warn!(
+                            %url,
+                            "cache: fresh hit blocked by CORS recheck",
+                        );
+                        return Err(Error::Cors(url.to_string()));
+                    }
                     tracing::debug!(%url, "cache: fresh hit");
                     if let Some((body, body_path)) =
                         self.cache.borrow_mut().read_body_for_response(&cache_key)
@@ -371,11 +417,25 @@ impl Client {
                 }
             }
         }
-        // Attach any matching cookies from the jar.
-        if let Some(cookie_header) = self.cookies.borrow().header_for(&url) {
-            request
-                .headers
-                .push(("Cookie".to_string(), cookie_header));
+        // Attach any matching cookies from the jar. SameSite + safe-
+        // method gating relies on the caller flagging whether this is
+        // a top-level navigation and which HTTP method is in play.
+        // Third-party cookie blocking sits on top: cross-site
+        // subresource requests get NO cookies at all (regardless of
+        // SameSite=None), absent an explicit opt-out.
+        let is_safe_method = matches!(method, Method::Get);
+        let third_party = is_third_party_subresource(&url, context);
+        if !(self.block_third_party_cookies && third_party) {
+            if let Some(cookie_header) = self.cookies.borrow().header_for(
+                &url,
+                context.initiator.as_ref(),
+                context.is_top_level_navigation,
+                is_safe_method,
+            ) {
+                request
+                    .headers
+                    .push(("Cookie".to_string(), cookie_header));
+            }
         }
 
         // Referer / Origin headers from the initiator. We use the
@@ -473,8 +533,10 @@ impl Client {
 
         // Ingest any Set-Cookie headers before deciding whether to follow
         // a redirect — the spec scopes Set-Cookie to the redirect's
-        // *origin* (the response we just got).
-        {
+        // *origin* (the response we just got). Third-party blocking
+        // also applies here: a cross-site subresource response can't
+        // plant a cookie either.
+        if !(self.block_third_party_cookies && third_party) {
             let iter = response
                 .headers
                 .iter()
@@ -492,7 +554,26 @@ impl Client {
             }
         }
 
-        // HTTP cache write / 304 refresh — only for GET.
+        // CORS enforcement happens BEFORE writing the cache so a
+        // CORS-blocked response can't poison the cache for a later
+        // same-origin reader.
+        if !cors_allows(&response.headers, &url, context) {
+            let want = context
+                .initiator
+                .as_ref()
+                .map(|i| i.origin().ascii_serialization())
+                .unwrap_or_default();
+            tracing::warn!(
+                %url,
+                %want,
+                "blocked cross-origin response without permissive CORS",
+            );
+            return Err(Error::Cors(url.to_string()));
+        }
+
+        // HTTP cache write / 304 refresh — only for GET. We do this
+        // AFTER CORS so a CORS-blocked response never makes it onto
+        // disk.
         if is_get {
             if response.status == 304 {
                 let refreshed = self
@@ -503,7 +584,7 @@ impl Client {
                     tracing::debug!(%url, "cache: 304 refresh");
                     // Substitute the cached body but keep the new
                     // response's headers so the cascade up the stack
-                    // (CORS / Set-Cookie / etc.) sees the latest.
+                    // (Set-Cookie / etc.) sees the latest.
                     return Ok(Response {
                         status: 200,
                         reason: "OK".into(),
@@ -514,29 +595,6 @@ impl Client {
                 }
             } else if (200..400).contains(&response.status) {
                 self.cache.borrow_mut().store(&cache_key, &response);
-            }
-        }
-
-        // CORS enforcement for fetch / XHR. Same-origin requests skip
-        // the check entirely.
-        if let Some(initiator) = &context.initiator {
-            if context.cors_required && initiator.origin() != url.origin() {
-                let allow = response.header("Access-Control-Allow-Origin");
-                let want = initiator.origin().ascii_serialization();
-                let permitted = match allow {
-                    Some("*") => true,
-                    Some(v) => v.trim().eq_ignore_ascii_case(&want),
-                    None => false,
-                };
-                if !permitted {
-                    tracing::warn!(
-                        %url,
-                        %want,
-                        allow = ?allow,
-                        "blocked cross-origin response without permissive CORS",
-                    );
-                    return Err(Error::Cors(url.to_string()));
-                }
             }
         }
 
@@ -575,5 +633,48 @@ fn build_path(url: &Url) -> String {
         Some(q) => format!("{path}?{q}"),
         None if path.is_empty() => "/".to_string(),
         None => path.to_string(),
+    }
+}
+
+/// True for cross-site subresource requests — the case
+/// third-party cookie blocking targets. A request is "third
+/// party" when the destination's registrable domain differs
+/// from the initiator's AND it isn't a top-level navigation
+/// (top-level nav cookies always flow so federated SSO,
+/// link-out tracking, etc. survive).
+fn is_third_party_subresource(url: &Url, context: &RequestContext) -> bool {
+    let Some(initiator) = &context.initiator else {
+        return false;
+    };
+    if context.is_top_level_navigation {
+        return false;
+    }
+    !cookies::same_site_urls(url, initiator)
+}
+
+/// Whether response headers permit the current request under CORS.
+/// Same-origin / no-CORS requests always pass. For cross-origin
+/// fetch / XHR, the response must carry an
+/// `Access-Control-Allow-Origin` of `*` or the initiator's origin.
+fn cors_allows(headers: &[(String, String)], url: &Url, context: &RequestContext) -> bool {
+    let Some(initiator) = &context.initiator else {
+        return true;
+    };
+    if !context.cors_required {
+        return true;
+    }
+    if initiator.origin() == url.origin() {
+        return true;
+    }
+    let allow = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("Access-Control-Allow-Origin"))
+        .map(|(_, v)| v.as_str());
+    match allow {
+        Some(v) if v.trim() == "*" => true,
+        Some(v) => v
+            .trim()
+            .eq_ignore_ascii_case(&initiator.origin().ascii_serialization()),
+        None => false,
     }
 }

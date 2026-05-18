@@ -21,10 +21,14 @@ use crate::dom::{Dom, NodeId, NodeKind};
 /// A stylesheet either embedded inline or referenced by URL.
 /// Phase 3 `main.rs` walks this list, fetching `External` refs through the
 /// network client. Order in the list matches DOM source order so cascade
-/// behaves correctly.
+/// behaves correctly. External refs carry an optional `integrity` value
+/// for Subresource Integrity verification.
 pub enum StylesheetRef {
     Embedded(Stylesheet),
-    External(String),
+    External {
+        href: String,
+        integrity: Option<String>,
+    },
 }
 
 pub fn discover_stylesheets(dom: &Dom) -> Vec<StylesheetRef> {
@@ -53,7 +57,14 @@ fn collect(dom: &Dom, node: NodeId, out: &mut Vec<StylesheetRef>) {
                 if is_stylesheet {
                     if let Some((_, href)) = attrs.iter().find(|(k, _)| k == "href") {
                         if !href.is_empty() {
-                            out.push(StylesheetRef::External(href.clone()));
+                            let integrity = attrs
+                                .iter()
+                                .find(|(k, _)| k.eq_ignore_ascii_case("integrity"))
+                                .map(|(_, v)| v.clone());
+                            out.push(StylesheetRef::External {
+                                href: href.clone(),
+                                integrity,
+                            });
                         }
                     }
                 }
@@ -221,9 +232,9 @@ mod tests {
         );
         let refs = discover_stylesheets(&dom);
         assert_eq!(refs.len(), 3);
-        assert!(matches!(refs[0], StylesheetRef::External(ref s) if s == "a.css"));
+        assert!(matches!(refs[0], StylesheetRef::External { ref href, .. } if href == "a.css"));
         assert!(matches!(refs[1], StylesheetRef::Embedded(_)));
-        assert!(matches!(refs[2], StylesheetRef::External(ref s) if s == "b.css"));
+        assert!(matches!(refs[2], StylesheetRef::External { ref href, .. } if href == "b.css"));
     }
 
     #[test]

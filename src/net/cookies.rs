@@ -34,7 +34,30 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 const JAR_MAGIC: &[u8; 4] = b"DBCJ";
-const JAR_VERSION: u8 = 1;
+const JAR_VERSION: u8 = 2;
+
+/// RFC 6265bis §5.2 SameSite. Default per modern browser (Chrome 80+
+/// / Firefox 96+) is `Lax` when the attribute isn't present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SameSite {
+    /// Sent only on same-site requests. Cross-site requests — even
+    /// top-level navigations — never include the cookie.
+    Strict,
+    /// Sent on same-site requests AND on cross-site top-level
+    /// navigations with safe methods (GET). Default for cookies
+    /// without an explicit `SameSite=` attribute.
+    Lax,
+    /// Sent on all requests, but only if the cookie also carries
+    /// `Secure`. Cookies with `SameSite=None` and no `Secure` are
+    /// rejected at parse time.
+    None_,
+}
+
+impl Default for SameSite {
+    fn default() -> Self {
+        SameSite::Lax
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Cookie {
@@ -45,6 +68,7 @@ pub struct Cookie {
     pub expires_at: Option<Instant>,
     pub secure: bool,
     pub http_only: bool,
+    pub same_site: SameSite,
 }
 
 #[derive(Default, Debug)]
@@ -116,10 +140,26 @@ impl CookieJar {
 
     /// Return the `Cookie:` header value for a given request URL, or
     /// `None` if no cookies match. Cookies are joined with `; `.
-    pub fn header_for(&self, url: &Url) -> Option<String> {
+    ///
+    /// `initiator` is the page that triggered the request (for
+    /// SameSite enforcement and third-party blocking).
+    /// `is_top_level_nav` is true when the user is navigating to
+    /// `url` (typed address, link click). `is_safe_method` is true
+    /// for GET — `Lax` cookies require both.
+    pub fn header_for(
+        &self,
+        url: &Url,
+        initiator: Option<&Url>,
+        is_top_level_nav: bool,
+        is_safe_method: bool,
+    ) -> Option<String> {
         let host = url.host_str()?;
         let path = if url.path().is_empty() { "/" } else { url.path() };
         let is_https = url.scheme() == "https";
+        let same_site_request = match initiator {
+            None => true,
+            Some(init) => same_site_urls(url, init),
+        };
 
         let mut hits: Vec<(usize, &Cookie)> = Vec::new();
         for c in &self.cookies {
@@ -131,6 +171,24 @@ impl CookieJar {
             }
             if !path_matches(path, &c.path) {
                 continue;
+            }
+            if !same_site_request {
+                match c.same_site {
+                    SameSite::Strict => continue,
+                    SameSite::Lax => {
+                        // Send only on top-level GET-style navigations.
+                        if !(is_top_level_nav && is_safe_method) {
+                            continue;
+                        }
+                    }
+                    SameSite::None_ => {
+                        // SameSite=None requires Secure to even be
+                        // stored, but double-check here.
+                        if !c.secure {
+                            continue;
+                        }
+                    }
+                }
             }
             hits.push((c.path.len(), c));
         }
@@ -193,6 +251,7 @@ pub fn parse_set_cookie(line: &str, url: &Url) -> Option<Cookie> {
         expires_at: None,
         secure: false,
         http_only: false,
+        same_site: SameSite::Lax,
     };
 
     for attr in parts {
@@ -229,7 +288,16 @@ pub fn parse_set_cookie(line: &str, url: &Url) -> Option<Cookie> {
                             }
                         }
                     }
-                    _ => {} // expires/samesite/etc. ignored
+                    "samesite" => {
+                        cookie.same_site = match v.trim().to_ascii_lowercase().as_str() {
+                            "strict" => SameSite::Strict,
+                            "none" => SameSite::None_,
+                            // "lax" or anything we don't understand
+                            // → the modern default.
+                            _ => SameSite::Lax,
+                        };
+                    }
+                    _ => {} // expires/etc. ignored
                 }
             }
         } else {
@@ -240,6 +308,11 @@ pub fn parse_set_cookie(line: &str, url: &Url) -> Option<Cookie> {
                 cookie.http_only = true;
             }
         }
+    }
+    // RFC 6265bis §4.1.2.7: SameSite=None requires Secure. Cookies
+    // that violate the rule are rejected at storage time.
+    if cookie.same_site == SameSite::None_ && !cookie.secure {
+        return None;
     }
     Some(cookie)
 }
@@ -279,6 +352,30 @@ fn domain_matches(host: &str, cookie_domain: &str) -> bool {
         return false;
     }
     host.as_bytes()[suffix_start - 1] == b'.'
+}
+
+/// Approximate eTLD+1 by taking the rightmost two DNS labels. This is
+/// correct for `.com`/`.net`/`.org` style TLDs and wrong for `.co.uk`
+/// / `.ac.jp` style — real browsers consult the Public Suffix List.
+/// Pulling PSL into the toy is a future-tightening; this gets us
+/// 90% of the way for the common case.
+pub fn registrable_domain(host: &str) -> &str {
+    let Some(last_dot) = host.rfind('.') else {
+        return host;
+    };
+    match host[..last_dot].rfind('.') {
+        Some(prior_dot) => &host[prior_dot + 1..],
+        None => host,
+    }
+}
+
+pub fn same_site_urls(a: &Url, b: &Url) -> bool {
+    let ha = a.host_str().unwrap_or("");
+    let hb = b.host_str().unwrap_or("");
+    if ha.is_empty() || hb.is_empty() {
+        return false;
+    }
+    registrable_domain(ha).eq_ignore_ascii_case(registrable_domain(hb))
 }
 
 fn path_matches(request_path: &str, cookie_path: &str) -> bool {
@@ -360,6 +457,11 @@ fn encode_jar(cookies: &[&Cookie]) -> Vec<u8> {
         out.extend_from_slice(&ms.to_le_bytes());
         out.push(c.secure as u8);
         out.push(c.http_only as u8);
+        out.push(match c.same_site {
+            SameSite::Strict => 0,
+            SameSite::Lax => 1,
+            SameSite::None_ => 2,
+        });
     }
     out
 }
@@ -382,12 +484,17 @@ fn decode_jar(buf: &[u8]) -> Option<Vec<Cookie>> {
         let domain = read_lp(buf, &mut p)?;
         let path = read_lp(buf, &mut p)?;
         let ms = read_u64(buf, &mut p)?;
-        if p + 2 > buf.len() {
+        if p + 3 > buf.len() {
             return None;
         }
         let secure = buf[p] != 0;
         let http_only = buf[p + 1] != 0;
-        p += 2;
+        let same_site = match buf[p + 2] {
+            0 => SameSite::Strict,
+            2 => SameSite::None_,
+            _ => SameSite::Lax,
+        };
+        p += 3;
         let expires_at = if ms == 0 {
             None
         } else {
@@ -401,6 +508,7 @@ fn decode_jar(buf: &[u8]) -> Option<Vec<Cookie>> {
             expires_at,
             secure,
             http_only,
+            same_site,
         });
     }
     Some(out)
@@ -520,14 +628,22 @@ mod tests {
         assert!(!path_matches("/foobar", "/foo"));
     }
 
+    fn same_site_ctx(u: &Url) -> (Option<&Url>, bool, bool) {
+        (Some(u), true, true)
+    }
+
     #[test]
     fn jar_header_for_matches_secure_only_on_https() {
         let mut jar = CookieJar::new_in_memory();
         let mut c = parse_set_cookie("a=1; Secure", &url("https://example.com/")).unwrap();
         c.secure = true;
         jar.insert(c);
-        assert!(jar.header_for(&url("https://example.com/")).is_some());
-        assert!(jar.header_for(&url("http://example.com/")).is_none());
+        let u_https = url("https://example.com/");
+        let u_http = url("http://example.com/");
+        let (init, tln, safe) = same_site_ctx(&u_https);
+        assert!(jar.header_for(&u_https, init, tln, safe).is_some());
+        let (init, tln, safe) = same_site_ctx(&u_http);
+        assert!(jar.header_for(&u_http, init, tln, safe).is_none());
     }
 
     #[test]
@@ -535,7 +651,9 @@ mod tests {
         let mut jar = CookieJar::new_in_memory();
         jar.insert(parse_set_cookie("a=1", &url("https://example.com/")).unwrap());
         jar.insert(parse_set_cookie("a=2", &url("https://example.com/")).unwrap());
-        let h = jar.header_for(&url("https://example.com/")).unwrap();
+        let u = url("https://example.com/");
+        let (init, tln, safe) = same_site_ctx(&u);
+        let h = jar.header_for(&u, init, tln, safe).unwrap();
         assert_eq!(h, "a=2");
     }
 
@@ -546,7 +664,9 @@ mod tests {
         jar.insert(
             parse_set_cookie("a=1; Max-Age=0", &url("https://example.com/")).unwrap(),
         );
-        assert!(jar.header_for(&url("https://example.com/")).is_none());
+        let u = url("https://example.com/");
+        let (init, tln, safe) = same_site_ctx(&u);
+        assert!(jar.header_for(&u, init, tln, safe).is_none());
     }
 
     #[test]
@@ -559,7 +679,9 @@ mod tests {
         ];
         jar.ingest_set_cookies(&url("https://example.com/"), headers.iter().copied());
         assert_eq!(jar.cookies().len(), 2);
-        let h = jar.header_for(&url("https://example.com/")).unwrap();
+        let u = url("https://example.com/");
+        let (init, tln, safe) = same_site_ctx(&u);
+        let h = jar.header_for(&u, init, tln, safe).unwrap();
         // Both present, joined with `; `.
         assert!(h.contains("a=1") && h.contains("b=2"));
     }
@@ -571,7 +693,52 @@ mod tests {
         jar.insert(
             parse_set_cookie("b=2; Path=/foo", &url("https://x/foo/")).unwrap(),
         );
-        let h = jar.header_for(&url("https://x/foo/bar")).unwrap();
+        let u = url("https://x/foo/bar");
+        let (init, tln, safe) = same_site_ctx(&u);
+        let h = jar.header_for(&u, init, tln, safe).unwrap();
         assert!(h.starts_with("b=2"));
+    }
+
+    #[test]
+    fn samesite_strict_blocks_cross_site() {
+        let mut jar = CookieJar::new_in_memory();
+        jar.insert(
+            parse_set_cookie("a=1; SameSite=Strict", &url("https://example.com/")).unwrap(),
+        );
+        let dest = url("https://example.com/");
+        let initiator = url("https://other.example.org/");
+        // Cross-site → blocked even on top-level navigation.
+        assert!(jar.header_for(&dest, Some(&initiator), true, true).is_none());
+        // Same-site → fine.
+        assert!(jar.header_for(&dest, Some(&dest), false, true).is_some());
+    }
+
+    #[test]
+    fn samesite_lax_blocks_cross_site_subresource() {
+        let mut jar = CookieJar::new_in_memory();
+        // Default (no SameSite attribute) is Lax.
+        jar.insert(parse_set_cookie("a=1", &url("https://example.com/")).unwrap());
+        let dest = url("https://example.com/");
+        let initiator = url("https://other.example.org/");
+        // Cross-site subresource (top_level=false) → blocked.
+        assert!(jar.header_for(&dest, Some(&initiator), false, true).is_none());
+        // Cross-site top-level GET → allowed.
+        assert!(jar.header_for(&dest, Some(&initiator), true, true).is_some());
+        // Cross-site top-level POST → blocked (non-safe method).
+        assert!(jar.header_for(&dest, Some(&initiator), true, false).is_none());
+    }
+
+    #[test]
+    fn samesite_none_rejected_without_secure() {
+        assert!(parse_set_cookie(
+            "a=1; SameSite=None",
+            &url("https://example.com/"),
+        )
+        .is_none());
+        let c =
+            parse_set_cookie("a=1; SameSite=None; Secure", &url("https://example.com/"))
+                .unwrap();
+        assert_eq!(c.same_site, SameSite::None_);
+        assert!(c.secure);
     }
 }

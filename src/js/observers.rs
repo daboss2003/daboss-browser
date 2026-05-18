@@ -7,17 +7,22 @@
 //! the queue after every dispatch and fires the matching observers'
 //! callbacks with a batch.
 //!
-//! **IntersectionObserver** — registration is stored; the callback
-//! fires *once* synchronously per registered target, reporting that
-//! the target is fully visible. Pages that rely on continuous
-//! intersection tracking (infinite scroll, lazy loading) get the
-//! "first sighting" event but won't fire on subsequent scrolls yet.
+//! **IntersectionObserver** — threshold-driven. Each observer
+//! carries an `Options.threshold` array (default `[0]`) and a
+//! per-target last-reported ratio. After every layout pass,
+//! [`tick_layout_observers`] recomputes intersection of every
+//! observed target against the viewport (the implicit root). It
+//! fires the callback whenever:
+//!  * the boolean `isIntersecting` flipped, OR
+//!  * the ratio crossed any threshold in the configured list.
+//! This is what makes infinite-scroll / lazy-load libraries work.
 //!
-//! **ResizeObserver** — same shape as IntersectionObserver. Fires once
-//! per registered target with the current width/height. Continuous
-//! resize tracking is future work.
+//! **ResizeObserver** — also threshold-aware. Records each target's
+//! last seen `(width, height)` and fires when the layout's current
+//! box size differs.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use boa_engine::{
@@ -28,6 +33,7 @@ use boa_engine::{
 };
 
 use crate::dom::NodeId;
+use crate::layout::BoxTree;
 
 use super::dom as js_dom;
 
@@ -72,11 +78,20 @@ pub(crate) struct MutationWatch {
 pub(crate) struct IntersectionObserverEntry {
     pub(crate) callback: JsFunction,
     pub(crate) targets: Vec<NodeId>,
+    /// Sorted, deduped list of thresholds in [0, 1]. Defaults to
+    /// `[0.0]` when the page didn't pass a threshold option.
+    pub(crate) thresholds: Vec<f64>,
+    /// Last-reported state per target, used to detect threshold
+    /// crossings. `(was_intersecting, last_ratio)`.
+    pub(crate) last_state: HashMap<NodeId, (bool, f64)>,
 }
 
 pub(crate) struct ResizeObserverEntry {
     pub(crate) callback: JsFunction,
     pub(crate) targets: Vec<NodeId>,
+    /// Last-reported `(width, height)` per target so we only fire
+    /// when the box actually changed size.
+    pub(crate) last_size: HashMap<NodeId, (f32, f32)>,
 }
 
 thread_local! {
@@ -248,12 +263,17 @@ fn intersection_observer_ctor(_: &JsValue, args: &[JsValue], ctx: &mut Context) 
     let Some(cb) = args.first().and_then(extract_fn) else {
         return Ok(JsValue::null());
     };
+    // Parse `options.threshold` — may be a single number or an
+    // array of numbers in [0, 1]. Default per spec is [0].
+    let thresholds = parse_thresholds(args.get(1), ctx);
     let idx = JS_OBSERVERS.with(|slot| {
         if let Some(rc) = slot.borrow().as_ref() {
             let mut s = rc.borrow_mut();
             s.intersection_observers.push(IntersectionObserverEntry {
                 callback: cb,
                 targets: Vec::new(),
+                thresholds,
+                last_state: HashMap::new(),
             });
             s.intersection_observers.len() - 1
         } else {
@@ -376,6 +396,7 @@ fn resize_observer_ctor(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
             s.resize_observers.push(ResizeObserverEntry {
                 callback: cb,
                 targets: Vec::new(),
+                last_size: HashMap::new(),
             });
             s.resize_observers.len() - 1
         } else {

@@ -122,6 +122,18 @@ fn build_document(ctx: &mut Context) -> JsObject {
         Some(cookie_set),
         Attribute::ENUMERABLE,
     );
+    let feature_policy = super::permissions::build_policy_object(b.context());
+    let permissions_policy = super::permissions::build_policy_object(b.context());
+    b.property(
+        js_string!("featurePolicy"),
+        JsValue::from(feature_policy),
+        Attribute::READONLY,
+    );
+    b.property(
+        js_string!("permissionsPolicy"),
+        JsValue::from(permissions_policy),
+        Attribute::READONLY,
+    );
     b.build()
 }
 
@@ -1374,7 +1386,10 @@ fn element_set_inner_html(this: &JsValue, args: &[JsValue], ctx: &mut Context) -
     let Some(val) = args.first() else {
         return Ok(JsValue::undefined());
     };
-    let src = val.to_string(ctx)?.to_std_string_escaped();
+    // Trusted Types: when CSP set
+    // `require-trusted-types-for 'script'`, raw strings get
+    // rejected (unless a default policy is registered).
+    let src = super::trusted_types::resolve_html_sink(val, ctx)?;
     // Parse the new content into a temporary Dom. The parser wraps any
     // bare fragment in a synthetic Document; the actual content lives
     // under the document's root element / body equivalent.

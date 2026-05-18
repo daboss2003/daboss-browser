@@ -314,8 +314,16 @@ impl Drop for EventSourceConnection {
     }
 }
 
+/// Cap on queued SSE events before we drop the oldest. Live
+/// streams (chat tickers, log feeds) can outpace JS handlers; this
+/// floor keeps the queue at ≤ 1024 events.
+const INBOUND_QUEUE_CAP: usize = 1024;
+
 fn push(queue: &Arc<Mutex<VecDeque<SseInbound>>>, ev: SseInbound) {
     if let Ok(mut q) = queue.lock() {
+        while q.len() >= INBOUND_QUEUE_CAP {
+            q.pop_front();
+        }
         q.push_back(ev);
     }
 }

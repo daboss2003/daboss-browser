@@ -471,8 +471,7 @@ impl JsEngine {
         let rtc_runtime = crate::webrtc::build_runtime();
         let ws_registry: super::websocket::WsRegistry = Rc::new(RefCell::new(Vec::new()));
         let es_registry: super::sse::EsRegistry = Rc::new(RefCell::new(Vec::new()));
-        let idb: super::idb::IdbState =
-            Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let idb: super::idb::IdbState = Rc::new(RefCell::new(()));
         let workers: super::worker::WorkerRegistry = Rc::new(RefCell::new(Vec::new()));
         let webgl_contexts: super::webgl::WebGlContexts =
             Rc::new(RefCell::new(std::collections::HashMap::new()));

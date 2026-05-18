@@ -95,7 +95,9 @@ fn origin_root() -> PathBuf {
     base
 }
 
-fn data_dir_path() -> PathBuf {
+/// Resolve the platform's user-data directory. Shared with other
+/// per-origin disk-backed stores (IndexedDB, localStorage).
+pub(crate) fn data_dir_path() -> PathBuf {
     if let Ok(p) = std::env::var("XDG_DATA_HOME") {
         if !p.is_empty() {
             return PathBuf::from(p);
@@ -128,9 +130,20 @@ fn data_dir_path() -> PathBuf {
     std::env::temp_dir()
 }
 
+/// Resolve the current page's origin host into a sanitised path
+/// component. Shared with other per-origin disk-backed stores.
+pub(crate) fn current_origin_host() -> String {
+    let host = super::engine::JS_BASE_URL.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|u| u.host_str().map(|s| s.to_string()))
+    });
+    sanitise_path_component(&host.unwrap_or_else(|| "default".to_string()))
+}
+
 /// Strip path traversal characters so an origin like `..` or
 /// `foo/bar` can't reach outside the OPFS root.
-fn sanitise_path_component(s: &str) -> String {
+pub(crate) fn sanitise_path_component(s: &str) -> String {
     s.chars()
         .map(|c| match c {
             'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => c,

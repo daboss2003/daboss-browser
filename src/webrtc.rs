@@ -26,6 +26,21 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+/// Cap on queued PeerConnection events (ICE candidates, state
+/// changes, data-channel messages) before we start dropping the
+/// oldest. A fast remote with a slow JS handler used to grow this
+/// queue without bound.
+const INBOUND_QUEUE_CAP: usize = 1024;
+
+fn push_event_bounded(queue: &Arc<Mutex<VecDeque<PcEvent>>>, ev: PcEvent) {
+    if let Ok(mut q) = queue.lock() {
+        while q.len() >= INBOUND_QUEUE_CAP {
+            q.pop_front();
+        }
+        q.push_back(ev);
+    }
+}
+
 use tokio::runtime::Runtime;
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
@@ -121,9 +136,7 @@ impl PeerConnection {
             let q = ev_ice.clone();
             Box::pin(async move {
                 let payload = candidate.map(|c| c.to_string());
-                if let Ok(mut q) = q.lock() {
-                    q.push_back(PcEvent::IceCandidate(payload));
-                }
+                push_event_bounded(&q, PcEvent::IceCandidate(payload));
             })
         }));
 
@@ -132,9 +145,7 @@ impl PeerConnection {
             let q = ev_state.clone();
             let name = format!("{state}").to_lowercase();
             Box::pin(async move {
-                if let Ok(mut q) = q.lock() {
-                    q.push_back(PcEvent::ConnectionState(name));
-                }
+                push_event_bounded(&q, PcEvent::ConnectionState(name));
             })
         }));
 
@@ -149,12 +160,13 @@ impl PeerConnection {
                     _ => "unknown",
                 };
                 let id = track.id().to_string();
-                if let Ok(mut q) = q.lock() {
-                    q.push_back(PcEvent::TrackReceived {
+                push_event_bounded(
+                    &q,
+                    PcEvent::TrackReceived {
                         kind: kind.to_string(),
                         id,
-                    });
-                }
+                    },
+                );
             })
         }));
 
@@ -171,15 +183,11 @@ impl PeerConnection {
                 Box::pin(async move {
                     let payload =
                         String::from_utf8(msg.data.to_vec()).unwrap_or_default();
-                    if let Ok(mut q) = q.lock() {
-                        q.push_back(PcEvent::DataMessage(label, payload));
-                    }
+                    push_event_bounded(&q, PcEvent::DataMessage(label, payload));
                 })
             }));
             Box::pin(async move {
-                if let Ok(mut q) = q_open.lock() {
-                    q.push_back(PcEvent::DataChannel(label_for_open));
-                }
+                push_event_bounded(&q_open, PcEvent::DataChannel(label_for_open));
             })
         }));
 
@@ -309,9 +317,7 @@ impl PeerConnection {
             let q = q_open.clone();
             let label = label_for_open.clone();
             Box::pin(async move {
-                if let Ok(mut q) = q.lock() {
-                    q.push_back(PcEvent::DataChannelOpen(label));
-                }
+                push_event_bounded(&q, PcEvent::DataChannelOpen(label));
             })
         }));
         let q_msg = self.events.clone();
@@ -321,9 +327,7 @@ impl PeerConnection {
             let label = label_for_msg.clone();
             Box::pin(async move {
                 let payload = String::from_utf8(msg.data.to_vec()).unwrap_or_default();
-                if let Ok(mut q) = q.lock() {
-                    q.push_back(PcEvent::DataMessage(label, payload));
-                }
+                push_event_bounded(&q, PcEvent::DataMessage(label, payload));
             })
         }));
         Some(dc)

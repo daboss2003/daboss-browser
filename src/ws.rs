@@ -22,6 +22,21 @@ const STATE_OPEN: u8 = 1;
 const STATE_CLOSING: u8 = 2;
 const STATE_CLOSED: u8 = 3;
 
+/// Cap on queued inbound frames before we start dropping the oldest.
+/// A slow JS handler on a fast feed (live ticker, log stream) used
+/// to grow this queue without bound and OOM the tab; this floor
+/// keeps the queue at ≤ 1024 entries.
+const INBOUND_QUEUE_CAP: usize = 1024;
+
+fn push_bounded(q: &Arc<Mutex<VecDeque<WsInbound>>>, value: WsInbound) {
+    if let Ok(mut q) = q.lock() {
+        while q.len() >= INBOUND_QUEUE_CAP {
+            q.pop_front();
+        }
+        q.push_back(value);
+    }
+}
+
 /// Server → client message visible to JS.
 #[derive(Debug, Clone)]
 pub enum WsInbound {
@@ -65,7 +80,7 @@ impl WebSocketConnection {
 
         let socket = Arc::new(Mutex::new(Some(socket)));
         let inbound: Arc<Mutex<VecDeque<WsInbound>>> = Arc::new(Mutex::new(VecDeque::new()));
-        inbound.lock().unwrap().push_back(WsInbound::Open);
+        push_bounded(&inbound, WsInbound::Open);
         let ready_state = Arc::new(AtomicU8::new(STATE_OPEN));
         let closed = Arc::new(AtomicBool::new(false));
 
@@ -92,20 +107,14 @@ impl WebSocketConnection {
             };
             match msg {
                 Ok(Message::Text(t)) => {
-                    inbound_for_reader
-                        .lock()
-                        .unwrap()
-                        .push_back(WsInbound::Text(t.to_string()));
+                    push_bounded(&inbound_for_reader, WsInbound::Text(t.to_string()));
                 }
                 Ok(Message::Binary(b)) => {
-                    inbound_for_reader
-                        .lock()
-                        .unwrap()
-                        .push_back(WsInbound::Binary(b.to_vec()));
+                    push_bounded(&inbound_for_reader, WsInbound::Binary(b.to_vec()));
                 }
                 Ok(Message::Close(_)) => {
                     state_for_reader.store(STATE_CLOSED, Ordering::Relaxed);
-                    inbound_for_reader.lock().unwrap().push_back(WsInbound::Closed);
+                    push_bounded(&inbound_for_reader, WsInbound::Closed);
                     break;
                 }
                 Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {
@@ -117,10 +126,7 @@ impl WebSocketConnection {
                     std::thread::sleep(std::time::Duration::from_millis(30));
                 }
                 Err(e) => {
-                    inbound_for_reader
-                        .lock()
-                        .unwrap()
-                        .push_back(WsInbound::Error(e.to_string()));
+                    push_bounded(&inbound_for_reader, WsInbound::Error(e.to_string()));
                     state_for_reader.store(STATE_CLOSED, Ordering::Relaxed);
                     break;
                 }

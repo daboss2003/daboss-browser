@@ -39,6 +39,11 @@ pub fn install(ctx: &mut Context) {
     install_navigation(ctx);
     install_hardware_stubs(ctx);
     install_media_session(ctx);
+    install_notifications(ctx);
+    install_push(ctx);
+    install_background_sync(ctx);
+    install_web_transport(ctx);
+    install_picture_in_picture(ctx);
 }
 
 thread_local! {
@@ -530,4 +535,299 @@ fn media_set_action_handler(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsRe
 
 fn media_set_position_state(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
     Ok(JsValue::undefined())
+}
+
+// =================== Notifications ===================
+
+fn install_notifications(ctx: &mut Context) {
+    // `Notification` is a constructor that ALSO exposes static
+    // `requestPermission` + `permission` properties. We expose it as
+    // a callable global with the static fields attached.
+    let _ = ctx.register_global_callable(
+        js_string!("Notification"),
+        2,
+        NativeFunction::from_fn_ptr(notification_ctor),
+    );
+    // Attach static properties on the now-registered constructor.
+    let global = ctx.global_object();
+    if let Ok(notif_val) = global.get(js_string!("Notification"), ctx) {
+        if let Some(notif) = notif_val.as_object() {
+            let realm = ctx.realm().clone();
+            let req = boa_engine::object::FunctionObjectBuilder::new(
+                &realm,
+                NativeFunction::from_fn_ptr(notification_request_permission),
+            )
+            .build();
+            let _ = notif.set(
+                js_string!("requestPermission"),
+                JsValue::from(req),
+                false,
+                ctx,
+            );
+            let _ = notif.set(
+                js_string!("permission"),
+                JsValue::from(js_string!("default")),
+                false,
+                ctx,
+            );
+            let _ = notif.set(
+                js_string!("maxActions"),
+                JsValue::from(0u32),
+                false,
+                ctx,
+            );
+        }
+    }
+}
+
+fn notification_ctor(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let title = args
+        .first()
+        .map(|v| v.to_string(ctx))
+        .transpose()?
+        .map(|s| s.to_std_string_escaped())
+        .unwrap_or_default();
+    let body = args
+        .get(1)
+        .and_then(|v| v.as_object().cloned())
+        .and_then(|o| o.get(js_string!("body"), ctx).ok())
+        .and_then(|v| v.to_string(ctx).ok())
+        .map(|s| s.to_std_string_escaped())
+        .unwrap_or_default();
+    let realm = ctx.realm().clone();
+    let close = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(noop_zero),
+    )
+    .build();
+    Ok(JsValue::from(
+        ObjectInitializer::new(ctx)
+            .property(
+                js_string!("title"),
+                JsValue::from(js_string!(title)),
+                Attribute::READONLY,
+            )
+            .property(
+                js_string!("body"),
+                JsValue::from(js_string!(body)),
+                Attribute::READONLY,
+            )
+            .property(js_string!("close"), JsValue::from(close), Attribute::READONLY)
+            .build(),
+    ))
+}
+
+fn notification_request_permission(
+    _: &JsValue,
+    _: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    // No OS notification backend; refuse permission honestly so
+    // pages take the fallback branch.
+    Ok(JsPromise::resolve(JsValue::from(js_string!("denied")), ctx).into())
+}
+
+// =================== Push API ===================
+
+fn install_push(ctx: &mut Context) {
+    // `PushManager` is conceptually on
+    // `ServiceWorkerRegistration.pushManager`. We install a global
+    // `PushManager` namespace so feature detection passes; the SW
+    // module can pull this in when it wires the registration object.
+    let realm = ctx.realm().clone();
+    let subscribe = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(push_subscribe),
+    )
+    .build();
+    let get_subscription = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(push_get_subscription),
+    )
+    .build();
+    let permission_state = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(push_permission_state),
+    )
+    .build();
+    let push_manager = ObjectInitializer::new(ctx)
+        .property(
+            js_string!("subscribe"),
+            JsValue::from(subscribe),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("getSubscription"),
+            JsValue::from(get_subscription),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("permissionState"),
+            JsValue::from(permission_state),
+            Attribute::READONLY,
+        )
+        .build();
+    let _ = ctx.register_global_property(
+        js_string!("PushManager"),
+        push_manager,
+        Attribute::WRITABLE | Attribute::CONFIGURABLE,
+    );
+}
+
+fn push_subscribe(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    // No push server backing. Reject so pages take the offline
+    // branch rather than handing a fake endpoint they'd POST to.
+    let err: JsError = boa_engine::JsNativeError::error()
+        .with_message("AbortError: push subscription unavailable")
+        .into();
+    Ok(JsPromise::reject(err, ctx).into())
+}
+
+fn push_get_subscription(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    Ok(JsPromise::resolve(JsValue::null(), ctx).into())
+}
+
+fn push_permission_state(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    Ok(JsPromise::resolve(JsValue::from(js_string!("denied")), ctx).into())
+}
+
+// =================== Background Sync ===================
+
+fn install_background_sync(ctx: &mut Context) {
+    let realm = ctx.realm().clone();
+    let mk = |f: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>| {
+        boa_engine::object::FunctionObjectBuilder::new(&realm, NativeFunction::from_fn_ptr(f))
+            .build()
+    };
+    let sync = ObjectInitializer::new(ctx)
+        .property(
+            js_string!("register"),
+            JsValue::from(mk(sync_register)),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("getTags"),
+            JsValue::from(mk(sync_get_tags)),
+            Attribute::READONLY,
+        )
+        .build();
+    let _ = ctx.register_global_property(
+        js_string!("SyncManager"),
+        sync,
+        Attribute::WRITABLE | Attribute::CONFIGURABLE,
+    );
+}
+
+fn sync_register(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    // Spec says register resolves; we resolve since the toy can't
+    // schedule a true background event but pages assume success.
+    Ok(JsPromise::resolve(JsValue::undefined(), ctx).into())
+}
+
+fn sync_get_tags(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let arr = boa_engine::object::builtins::JsArray::new(ctx);
+    Ok(JsPromise::resolve(JsValue::from(arr), ctx).into())
+}
+
+// =================== WebTransport ===================
+
+fn install_web_transport(ctx: &mut Context) {
+    // `WebTransport` is a constructor that pages new up with a URL.
+    let _ = ctx.register_global_callable(
+        js_string!("WebTransport"),
+        1,
+        NativeFunction::from_fn_ptr(web_transport_ctor),
+    );
+}
+
+fn web_transport_ctor(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let url = args
+        .first()
+        .map(|v| v.to_string(ctx))
+        .transpose()?
+        .map(|s| s.to_std_string_escaped())
+        .unwrap_or_default();
+    // The `ready` Promise rejects (no QUIC datagram channel wired
+    // through to JS yet). Pages awaiting `transport.ready` get a
+    // typed error and bail.
+    let err: JsError = boa_engine::JsNativeError::error()
+        .with_message("WebTransport unavailable on this toy build")
+        .into();
+    let rejected = JsPromise::reject(err, ctx);
+    let realm = ctx.realm().clone();
+    let close = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(noop_zero),
+    )
+    .build();
+    Ok(JsValue::from(
+        ObjectInitializer::new(ctx)
+            .property(
+                js_string!("url"),
+                JsValue::from(js_string!(url)),
+                Attribute::READONLY,
+            )
+            .property(
+                js_string!("ready"),
+                JsValue::from(rejected.clone()),
+                Attribute::READONLY,
+            )
+            .property(
+                js_string!("closed"),
+                JsValue::from(rejected),
+                Attribute::READONLY,
+            )
+            .property(js_string!("close"), JsValue::from(close), Attribute::READONLY)
+            .build(),
+    ))
+}
+
+// =================== Picture-in-Picture ===================
+
+fn install_picture_in_picture(ctx: &mut Context) {
+    // `document.pictureInPictureEnabled` / `exitPictureInPicture` —
+    // wire on the existing document handle. We can't easily extend
+    // dom.rs from here without refactor, so install module-level
+    // globals that legacy feature-detection often falls back to.
+    let realm = ctx.realm().clone();
+    let exit = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(pip_exit),
+    )
+    .build();
+    let global = ctx.global_object();
+    if let Ok(doc_val) = global.get(js_string!("document"), ctx) {
+        if let Some(doc) = doc_val.as_object() {
+            let _ = doc.set(
+                js_string!("pictureInPictureEnabled"),
+                JsValue::from(false),
+                false,
+                ctx,
+            );
+            let _ = doc.set(
+                js_string!("pictureInPictureElement"),
+                JsValue::null(),
+                false,
+                ctx,
+            );
+            let _ = doc.set(
+                js_string!("exitPictureInPicture"),
+                JsValue::from(exit),
+                false,
+                ctx,
+            );
+        }
+    }
+    // Also register the PiP `PictureInPictureWindow` global for
+    // feature-detection completeness.
+    let pip_window = ObjectInitializer::new(ctx).build();
+    let _ = ctx.register_global_property(
+        js_string!("PictureInPictureWindow"),
+        pip_window,
+        Attribute::WRITABLE | Attribute::CONFIGURABLE,
+    );
+}
+
+fn pip_exit(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    Ok(JsPromise::resolve(JsValue::undefined(), ctx).into())
 }

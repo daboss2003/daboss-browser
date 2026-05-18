@@ -1199,6 +1199,57 @@ fn apply_declaration(
                 _ => TextOverflow::Clip,
             };
         }
+        "line-clamp" | "-webkit-line-clamp" => {
+            style.line_clamp = match value {
+                Value::Number(n) if *n > 0.0 => Some(*n as u32),
+                Value::Keyword(k) if k == "none" => None,
+                _ => style.line_clamp,
+            };
+        }
+        "scroll-snap-type" => {
+            style.scroll_snap_type = stringify_value(value);
+        }
+        "scroll-snap-align" => {
+            style.scroll_snap_align = stringify_value(value);
+        }
+        "font-feature-settings" => {
+            style.font_feature_settings = stringify_value(value);
+        }
+        "hyphens" => {
+            style.hyphens = match value {
+                Value::Keyword(k) => Some(k.to_ascii_lowercase()),
+                _ => None,
+            };
+        }
+        "container-type" => {
+            style.container_type = match value {
+                Value::Keyword(k) => Some(k.to_ascii_lowercase()),
+                _ => None,
+            };
+        }
+        "container-name" => {
+            style.container_name = match value {
+                Value::Keyword(k) => Some(k.clone()),
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            };
+        }
+        "container" => {
+            // Shorthand: `container: <name> [/ <type>]`. Best-effort
+            // parse — split on `/`, name first, type second.
+            let text = render_value(value);
+            let mut parts = text.split('/');
+            if let Some(name) = parts.next().map(str::trim) {
+                if !name.is_empty() {
+                    style.container_name = Some(name.to_string());
+                }
+            }
+            if let Some(ty) = parts.next().map(str::trim) {
+                if !ty.is_empty() {
+                    style.container_type = Some(ty.to_ascii_lowercase());
+                }
+            }
+        }
         "transition" => {
             style.transitions = transitions_from(value);
         }
@@ -1537,6 +1588,42 @@ fn filter_chain_from(value: &Value) -> Vec<FilterFunction> {
         out.push(entry);
     }
     out
+}
+
+/// Best-effort textual rendering of a CSS `Value` for properties we
+/// don't fully model (scroll-snap-type, font-feature-settings, etc.).
+/// Returns `None` if the value is empty or unrecognised.
+fn stringify_value(value: &Value) -> Option<String> {
+    let s = render_value(value);
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn render_value(value: &Value) -> String {
+    match value {
+        Value::Keyword(k) => k.clone(),
+        Value::String(s) => format!("\"{s}\""),
+        Value::Number(n) => format!("{n}"),
+        Value::Percentage(p) => format!("{p}%"),
+        Value::Length(n, unit) => format!("{n}{unit:?}").to_lowercase(),
+        Value::List(items) => items
+            .iter()
+            .map(render_value)
+            .collect::<Vec<_>>()
+            .join(" "),
+        Value::Function { name, args } => {
+            let inner = args
+                .iter()
+                .map(render_value)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{name}({inner})")
+        }
+        _ => String::new(),
+    }
 }
 
 fn transform_matrix_from(

@@ -96,6 +96,29 @@ impl<'a> Parser<'a> {
                 sheet.font_faces.extend(inner.font_faces);
                 sheet.keyframes.extend(inner.keyframes);
             }
+            "container" => {
+                // Container queries. Real evaluation needs layout-time
+                // access to the matched container's box size; for now
+                // we evaluate the condition against the viewport
+                // (mirrors `@media (...)` semantics). Wrong when the
+                // container differs from the viewport, but at least
+                // the rules are picked up by cascade rather than
+                // dropped on the floor. Strip the optional container
+                // name preceding the condition list.
+                let prelude = self.read_prelude_until_brace();
+                if !self.consume('{') {
+                    return;
+                }
+                let inner = self.parse_at_block_inner();
+                let condition_text = strip_container_name(&prelude);
+                let query = parse_media_query(&condition_text);
+                sheet.media_blocks.push(MediaBlock {
+                    query,
+                    rules: inner.rules,
+                });
+                sheet.font_faces.extend(inner.font_faces);
+                sheet.keyframes.extend(inner.keyframes);
+            }
             "font-face" => {
                 self.skip_ws();
                 if !self.consume('{') {
@@ -1329,6 +1352,27 @@ fn is_known_pseudo_element(name: &str) -> bool {
     )
 }
 
+/// Strip an optional container-name token from an `@container`
+/// prelude. The spec allows `@container <name>? <condition>`, so we
+/// peel off the first ident only if a `(` follows it later.
+fn strip_container_name(prelude: &str) -> String {
+    let trimmed = prelude.trim();
+    let first = trimmed.split_ascii_whitespace().next();
+    if let Some(name) = first {
+        if !name.starts_with('(')
+            && trimmed
+                .trim_start_matches(name)
+                .trim_start()
+                .starts_with('(')
+        {
+            return trimmed.trim_start_matches(name).trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+/// Parse `container-type` / `container-name` for storage on
+/// ComputedStyle so future layout-aware evaluation can consult them.
 fn rgb_from_args(args: &[Value]) -> Option<Value> {
     if args.len() < 3 {
         return None;

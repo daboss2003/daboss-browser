@@ -117,7 +117,21 @@ impl TextLayout {
         let mut glyphs = Vec::new();
         let mut total_height = 0.0_f32;
         let mut max_w = 0.0_f32;
+        // `line-clamp: N` — limit collected lines to the first N and
+        // remember whether more lines were truncated so we can stamp
+        // an ellipsis onto the kept-tail.
+        let clamp = parent_style.line_clamp.map(|n| n.max(1) as usize);
+        let mut line_idx = 0usize;
+        let mut clamped_overflow = false;
+        let mut clamp_last_y = 0.0_f32;
+        let mut clamp_last_h = line_height;
         for run in buffer.layout_runs() {
+            if let Some(max_lines) = clamp {
+                if line_idx >= max_lines {
+                    clamped_overflow = true;
+                    break;
+                }
+            }
             for g in run.glyphs.iter() {
                 glyphs.push(ShapedGlyph {
                     text_start: g.start,
@@ -127,6 +141,8 @@ impl TextLayout {
                     height: run.line_height,
                 });
             }
+            clamp_last_y = run.line_top;
+            clamp_last_h = run.line_height;
             let bottom = run.line_top + run.line_height;
             if bottom > total_height {
                 total_height = bottom;
@@ -134,6 +150,51 @@ impl TextLayout {
             if run.line_w > max_w {
                 max_w = run.line_w;
             }
+            line_idx += 1;
+        }
+
+        // line-clamp ellipsis: stamp `…` on the last kept line if we
+        // dropped subsequent lines. Mirrors the text-overflow:
+        // ellipsis approach below.
+        if clamped_overflow && !glyphs.is_empty() {
+            let ellipsis_width = self.measure_natural_width("\u{2026}", parent_style);
+            let cutoff = (max_width - ellipsis_width).max(0.0);
+            // Drop any glyph on the last kept line whose right edge
+            // would collide with the ellipsis.
+            glyphs.retain(|g| {
+                if (g.y - clamp_last_y).abs() < 0.5 {
+                    g.x + g.width <= cutoff
+                } else {
+                    true
+                }
+            });
+            let last_x_on_clamp_line = glyphs
+                .iter()
+                .filter(|g| (g.y - clamp_last_y).abs() < 0.5)
+                .map(|g| g.x + g.width)
+                .fold(0.0_f32, f32::max);
+            let mut elps = Buffer::new(&mut self.system, metrics);
+            elps.set_size(&mut self.system, Some(ellipsis_width + 1.0), None);
+            elps.set_wrap(&mut self.system, Wrap::None);
+            elps.set_text(
+                &mut self.system,
+                "\u{2026}",
+                attrs_from_style(parent_style),
+                Shaping::Advanced,
+            );
+            elps.shape_until_scroll(&mut self.system, false);
+            for run in elps.layout_runs() {
+                for g in run.glyphs.iter() {
+                    glyphs.push(ShapedGlyph {
+                        text_start: g.start,
+                        x: last_x_on_clamp_line + g.x,
+                        y: clamp_last_y,
+                        width: g.w,
+                        height: clamp_last_h,
+                    });
+                }
+            }
+            total_height = clamp_last_y + clamp_last_h;
         }
 
         // text-overflow: ellipsis post-processing. Cosmic-text doesn't

@@ -747,6 +747,33 @@ pub struct ComputedStyle {
     /// requires width-aware glyph clipping in the inline formatting
     /// context.
     pub text_overflow: TextOverflow,
+    /// `line-clamp` / `-webkit-line-clamp`. When `Some(n)`, inline
+    /// text inside this element is limited to `n` visible lines,
+    /// with an ellipsis stamped onto the last line if more text
+    /// would have wrapped.
+    pub line_clamp: Option<u32>,
+    /// `scroll-snap-type` — e.g. `x mandatory`, `y proximity`,
+    /// `both mandatory`. Lower-cased, parsed as-is. The scroll
+    /// handler reads this to decide whether to snap on scroll-end.
+    pub scroll_snap_type: Option<String>,
+    /// `scroll-snap-align` — `none`, `start`, `end`, `center`, or a
+    /// pair. Stored as the raw lower-cased string for inspection.
+    pub scroll_snap_align: Option<String>,
+    /// `font-feature-settings` — raw `"liga" 1, "smcp"` style
+    /// payload. Passed verbatim; cosmic-text picks up the standard
+    /// OpenType features it knows about.
+    pub font_feature_settings: Option<String>,
+    /// `hyphens` — `none` / `manual` / `auto`. Without a
+    /// hyphenation dictionary `auto` falls back to `manual` (i.e.
+    /// only break at U+00AD soft-hyphen).
+    pub hyphens: Option<String>,
+    /// `container-type` — `normal` / `inline-size` / `size`. Marks
+    /// this element as a query container so descendant
+    /// `@container` rules can target its box size.
+    pub container_type: Option<String>,
+    /// `container-name` — author-supplied identifier for filtered
+    /// `@container <name> (...)` queries.
+    pub container_name: Option<String>,
     /// `transition: <prop> <duration> [<timing>] [<delay>]` entries.
     /// When a tracked property changes between cascades, the browser
     /// shell starts a running animation that interpolates the old →
@@ -868,6 +895,13 @@ impl ComputedStyle {
             overflow_x: Overflow::Visible,
             overflow_y: Overflow::Visible,
             text_overflow: TextOverflow::Clip,
+            line_clamp: None,
+            scroll_snap_type: None,
+            scroll_snap_align: None,
+            font_feature_settings: None,
+            hyphens: None,
+            container_type: None,
+            container_name: None,
             transitions: Vec::new(),
             animations: Vec::new(),
             box_shadow: None,

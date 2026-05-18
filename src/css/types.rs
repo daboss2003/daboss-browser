@@ -559,7 +559,7 @@ pub struct GridPlacement {
     pub area: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum GridTrack {
     /// A fixed pixel width (also used for em-resolved lengths).
     Px(f32),
@@ -569,6 +569,10 @@ pub enum GridTrack {
     Auto,
     /// `<percentage>` of the container.
     Percent(f32),
+    /// `minmax(min, max)` — clamps the resolved size between two
+    /// other track sizes. Box+heap because the inner tracks would
+    /// otherwise make the enum recursive.
+    MinMax(Box<GridTrack>, Box<GridTrack>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -794,9 +798,21 @@ pub struct ComputedStyle {
     /// inner Vec is the named cells across that row (or `.` for empty).
     pub grid_template_areas: Vec<Vec<String>>,
     pub grid_auto_flow: GridAutoFlow,
+    /// Track size used when items spill past the explicit columns
+    /// (e.g. `grid-column: 5` inside a 3-column template).
+    pub grid_auto_columns: GridTrack,
+    pub grid_auto_rows: GridTrack,
+    /// Default item alignment along the inline axis (overridable per
+    /// item via `justify-self`).
+    pub justify_items: AlignItems,
 
     // ----- Grid item properties -----
     pub grid_placement: GridPlacement,
+    /// Per-item override of `align-items` (cross axis in flex, block
+    /// axis in grid). `None` inherits the container default.
+    pub align_self: Option<AlignItems>,
+    /// Per-item override of `justify-items` (inline axis in grid).
+    pub justify_self: Option<AlignItems>,
 
     // ----- Positioning -----
     pub position: Position,
@@ -871,7 +887,12 @@ impl ComputedStyle {
             grid_template_rows: Vec::new(),
             grid_template_areas: Vec::new(),
             grid_auto_flow: GridAutoFlow::Row,
+            grid_auto_columns: GridTrack::Auto,
+            grid_auto_rows: GridTrack::Auto,
+            justify_items: AlignItems::Stretch,
             grid_placement: GridPlacement::default(),
+            align_self: None,
+            justify_self: None,
             position: Position::Static,
             top: None,
             right: None,

@@ -14,13 +14,16 @@
 //! same point it drains microtasks and timer fires.
 //!
 //! Scope kept honest:
-//!  * Data channels only. Audio / video tracks are not exposed (no
-//!    getUserMedia, no `<video>` capture pipeline yet).
+//!  * Data channels work end-to-end. Audio/video tracks are added to
+//!    the SDP and surface remote `ontrack` events, but no samples
+//!    are actually pumped (no encoder pipeline) — pages get a
+//!    successful negotiation and a track handle, but the audio/video
+//!    bytes don't traverse the network.
 //!  * Default-ICE-server config (Google STUN). Custom `iceServers`
 //!    array is accepted but only the `urls` field is honoured.
 //!  * No SDP munging.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Runtime;
@@ -35,6 +38,11 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::rtp_transceiver::rtp_codec::{
+    RTCRtpCodecCapability, RTPCodecType,
+};
+use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+use webrtc::track::track_local::TrackLocal;
 
 /// One queued event surfacing from a PeerConnection to JS land.
 #[derive(Debug, Clone)]
@@ -52,12 +60,20 @@ pub enum PcEvent {
     DataMessage(String, String),
     /// Data channel opened (local label).
     DataChannelOpen(String),
+    /// Remote added a media track. Carries the kind (`audio` /
+    /// `video`) and the track's ID. Surfaced to JS as `ontrack`.
+    TrackReceived { kind: String, id: String },
 }
 
 pub struct PeerConnection {
     runtime: Arc<Runtime>,
     inner: Arc<RTCPeerConnection>,
     events: Arc<Mutex<VecDeque<PcEvent>>>,
+    /// Locally-added tracks. Keyed by track-id (the JS-visible string
+    /// the page used to identify the track). We hold the
+    /// `TrackLocalStaticSample` alive so the SDP keeps the track
+    /// reachable and the page can later push samples through it.
+    local_tracks: Arc<Mutex<HashMap<String, Arc<TrackLocalStaticSample>>>>,
 }
 
 impl PeerConnection {
@@ -122,6 +138,26 @@ impl PeerConnection {
             })
         }));
 
+        // Remote-track receipt → JS `ontrack` event.
+        let ev_track = events.clone();
+        pc.on_track(Box::new(move |track, _receiver, _transceiver| {
+            let q = ev_track.clone();
+            Box::pin(async move {
+                let kind = match track.kind() {
+                    RTPCodecType::Audio => "audio",
+                    RTPCodecType::Video => "video",
+                    _ => "unknown",
+                };
+                let id = track.id().to_string();
+                if let Ok(mut q) = q.lock() {
+                    q.push_back(PcEvent::TrackReceived {
+                        kind: kind.to_string(),
+                        id,
+                    });
+                }
+            })
+        }));
+
         let ev_dc = events.clone();
         pc.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
             let q_open = ev_dc.clone();
@@ -151,7 +187,64 @@ impl PeerConnection {
             runtime,
             inner: pc,
             events,
+            local_tracks: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Add a local audio or video track. `kind` is `"audio"` or
+    /// `"video"`. Returns the track-id wgpu-rs assigns, which JS
+    /// surfaces as the RTCRtpSender's track id.
+    pub fn add_local_track(&self, kind: &str, label: &str) -> Option<String> {
+        let pc = self.inner.clone();
+        let label_owned = label.to_string();
+        let stream_id = format!("daboss-stream-{kind}");
+        let (codec, codec_type) = match kind {
+            "audio" => (
+                RTCRtpCodecCapability {
+                    mime_type: "audio/opus".to_string(),
+                    clock_rate: 48000,
+                    channels: 2,
+                    ..Default::default()
+                },
+                RTPCodecType::Audio,
+            ),
+            "video" => (
+                RTCRtpCodecCapability {
+                    mime_type: "video/VP8".to_string(),
+                    clock_rate: 90000,
+                    ..Default::default()
+                },
+                RTPCodecType::Video,
+            ),
+            _ => return None,
+        };
+        let _ = codec_type;
+        let track = Arc::new(TrackLocalStaticSample::new(
+            codec,
+            label_owned.clone(),
+            stream_id,
+        ));
+        let track_id = track.id().to_string();
+        let track_for_add: Arc<dyn TrackLocal + Send + Sync> = track.clone();
+        let res =
+            self.runtime
+                .block_on(async move { pc.add_track(track_for_add).await });
+        if res.is_err() {
+            return None;
+        }
+        if let Ok(mut t) = self.local_tracks.lock() {
+            t.insert(track_id.clone(), track);
+        }
+        Some(track_id)
+    }
+
+    /// Drop a previously-added local track. webrtc-rs will renegotiate
+    /// on the next createOffer; the JS sender is left dangling (the
+    /// spec returns void from removeTrack, so no JS state change).
+    pub fn remove_local_track(&self, track_id: &str) {
+        if let Ok(mut t) = self.local_tracks.lock() {
+            t.remove(track_id);
+        }
     }
 
     pub fn create_offer(&self) -> Option<String> {

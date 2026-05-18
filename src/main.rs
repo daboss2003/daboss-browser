@@ -5,6 +5,7 @@ mod capture;
 mod css;
 mod dom;
 mod gpu;
+mod sse;
 mod webgl_gpu;
 mod html;
 mod js;

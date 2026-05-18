@@ -1071,6 +1071,33 @@ fn apply_declaration(
         "grid-column-end" => style.grid_placement.column_end = grid_line_from(value),
         "grid-row-start" => style.grid_placement.row_start = grid_line_from(value),
         "grid-row-end" => style.grid_placement.row_end = grid_line_from(value),
+        "grid-auto-columns" => {
+            let mut tracks = grid_tracks_from(value, style.font_size, parent);
+            if let Some(t) = tracks.pop() {
+                style.grid_auto_columns = t;
+            }
+        }
+        "grid-auto-rows" => {
+            let mut tracks = grid_tracks_from(value, style.font_size, parent);
+            if let Some(t) = tracks.pop() {
+                style.grid_auto_rows = t;
+            }
+        }
+        "justify-items" => {
+            if let Value::Keyword(k) = value {
+                style.justify_items = align_keyword(k);
+            }
+        }
+        "justify-self" => {
+            if let Value::Keyword(k) = value {
+                style.justify_self = Some(align_keyword(k));
+            }
+        }
+        "align-self" => {
+            if let Value::Keyword(k) = value {
+                style.align_self = Some(align_keyword(k));
+            }
+        }
         "align-content" => {
             if let Value::Keyword(k) = value {
                 style.align_content = match k.as_str() {
@@ -1755,6 +1782,17 @@ fn grid_tracks_from(value: &Value, em: f32, parent: Option<&ComputedStyle>) -> V
                     tracks.extend(pattern.iter().cloned());
                 }
             }
+            Value::Function { name, args } if name == "minmax" => {
+                let min_v = args
+                    .first()
+                    .map(|v| single_track(v, em, parent))
+                    .unwrap_or(GridTrack::Auto);
+                let max_v = args
+                    .get(1)
+                    .map(|v| single_track(v, em, parent))
+                    .unwrap_or(GridTrack::Auto);
+                tracks.push(GridTrack::MinMax(Box::new(min_v), Box::new(max_v)));
+            }
             Value::Keyword(k) if k == "auto" => tracks.push(GridTrack::Auto),
             Value::Percentage(p) => tracks.push(GridTrack::Percent(*p)),
             Value::Number(n) => tracks.push(GridTrack::Px(*n)),
@@ -1770,6 +1808,33 @@ fn grid_tracks_from(value: &Value, em: f32, parent: Option<&ComputedStyle>) -> V
         }
     }
     tracks
+}
+
+/// Resolve a single CSS value as one `GridTrack` (used by the
+/// `minmax(min, max)` parser; each side is itself a track-list-of-one).
+fn single_track(value: &Value, em: f32, parent: Option<&ComputedStyle>) -> GridTrack {
+    match value {
+        Value::Keyword(k) if k == "auto" => GridTrack::Auto,
+        Value::Percentage(p) => GridTrack::Percent(*p),
+        Value::Number(n) => GridTrack::Px(*n),
+        Value::Length(n, Unit::Fr) => GridTrack::Fr(*n),
+        Value::Length(_, _) => {
+            length_to_px(value, em, parent)
+                .map(GridTrack::Px)
+                .unwrap_or(GridTrack::Auto)
+        }
+        _ => GridTrack::Auto,
+    }
+}
+
+fn align_keyword(k: &str) -> AlignItems {
+    match k {
+        "flex-end" | "end" | "right" => AlignItems::FlexEnd,
+        "center" => AlignItems::Center,
+        "baseline" => AlignItems::Baseline,
+        "stretch" => AlignItems::Stretch,
+        _ => AlignItems::FlexStart,
+    }
 }
 
 fn grid_template_areas_from(value: &Value) -> Vec<Vec<String>> {

@@ -36,6 +36,12 @@ pub struct RtcEntry {
     /// Per-channel JS handles so `channel.onmessage` / `onopen` can
     /// be wired by label.
     pub channel_handles: std::collections::HashMap<String, boa_engine::JsObject>,
+    /// Track-ids JS surfaced via `addTrack`, in insertion order. The
+    /// JS sender objects live in `sender_handles`; this list orders
+    /// `getSenders()` output.
+    pub sender_track_ids: Vec<String>,
+    /// JS RTCRtpSender handles keyed by track-id.
+    pub sender_handles: std::collections::HashMap<String, boa_engine::JsObject>,
 }
 
 pub type RtcRegistry = Rc<RefCell<Vec<Option<RtcEntry>>>>;
@@ -113,6 +119,8 @@ fn pc_constructor(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<
             handle: None,
             channels: std::collections::HashMap::new(),
             channel_handles: std::collections::HashMap::new(),
+            sender_track_ids: Vec::new(),
+            sender_handles: std::collections::HashMap::new(),
         }));
         reg.len() - 1
     };
@@ -129,6 +137,7 @@ fn pc_constructor(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<
         "ondatachannel",
         "onconnectionstatechange",
         "oniceconnectionstatechange",
+        "ontrack",
     ] {
         b.property(js_string!(name), JsValue::null(), Attribute::all());
     }
@@ -161,6 +170,31 @@ fn pc_constructor(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<
         NativeFunction::from_fn_ptr(pc_create_data_channel),
         js_string!("createDataChannel"),
         1,
+    );
+    b.function(
+        NativeFunction::from_fn_ptr(pc_add_track),
+        js_string!("addTrack"),
+        2,
+    );
+    b.function(
+        NativeFunction::from_fn_ptr(pc_remove_track),
+        js_string!("removeTrack"),
+        1,
+    );
+    b.function(
+        NativeFunction::from_fn_ptr(pc_get_senders),
+        js_string!("getSenders"),
+        0,
+    );
+    b.function(
+        NativeFunction::from_fn_ptr(pc_get_receivers),
+        js_string!("getReceivers"),
+        0,
+    );
+    b.function(
+        NativeFunction::from_fn_ptr(pc_get_transceivers),
+        js_string!("getTransceivers"),
+        0,
     );
     b.function(
         NativeFunction::from_fn_ptr(pc_close),
@@ -403,6 +437,134 @@ fn pc_close(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
     Ok(JsValue::undefined())
 }
 
+fn pc_add_track(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(track_val) = args.first() else {
+        return Ok(JsValue::null());
+    };
+    let Some(track_obj) = track_val.as_object() else {
+        return Ok(JsValue::null());
+    };
+    let kind = track_obj
+        .get(js_string!("kind"), ctx)
+        .map(|v| v.to_string(ctx).map(|s| s.to_std_string_escaped()))
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    if kind != "audio" && kind != "video" {
+        return Ok(JsValue::null());
+    }
+    let label = track_obj
+        .get(js_string!("label"), ctx)
+        .map(|v| v.to_string(ctx).map(|s| s.to_std_string_escaped()))
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_else(|| format!("daboss-{kind}"));
+    let track_id = match with_entry(this, ctx, |e| e.pc.add_local_track(&kind, &label)) {
+        Some(Some(id)) => id,
+        _ => return Ok(JsValue::null()),
+    };
+    let track_clone = track_val.clone();
+    let mut b = ObjectInitializer::new(ctx);
+    b.property(
+        js_string!("track"),
+        track_clone,
+        Attribute::READONLY,
+    );
+    b.property(
+        js_string!("__track_id"),
+        JsValue::from(js_string!(track_id.clone())),
+        Attribute::READONLY,
+    );
+    let sender_handle = b.build();
+    with_entry(this, ctx, |e| {
+        e.sender_track_ids.push(track_id.clone());
+        e.sender_handles
+            .insert(track_id.clone(), sender_handle.clone());
+    });
+    Ok(JsValue::from(sender_handle))
+}
+
+fn pc_remove_track(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(sender_val) = args.first() else {
+        return Ok(JsValue::undefined());
+    };
+    let track_id = sender_val
+        .as_object()
+        .and_then(|o| o.get(js_string!("__track_id"), ctx).ok())
+        .and_then(|v| v.to_string(ctx).ok())
+        .map(|s| s.to_std_string_escaped())
+        .unwrap_or_default();
+    if track_id.is_empty() {
+        return Ok(JsValue::undefined());
+    }
+    with_entry(this, ctx, |e| {
+        e.pc.remove_local_track(&track_id);
+        e.sender_track_ids.retain(|id| id != &track_id);
+        e.sender_handles.remove(&track_id);
+    });
+    Ok(JsValue::undefined())
+}
+
+fn pc_get_senders(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    use boa_engine::object::builtins::JsArray;
+    let arr = JsArray::new(ctx);
+    let handles: Vec<boa_engine::JsObject> = with_entry(this, ctx, |e| {
+        e.sender_track_ids
+            .iter()
+            .filter_map(|id| e.sender_handles.get(id).cloned())
+            .collect()
+    })
+    .unwrap_or_default();
+    for h in handles {
+        let _ = arr.push(JsValue::from(h), ctx);
+    }
+    Ok(arr.into())
+}
+
+fn pc_get_receivers(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    // We don't surface remote receivers as standalone objects; the
+    // ontrack event carries the track directly. Real spec returns
+    // RTCRtpReceiver list — return empty for the toy.
+    use boa_engine::object::builtins::JsArray;
+    Ok(JsArray::new(ctx).into())
+}
+
+fn pc_get_transceivers(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    use boa_engine::object::builtins::JsArray;
+    // Synthesise one transceiver per local sender so libraries that
+    // call `getTransceivers().forEach(t => t.direction = ...)` can
+    // round-trip without throwing.
+    let arr = JsArray::new(ctx);
+    let senders: Vec<boa_engine::JsObject> = with_entry(this, ctx, |e| {
+        e.sender_track_ids
+            .iter()
+            .filter_map(|id| e.sender_handles.get(id).cloned())
+            .collect()
+    })
+    .unwrap_or_default();
+    for sender in senders {
+        let t = ObjectInitializer::new(ctx)
+            .property(
+                js_string!("sender"),
+                JsValue::from(sender),
+                Attribute::READONLY,
+            )
+            .property(
+                js_string!("direction"),
+                JsValue::from(js_string!("sendrecv")),
+                Attribute::all(),
+            )
+            .property(
+                js_string!("currentDirection"),
+                JsValue::from(js_string!("sendrecv")),
+                Attribute::READONLY,
+            )
+            .build();
+        let _ = arr.push(JsValue::from(t), ctx);
+    }
+    Ok(arr.into())
+}
+
 /// Drain queued PeerConnection events and dispatch them to JS
 /// handlers. Called by the engine alongside microtasks / timers.
 pub fn drain_rtc_events(ctx: &mut Context) {
@@ -532,6 +694,65 @@ fn dispatch_event(ctx: &mut Context, idx: usize, registry: &RtcRegistry, ev: PcE
                     ctx,
                 );
             }
+        }
+        PcEvent::TrackReceived { kind, id } => {
+            let Some(handle) = handle else { return };
+            let Some(handler) = read_function(&handle, "ontrack", ctx) else {
+                return;
+            };
+            // Build a synthetic MediaStreamTrack + RTCTrackEvent for
+            // the page. The track has no `__capture_idx` since the
+            // bytes are remote-only and not playable for the toy.
+            let track = ObjectInitializer::new(ctx)
+                .property(
+                    js_string!("kind"),
+                    JsValue::from(js_string!(kind.clone())),
+                    Attribute::READONLY,
+                )
+                .property(
+                    js_string!("id"),
+                    JsValue::from(js_string!(id.clone())),
+                    Attribute::READONLY,
+                )
+                .property(
+                    js_string!("label"),
+                    JsValue::from(js_string!(format!("remote {kind}"))),
+                    Attribute::READONLY,
+                )
+                .property(
+                    js_string!("enabled"),
+                    JsValue::from(true),
+                    Attribute::all(),
+                )
+                .property(
+                    js_string!("readyState"),
+                    JsValue::from(js_string!("live")),
+                    Attribute::READONLY,
+                )
+                .property(
+                    js_string!("remote"),
+                    JsValue::from(true),
+                    Attribute::READONLY,
+                )
+                .build();
+            let streams = boa_engine::object::builtins::JsArray::new(ctx);
+            let event_obj = ObjectInitializer::new(ctx)
+                .property(
+                    js_string!("track"),
+                    JsValue::from(track),
+                    Attribute::READONLY,
+                )
+                .property(
+                    js_string!("streams"),
+                    JsValue::from(streams),
+                    Attribute::READONLY,
+                )
+                .build();
+            let _ = handler.call(
+                &JsValue::from(handle),
+                &[JsValue::from(event_obj)],
+                ctx,
+            );
         }
     }
 }

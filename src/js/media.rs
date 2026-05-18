@@ -140,7 +140,7 @@ fn make_media_stream(ctx: &mut Context, capture_idx: Option<u32>) -> JsValue {
     );
     b.property(
         js_string!("id"),
-        JsValue::from(js_string!(id)),
+        JsValue::from(js_string!(id.clone())),
         Attribute::READONLY,
     );
     if let Some(idx) = capture_idx {
@@ -150,24 +150,132 @@ fn make_media_stream(ctx: &mut Context, capture_idx: Option<u32>) -> JsValue {
             Attribute::READONLY,
         );
     }
+    // Stash kind hints so getAudioTracks/getVideoTracks/getTracks can
+    // reflect them when we synthesise track objects. The `getUserMedia`
+    // caller's constraints determine whether the underlying capture
+    // has audio/video; we re-derive that from the registry at call
+    // time. For the toy we treat presence of a capture_idx as both
+    // audio+video available (matches our CaptureStream).
     b.function(
-        NativeFunction::from_fn_ptr(stream_empty_array),
+        NativeFunction::from_fn_ptr(stream_get_tracks_both),
         js_string!("getTracks"),
         0,
     );
     b.function(
-        NativeFunction::from_fn_ptr(stream_empty_array),
+        NativeFunction::from_fn_ptr(stream_get_video_tracks),
         js_string!("getVideoTracks"),
         0,
     );
     b.function(
-        NativeFunction::from_fn_ptr(stream_empty_array),
+        NativeFunction::from_fn_ptr(stream_get_audio_tracks),
         js_string!("getAudioTracks"),
         0,
     );
     JsValue::from(b.build())
 }
 
-fn stream_empty_array(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    Ok(JsArray::new(ctx).into())
+fn make_track(ctx: &mut Context, kind: &str, capture_idx: Option<u32>) -> JsValue {
+    let id = format!(
+        "{kind}-track-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let mut b = ObjectInitializer::new(ctx);
+    b.property(
+        js_string!("kind"),
+        JsValue::from(js_string!(kind.to_string())),
+        Attribute::READONLY,
+    );
+    b.property(
+        js_string!("id"),
+        JsValue::from(js_string!(id)),
+        Attribute::READONLY,
+    );
+    b.property(
+        js_string!("label"),
+        JsValue::from(js_string!(format!("daboss {kind}"))),
+        Attribute::READONLY,
+    );
+    b.property(
+        js_string!("enabled"),
+        JsValue::from(true),
+        Attribute::all(),
+    );
+    b.property(
+        js_string!("muted"),
+        JsValue::from(false),
+        Attribute::READONLY,
+    );
+    b.property(
+        js_string!("readyState"),
+        JsValue::from(js_string!("live")),
+        Attribute::all(),
+    );
+    if let Some(idx) = capture_idx {
+        b.property(
+            js_string!("__capture_idx"),
+            JsValue::from(idx),
+            Attribute::READONLY,
+        );
+    }
+    b.function(
+        NativeFunction::from_fn_ptr(track_stop),
+        js_string!("stop"),
+        0,
+    );
+    JsValue::from(b.build())
+}
+
+fn stream_capture_idx(this: &JsValue, ctx: &mut Context) -> Option<u32> {
+    let obj = this.as_object()?;
+    let v = obj.get(js_string!("__capture_idx"), ctx).ok()?;
+    if v.is_undefined() || v.is_null() {
+        return None;
+    }
+    v.to_u32(ctx).ok()
+}
+
+fn stream_get_tracks_both(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let idx = stream_capture_idx(this, ctx);
+    let video = make_track(ctx, "video", idx);
+    let audio = make_track(ctx, "audio", idx);
+    let arr = JsArray::new(ctx);
+    let _ = arr.push(video, ctx);
+    let _ = arr.push(audio, ctx);
+    Ok(arr.into())
+}
+
+fn stream_get_video_tracks(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let arr = JsArray::new(ctx);
+    if let Some(idx) = stream_capture_idx(this, ctx) {
+        let track = make_track(ctx, "video", Some(idx));
+        let _ = arr.push(track, ctx);
+    }
+    Ok(arr.into())
+}
+
+fn stream_get_audio_tracks(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let arr = JsArray::new(ctx);
+    if let Some(idx) = stream_capture_idx(this, ctx) {
+        let track = make_track(ctx, "audio", Some(idx));
+        let _ = arr.push(track, ctx);
+    }
+    Ok(arr.into())
+}
+
+fn track_stop(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    // Best-effort: flip readyState to "ended". Real spec would also
+    // detach the underlying capture; we leave the CaptureStream alive
+    // since multiple tracks may share it.
+    if let Some(obj) = this.as_object() {
+        let _ = obj.set(
+            js_string!("readyState"),
+            JsValue::from(js_string!("ended")),
+            false,
+            ctx,
+        );
+    }
+    Ok(JsValue::undefined())
 }

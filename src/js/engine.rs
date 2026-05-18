@@ -227,6 +227,9 @@ pub struct JsEngine {
     rtc_runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
     /// WebSocket registry — one slot per live `new WebSocket(url)`.
     ws_registry: super::websocket::WsRegistry,
+    /// EventSource (Server-Sent Events) registry — one entry per live
+    /// `new EventSource(url)`.
+    es_registry: super::sse::EsRegistry,
     /// IndexedDB storage, origin-scoped via Browser.
     idb: super::idb::IdbState,
     /// Live workers — each entry owns a thread + boa Context.
@@ -367,6 +370,7 @@ impl JsEngine {
         super::sw::install(&mut ctx);
         super::wasm::install(&mut ctx);
         super::crypto::install(&mut ctx);
+        super::sse::install(&mut ctx);
 
         let listeners: Rc<RefCell<ListenerMap>> = Rc::new(RefCell::new(HashMap::new()));
         let timers: Rc<RefCell<TimerState>> = Rc::new(RefCell::new(TimerState::default()));
@@ -402,6 +406,7 @@ impl JsEngine {
         let rtc_registry: super::rtc::RtcRegistry = Rc::new(RefCell::new(Vec::new()));
         let rtc_runtime = crate::webrtc::build_runtime();
         let ws_registry: super::websocket::WsRegistry = Rc::new(RefCell::new(Vec::new()));
+        let es_registry: super::sse::EsRegistry = Rc::new(RefCell::new(Vec::new()));
         let idb: super::idb::IdbState =
             Rc::new(RefCell::new(std::collections::HashMap::new()));
         let workers: super::worker::WorkerRegistry = Rc::new(RefCell::new(Vec::new()));
@@ -434,6 +439,7 @@ impl JsEngine {
             rtc_registry,
             rtc_runtime,
             ws_registry,
+            es_registry,
             idb,
             workers,
             webgl_contexts,
@@ -609,6 +615,7 @@ impl JsEngine {
         super::observers::drain_mutation_records(&mut self.ctx);
         super::rtc::drain_rtc_events(&mut self.ctx);
         super::websocket::drain_ws_inbound(&mut self.ctx);
+        super::sse::drain_sse_events(&mut self.ctx);
         super::worker::drain_worker_messages(&mut self.ctx);
         self.ctx.run_jobs();
 
@@ -653,6 +660,7 @@ impl JsEngine {
         super::observers::drain_mutation_records(&mut self.ctx);
         super::rtc::drain_rtc_events(&mut self.ctx);
         super::websocket::drain_ws_inbound(&mut self.ctx);
+        super::sse::drain_sse_events(&mut self.ctx);
         super::worker::drain_worker_messages(&mut self.ctx);
         self.ctx.run_jobs();
         self.uninstall_thread_locals(dom, rc, listeners_rc);
@@ -745,6 +753,7 @@ impl JsEngine {
         super::observers::drain_mutation_records(&mut self.ctx);
         super::rtc::drain_rtc_events(&mut self.ctx);
         super::websocket::drain_ws_inbound(&mut self.ctx);
+        super::sse::drain_sse_events(&mut self.ctx);
         super::worker::drain_worker_messages(&mut self.ctx);
         self.ctx.run_jobs();
 
@@ -832,6 +841,9 @@ impl JsEngine {
         super::websocket::JS_WS_REGISTRY.with(|slot| {
             *slot.borrow_mut() = Some(self.ws_registry.clone());
         });
+        super::sse::JS_ES_REGISTRY.with(|slot| {
+            *slot.borrow_mut() = Some(self.es_registry.clone());
+        });
         super::idb::JS_IDB.with(|slot| {
             *slot.borrow_mut() = Some(self.idb.clone());
         });
@@ -887,6 +899,9 @@ impl JsEngine {
             slot.borrow_mut().take();
         });
         super::websocket::JS_WS_REGISTRY.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        super::sse::JS_ES_REGISTRY.with(|slot| {
             slot.borrow_mut().take();
         });
         super::idb::JS_IDB.with(|slot| {

@@ -64,32 +64,6 @@ pub fn layout_grid(
     // Pull named areas if any; they define rows × columns names.
     let area_map = build_area_map(&style.grid_template_areas);
 
-    // Resolve column widths.
-    let column_widths = resolve_tracks(&style.grid_template_columns, content_width, col_gap);
-    let mut num_cols = column_widths.len().max(1);
-    if !style.grid_template_areas.is_empty() {
-        // Areas grid dictates the column count when no template-columns set.
-        let cols_from_areas = style
-            .grid_template_areas
-            .iter()
-            .map(|r| r.len())
-            .max()
-            .unwrap_or(1);
-        if column_widths.len() < cols_from_areas {
-            num_cols = cols_from_areas;
-        }
-    }
-    let column_widths = if column_widths.len() < num_cols {
-        // Pad with auto for any extra columns implied by areas.
-        let mut w = column_widths;
-        while w.len() < num_cols {
-            w.push(content_width / num_cols as f32);
-        }
-        w
-    } else {
-        column_widths
-    };
-
     // Collect grid items.
     let items: Vec<NodeId> = dom
         .children(node)
@@ -100,6 +74,30 @@ pub fn layout_grid(
             _ => false,
         })
         .collect();
+
+    // First pass: figure out how many columns we actually need.
+    // Templates + areas set a baseline; explicit placements past the
+    // template width grow the implicit grid (CSS Grid spec §6.1).
+    let template_cols = style.grid_template_columns.len();
+    let area_cols = style
+        .grid_template_areas
+        .iter()
+        .map(|r| r.len())
+        .max()
+        .unwrap_or(0);
+    let mut num_cols = template_cols.max(area_cols).max(1);
+    let max_explicit_col = max_explicit_column(styles, &items, &area_map);
+    if max_explicit_col + 1 > num_cols {
+        num_cols = max_explicit_col + 1;
+    }
+
+    // Resolve column widths. Any implicit (extra) tracks beyond the
+    // template inherit `grid-auto-columns`.
+    let mut explicit_tracks: Vec<GridTrack> = style.grid_template_columns.clone();
+    while explicit_tracks.len() < num_cols {
+        explicit_tracks.push(style.grid_auto_columns.clone());
+    }
+    let column_widths = resolve_tracks(&explicit_tracks, content_width, col_gap);
 
     // Resolve each item's grid placement to (row_start, col_start, row_span,
     // col_span). Auto-placement is run after explicit placements are claimed.
@@ -191,23 +189,59 @@ pub fn layout_grid(
         acc += h + row_gap;
     }
 
-    // Pass 2: shift each item's subtree to its final y based on row_start.
+    // Pass 2: shift each item to its final y based on row_start, then
+    // apply justify-self / align-self within its cell.
     for (idx, p) in placements.iter().enumerate() {
-        let target_y = row_ys[p.row_start];
-        let current_box = tree.boxes[items[idx].index()].as_ref();
-        if let Some(b) = current_box {
-            let dy = target_y - b.rect.y;
-            if dy.abs() > 0.001 {
-                shift_subtree(dom, items[idx], dy, tree);
+        let item_style = styles.get(items[idx]);
+        let justify_self = item_style.justify_self.unwrap_or(style.justify_items);
+        let align_self = item_style.align_self.unwrap_or(style.align_items);
+
+        let row_end = (p.row_start + p.row_span).min(row_heights.len());
+        let cell_y = row_ys[p.row_start];
+        let cell_h: f32 = row_heights[p.row_start..row_end].iter().sum::<f32>()
+            + row_gap * (p.row_span.saturating_sub(1) as f32);
+        let col_end = (p.col_start + p.col_span).min(column_widths.len());
+        let cell_w: f32 = (p.col_start..col_end)
+            .map(|c| column_widths[c])
+            .sum::<f32>()
+            + col_gap * (p.col_span.saturating_sub(1) as f32);
+
+        let Some(current_box) = tree.boxes[items[idx].index()].as_ref() else {
+            continue;
+        };
+        let item_w = current_box.rect.width;
+        let item_h = current_box.rect.height;
+
+        // Inline-axis (`justify-self`) placement within cell.
+        let dx = match justify_self {
+            crate::css::AlignItems::FlexEnd => (cell_w - item_w).max(0.0),
+            crate::css::AlignItems::Center => ((cell_w - item_w) / 2.0).max(0.0),
+            crate::css::AlignItems::Stretch | crate::css::AlignItems::Baseline => 0.0,
+            _ => 0.0,
+        };
+        // Block-axis (`align-self`) placement within cell.
+        let dy = (cell_y - current_box.rect.y)
+            + match align_self {
+                crate::css::AlignItems::FlexEnd => (cell_h - item_h).max(0.0),
+                crate::css::AlignItems::Center => ((cell_h - item_h) / 2.0).max(0.0),
+                _ => 0.0,
+            };
+
+        if dx.abs() > 0.001 || dy.abs() > 0.001 {
+            shift_subtree_xy(dom, items[idx], dx, dy, tree);
+        }
+
+        // Stretch the item box to fill the cell when alignment is
+        // `stretch` (the spec default).
+        if let Some(b) = tree.boxes[items[idx].index()].as_mut() {
+            if matches!(justify_self, crate::css::AlignItems::Stretch)
+                && b.rect.width < cell_w
+            {
+                b.rect.width = cell_w;
             }
-            // For multi-row spans, stretch the item's box height to cover them.
-            if p.row_span > 1 {
-                let end = (p.row_start + p.row_span).min(row_heights.len());
-                let total: f32 = row_heights[p.row_start..end].iter().sum::<f32>()
-                    + row_gap * (p.row_span as f32 - 1.0);
-                if let Some(b) = tree.boxes[items[idx].index()].as_mut() {
-                    b.rect.height = total;
-                }
+            if matches!(align_self, crate::css::AlignItems::Stretch) && p.row_span >= 1
+            {
+                b.rect.height = b.rect.height.max(cell_h);
             }
         }
     }
@@ -474,20 +508,60 @@ fn build_area_map(
     map
 }
 
-fn shift_subtree(dom: &Dom, node: NodeId, dy: f32, tree: &mut BoxTree) {
+fn shift_subtree_xy(dom: &Dom, node: NodeId, dx: f32, dy: f32, tree: &mut BoxTree) {
     if let Some(b) = tree.boxes.get_mut(node.index()).and_then(|s| s.as_mut()) {
+        b.rect.x += dx;
         b.rect.y += dy;
     }
     let kids: Vec<NodeId> = dom.children(node).collect();
     for c in kids {
-        shift_subtree(dom, c, dy, tree);
+        shift_subtree_xy(dom, c, dx, dy, tree);
     }
+}
+
+/// Largest column index any explicitly-placed item references. Used
+/// to size the implicit grid past the template (CSS Grid §6.1).
+fn max_explicit_column(
+    styles: &StyleTree,
+    items: &[NodeId],
+    area_map: &std::collections::HashMap<String, (usize, usize, usize, usize)>,
+) -> usize {
+    let mut max_col = 0usize;
+    for &node in items {
+        let p = &styles.get(node).grid_placement;
+        if let Some(name) = &p.area {
+            if let Some((_, _, _, c1)) = area_map.get(name).copied() {
+                if c1 > max_col {
+                    max_col = c1;
+                }
+            }
+            continue;
+        }
+        let start = match &p.column_start {
+            Some(GridLine::Index(n)) => (*n as i32 - 1).max(0) as usize,
+            Some(GridLine::Name(n)) => area_map.get(n).map(|t| t.1).unwrap_or(0),
+            _ => 0,
+        };
+        let span = match (&p.column_start, &p.column_end) {
+            (_, Some(GridLine::Span(n))) => (*n as usize).max(1),
+            (Some(GridLine::Index(a)), Some(GridLine::Index(b))) => {
+                ((*b as i32 - *a as i32).max(1)) as usize
+            }
+            _ => 1,
+        };
+        let end_col = start + span - 1;
+        if end_col > max_col {
+            max_col = end_col;
+        }
+    }
+    max_col
 }
 
 /// Resolve a list of `GridTrack`s into pixel widths that sum (with gaps) to
 /// the available content width. Fixed and percentage tracks consume their
 /// declared share; `fr` tracks divide the remaining space; `auto` tracks
-/// are treated like a single fr track for the toy.
+/// are treated like a single fr track for the toy. `minmax(min, max)`
+/// clamps the resolved track size between the two endpoints.
 fn resolve_tracks(tracks: &[GridTrack], available: f32, gap: f32) -> Vec<f32> {
     if tracks.is_empty() {
         return vec![available];
@@ -515,6 +589,17 @@ fn resolve_tracks(tracks: &[GridTrack], available: f32, gap: f32) -> Vec<f32> {
             GridTrack::Auto => {
                 fr_total += 1.0;
             }
+            GridTrack::MinMax(min, max) => {
+                // The base size is the min track resolved against the
+                // available space; the max contributes fr weight (if
+                // fr-typed) so the track can grow.
+                let base = resolve_single_track(min, usable, 0.0);
+                widths[i] = base;
+                fixed_total += base;
+                if let GridTrack::Fr(f) = max.as_ref() {
+                    fr_total += *f;
+                }
+            }
         }
     }
     let remaining = (usable - fixed_total).max(0.0);
@@ -524,11 +609,35 @@ fn resolve_tracks(tracks: &[GridTrack], available: f32, gap: f32) -> Vec<f32> {
             match t {
                 GridTrack::Fr(f) => widths[i] = unit * f,
                 GridTrack::Auto => widths[i] = unit,
+                GridTrack::MinMax(min, max) => {
+                    if let GridTrack::Fr(f) = max.as_ref() {
+                        let want = unit * f;
+                        let min_px = resolve_single_track(min, usable, 0.0);
+                        let max_px = match max.as_ref() {
+                            GridTrack::Px(px) => *px,
+                            GridTrack::Percent(p) => usable * p / 100.0,
+                            _ => f32::INFINITY,
+                        };
+                        widths[i] = want.max(min_px).min(max_px);
+                    }
+                }
                 _ => {}
             }
         }
     }
     widths
+}
+
+/// Resolve a single non-minmax track for the `min` side of a `minmax()`.
+/// Handles only the leaf-level variants; `fr` / `Auto` collapse to 0.
+fn resolve_single_track(t: &GridTrack, usable: f32, fr_unit: f32) -> f32 {
+    match t {
+        GridTrack::Px(px) => *px,
+        GridTrack::Percent(p) => usable * p / 100.0,
+        GridTrack::Fr(f) => fr_unit * f,
+        GridTrack::Auto => 0.0,
+        GridTrack::MinMax(min, _) => resolve_single_track(min, usable, fr_unit),
+    }
 }
 
 #[cfg(test)]

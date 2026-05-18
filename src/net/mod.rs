@@ -6,7 +6,7 @@ mod dns;
 mod error;
 mod h2c;
 mod http;
-mod transport;
+pub(crate) mod transport;
 
 pub use self::adblock::Blocklist;
 pub use self::cookies::CookieJar;

@@ -373,6 +373,10 @@ impl JsEngine {
         super::sse::install(&mut ctx);
         super::abort::install(&mut ctx);
         super::streams::install(&mut ctx);
+        super::file::install(&mut ctx);
+        super::formdata::install(&mut ctx);
+        super::clipboard::install(&mut ctx);
+        super::webgpu::install(&mut ctx);
 
         let listeners: Rc<RefCell<ListenerMap>> = Rc::new(RefCell::new(HashMap::new()));
         let timers: Rc<RefCell<TimerState>> = Rc::new(RefCell::new(TimerState::default()));
@@ -1722,6 +1726,7 @@ fn js_fetch(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
 
     let mut method = "GET".to_string();
     let mut body: Option<Vec<u8>> = None;
+    let mut body_content_type: Option<String> = None;
     let mut signal: Option<JsValue> = None;
     if let Some(init_val) = args.get(1) {
         if let Some(obj) = init_val.as_object() {
@@ -1732,7 +1737,31 @@ fn js_fetch(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
             }
             if let Ok(b) = obj.get(js_string!("body"), ctx) {
                 if !b.is_undefined() && !b.is_null() {
-                    body = Some(b.to_string(ctx)?.to_std_string_escaped().into_bytes());
+                    // FormData → multipart/form-data with boundary.
+                    if let Some(state) = super::formdata::formdata_state_of(&b, ctx) {
+                        let (bytes, ct) = super::formdata::serialise_formdata(&state);
+                        body = Some(bytes);
+                        body_content_type = Some(ct);
+                    }
+                    // Blob/File → raw bytes with the blob's mime type.
+                    else if let Some(id) = super::file::blob_id_of(&b, ctx) {
+                        if let Some(entry) = super::file::read_blob_entry(id) {
+                            body = Some(entry.bytes);
+                            if !entry.mime.is_empty() {
+                                body_content_type = Some(entry.mime);
+                            }
+                        }
+                    }
+                    // ArrayBuffer / Uint8Array — try the byte-iterable
+                    // path so binary uploads work without manual
+                    // string conversion.
+                    else if let Some(bytes) = read_typed_array_bytes(&b, ctx) {
+                        body = Some(bytes);
+                    }
+                    // Default: serialise as a UTF-8 string.
+                    else {
+                        body = Some(b.to_string(ctx)?.to_std_string_escaped().into_bytes());
+                    }
                 }
             }
             if let Ok(s) = obj.get(js_string!("signal"), ctx) {
@@ -1775,6 +1804,8 @@ fn js_fetch(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
         .into());
     }
 
+    let content_type =
+        body_content_type.unwrap_or_else(|| "application/x-www-form-urlencoded".to_string());
     let response = JS_FETCH_CLIENT.with(|slot| -> Option<net::Result<net::Response>> {
         let client = slot.borrow().as_ref()?.clone();
         let initiator = JS_BASE_URL.with(|u| u.borrow().clone());
@@ -1786,7 +1817,7 @@ fn js_fetch(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
         Some(match method.as_str() {
             "POST" => {
                 let b = body.unwrap_or_default();
-                client.post_with(&url, b, "application/x-www-form-urlencoded", ctx)
+                client.post_with(&url, b, &content_type, ctx)
             }
             _ => client.get_with(&url, ctx),
         })
@@ -1901,6 +1932,34 @@ fn make_failed_response(ctx: &mut Context, url_str: &str, reason: &str) -> boa_e
             0,
         )
         .build()
+}
+
+/// Best-effort extraction of a `Uint8Array` / `ArrayBuffer` view into
+/// a Rust `Vec<u8>`. Returns `None` if `val` isn't recognisable as
+/// either.
+fn read_typed_array_bytes(val: &JsValue, ctx: &mut Context) -> Option<Vec<u8>> {
+    use boa_engine::object::builtins::{JsArrayBuffer, JsUint8Array};
+    let obj = val.as_object()?;
+    if let Ok(u8a) = JsUint8Array::from_object(obj.clone()) {
+        let len = u8a.length(ctx).unwrap_or(0);
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len {
+            let v = u8a.at(i as i64, ctx).ok()?;
+            out.push(v.to_u32(ctx).ok()? as u8);
+        }
+        return Some(out);
+    }
+    if let Ok(ab) = JsArrayBuffer::from_object(obj.clone()) {
+        let len = ab.byte_length();
+        let view = JsUint8Array::from_array_buffer(ab, ctx).ok()?;
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len {
+            let v = view.at(i as i64, ctx).ok()?;
+            out.push(v.to_u32(ctx).ok()? as u8);
+        }
+        return Some(out);
+    }
+    None
 }
 
 fn response_text(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {

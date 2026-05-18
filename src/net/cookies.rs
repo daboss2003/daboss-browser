@@ -19,13 +19,22 @@
 //!    `SameSite=None`. Real browsers default to `Lax`; we'll close this
 //!    gap when we have multi-tab top-level navigation that matters.
 //!
-//! Threat model note: cookies are kept in memory only — no disk
-//! persistence — so they never outlive the process. This keeps the cookie
-//! attack surface bounded to the current run.
+//! Persistence: cookies with a `Max-Age` (i.e. `expires_at: Some(_)`)
+//! survive process restarts via a single binary file at
+//! `<data_dir>/daboss-cookies/jar.bin`. Session cookies (no Max-Age)
+//! stay in-memory only, matching the browser convention. Writes are
+//! atomic (tempfile + rename) so a crash mid-write can't corrupt the
+//! jar.
 
-use std::time::{Duration, Instant};
+use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use url::Url;
+
+const JAR_MAGIC: &[u8; 4] = b"DBCJ";
+const JAR_VERSION: u8 = 1;
 
 #[derive(Debug, Clone)]
 pub struct Cookie {
@@ -41,11 +50,30 @@ pub struct Cookie {
 #[derive(Default, Debug)]
 pub struct CookieJar {
     cookies: Vec<Cookie>,
+    /// Set to false in unit tests so jar mutations don't write to a
+    /// shared disk file that would leak state between tests. Real
+    /// callers (the `Client`) leave this `true`.
+    disk_backed: bool,
 }
 
 impl CookieJar {
     pub fn new() -> Self {
-        Self::default()
+        let mut jar = Self {
+            cookies: Vec::new(),
+            disk_backed: true,
+        };
+        jar.load_from_disk();
+        jar
+    }
+
+    /// Test-only constructor that skips disk persistence so multiple
+    /// in-process jars don't trip over each other's saved state.
+    #[cfg(test)]
+    pub fn new_in_memory() -> Self {
+        Self {
+            cookies: Vec::new(),
+            disk_backed: false,
+        }
     }
 
     /// Insert a cookie. If one with the same (name, domain, path) tuple
@@ -60,6 +88,7 @@ impl CookieJar {
                     && c.domain.eq_ignore_ascii_case(&cookie.domain)
                     && c.path == cookie.path)
             });
+            self.persist();
             return;
         }
         if let Some(slot) = self.cookies.iter_mut().find(|c| {
@@ -71,6 +100,7 @@ impl CookieJar {
         } else {
             self.cookies.push(cookie);
         }
+        self.persist();
     }
 
     /// Drop every cookie whose `expires_at` is in the past relative to
@@ -81,6 +111,7 @@ impl CookieJar {
             Some(t) => t > now,
             None => true,
         });
+        self.persist();
     }
 
     /// Return the `Cookie:` header value for a given request URL, or
@@ -265,6 +296,179 @@ fn path_matches(request_path: &str, cookie_path: &str) -> bool {
     request_path[cookie_path.len()..].starts_with('/')
 }
 
+// =================== persistence ===================
+
+impl CookieJar {
+    fn persist(&self) {
+        if !self.disk_backed {
+            return;
+        }
+        let persistent: Vec<&Cookie> = self
+            .cookies
+            .iter()
+            .filter(|c| c.expires_at.is_some())
+            .collect();
+        let bytes = encode_jar(&persistent);
+        let target = jar_path();
+        if let Some(parent) = target.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let tmp = target.with_extension("bin.tmp");
+        if let Ok(mut f) = fs::File::create(&tmp) {
+            if f.write_all(&bytes).is_err() {
+                return;
+            }
+            drop(f);
+            let _ = fs::rename(&tmp, &target);
+        }
+    }
+
+    fn load_from_disk(&mut self) {
+        let path = jar_path();
+        let Ok(bytes) = fs::read(&path) else {
+            return;
+        };
+        if let Some(loaded) = decode_jar(&bytes) {
+            let now = Instant::now();
+            // Skip cookies that are already expired.
+            self.cookies = loaded
+                .into_iter()
+                .filter(|c| c.expires_at.map(|t| t > now).unwrap_or(true))
+                .collect();
+        }
+    }
+}
+
+fn jar_path() -> PathBuf {
+    let mut p = crate::js::opfs::data_dir_path();
+    p.push("daboss-cookies");
+    p.push("jar.bin");
+    p
+}
+
+fn encode_jar(cookies: &[&Cookie]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64 + cookies.len() * 64);
+    out.extend_from_slice(JAR_MAGIC);
+    out.push(JAR_VERSION);
+    out.extend_from_slice(&(cookies.len() as u32).to_le_bytes());
+    for c in cookies {
+        write_lp(&mut out, c.name.as_bytes());
+        write_lp(&mut out, c.value.as_bytes());
+        write_lp(&mut out, c.domain.as_bytes());
+        write_lp(&mut out, c.path.as_bytes());
+        let ms = c.expires_at.map(instant_to_unix_ms).unwrap_or(0);
+        out.extend_from_slice(&ms.to_le_bytes());
+        out.push(c.secure as u8);
+        out.push(c.http_only as u8);
+    }
+    out
+}
+
+fn decode_jar(buf: &[u8]) -> Option<Vec<Cookie>> {
+    let mut p = 0usize;
+    if buf.len() < 9 || &buf[..4] != JAR_MAGIC {
+        return None;
+    }
+    p += 4;
+    if buf[p] != JAR_VERSION {
+        return None;
+    }
+    p += 1;
+    let n = read_u32(buf, &mut p)? as usize;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let name = read_lp(buf, &mut p)?;
+        let value = read_lp(buf, &mut p)?;
+        let domain = read_lp(buf, &mut p)?;
+        let path = read_lp(buf, &mut p)?;
+        let ms = read_u64(buf, &mut p)?;
+        if p + 2 > buf.len() {
+            return None;
+        }
+        let secure = buf[p] != 0;
+        let http_only = buf[p + 1] != 0;
+        p += 2;
+        let expires_at = if ms == 0 {
+            None
+        } else {
+            unix_ms_to_instant(ms)
+        };
+        out.push(Cookie {
+            name: String::from_utf8(name).ok()?,
+            value: String::from_utf8(value).ok()?,
+            domain: String::from_utf8(domain).ok()?,
+            path: String::from_utf8(path).ok()?,
+            expires_at,
+            secure,
+            http_only,
+        });
+    }
+    Some(out)
+}
+
+fn write_lp(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(bytes);
+}
+
+fn read_u32(buf: &[u8], p: &mut usize) -> Option<u32> {
+    if *p + 4 > buf.len() {
+        return None;
+    }
+    let v = u32::from_le_bytes([buf[*p], buf[*p + 1], buf[*p + 2], buf[*p + 3]]);
+    *p += 4;
+    Some(v)
+}
+
+fn read_u64(buf: &[u8], p: &mut usize) -> Option<u64> {
+    if *p + 8 > buf.len() {
+        return None;
+    }
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(&buf[*p..*p + 8]);
+    *p += 8;
+    Some(u64::from_le_bytes(arr))
+}
+
+fn read_lp(buf: &[u8], p: &mut usize) -> Option<Vec<u8>> {
+    let n = read_u32(buf, p)? as usize;
+    if *p + n > buf.len() {
+        return None;
+    }
+    let out = buf[*p..*p + n].to_vec();
+    *p += n;
+    Some(out)
+}
+
+fn instant_to_unix_ms(t: Instant) -> u64 {
+    let now_instant = Instant::now();
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if t >= now_instant {
+        let delta = t.duration_since(now_instant);
+        now_unix.saturating_add(delta.as_millis() as u64)
+    } else {
+        let delta = now_instant.duration_since(t);
+        now_unix.saturating_sub(delta.as_millis() as u64)
+    }
+}
+
+fn unix_ms_to_instant(ms: u64) -> Option<Instant> {
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let now_instant = Instant::now();
+    if ms >= now_unix {
+        Some(now_instant + Duration::from_millis(ms - now_unix))
+    } else {
+        let delta = now_unix - ms;
+        now_instant.checked_sub(Duration::from_millis(delta))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,7 +522,7 @@ mod tests {
 
     #[test]
     fn jar_header_for_matches_secure_only_on_https() {
-        let mut jar = CookieJar::new();
+        let mut jar = CookieJar::new_in_memory();
         let mut c = parse_set_cookie("a=1; Secure", &url("https://example.com/")).unwrap();
         c.secure = true;
         jar.insert(c);
@@ -328,7 +532,7 @@ mod tests {
 
     #[test]
     fn jar_replaces_same_name_path_domain() {
-        let mut jar = CookieJar::new();
+        let mut jar = CookieJar::new_in_memory();
         jar.insert(parse_set_cookie("a=1", &url("https://example.com/")).unwrap());
         jar.insert(parse_set_cookie("a=2", &url("https://example.com/")).unwrap());
         let h = jar.header_for(&url("https://example.com/")).unwrap();
@@ -337,7 +541,7 @@ mod tests {
 
     #[test]
     fn jar_max_age_zero_deletes() {
-        let mut jar = CookieJar::new();
+        let mut jar = CookieJar::new_in_memory();
         jar.insert(parse_set_cookie("a=1", &url("https://example.com/")).unwrap());
         jar.insert(
             parse_set_cookie("a=1; Max-Age=0", &url("https://example.com/")).unwrap(),
@@ -347,7 +551,7 @@ mod tests {
 
     #[test]
     fn ingest_set_cookies_picks_only_set_cookie_lines() {
-        let mut jar = CookieJar::new();
+        let mut jar = CookieJar::new_in_memory();
         let headers = [
             ("Set-Cookie", "a=1"),
             ("Content-Type", "text/html"),
@@ -362,7 +566,7 @@ mod tests {
 
     #[test]
     fn more_specific_path_sorts_first() {
-        let mut jar = CookieJar::new();
+        let mut jar = CookieJar::new_in_memory();
         jar.insert(parse_set_cookie("a=1; Path=/", &url("https://x/")).unwrap());
         jar.insert(
             parse_set_cookie("b=2; Path=/foo", &url("https://x/foo/")).unwrap(),

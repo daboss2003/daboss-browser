@@ -40,12 +40,24 @@ pub const MAX_DISK_BYTES: u64 = 256 * 1024 * 1024;
 const META_MAGIC: &[u8; 4] = b"DBCK";
 const META_VERSION: u8 = 1;
 
+/// Inline-vs-disk threshold for materializing cached bodies on read.
+/// Smaller cache hits return their body in a `Vec<u8>`; larger ones
+/// are copied to a fresh tempfile so a `Response` can own and unlink
+/// it without disturbing the canonical cache file. On macOS the copy
+/// is a reflink (clonefile) so it's near-free; on Linux/Android with
+/// reflink support it's likewise cheap, otherwise it's a stream copy
+/// that still avoids RAM materialization.
+pub const CACHE_HIT_INLINE_THRESHOLD: u64 = 1 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct CachedEntry {
     pub status: u16,
     pub reason: String,
     pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
+    /// Total body size on disk. The body itself is fetched via
+    /// `HttpCache::read_body_for_response`, which decides whether
+    /// to return inline bytes or a tempfile path.
+    pub body_size: u64,
     /// When the cached entry becomes stale. `None` means
     /// "must-revalidate via the ETag/Last-Modified validator path
     /// every time" — i.e. no freshness window.
@@ -167,20 +179,47 @@ impl HttpCache {
     pub fn lookup(&mut self, key: &str) -> Option<&CachedEntry> {
         if !self.map.contains_key(key) {
             let dk = self.disk.get(key).cloned()?;
-            let entry = read_meta_and_body(&dk)?;
+            let entry = read_meta(&dk)?;
             self.map.insert(key.to_string(), (entry, dk));
         }
         self.map.get(key).map(|(e, _)| e)
     }
 
+    /// Materialize the cached body for a Response. Small entries come
+    /// back as inline bytes; large ones come back as a fresh tempfile
+    /// path the caller takes ownership of (Response::Drop will unlink
+    /// it, leaving the canonical cache file intact).
+    pub fn read_body_for_response(
+        &mut self,
+        key: &str,
+    ) -> Option<(Vec<u8>, Option<PathBuf>)> {
+        // Fault the meta in so we know the size up front.
+        let _ = self.lookup(key);
+        let (_, dk) = self.map.get(key)?;
+        let body_path = dk.body_path();
+        let size = fs::metadata(&body_path).map(|m| m.len()).unwrap_or(0);
+        if size <= CACHE_HIT_INLINE_THRESHOLD {
+            let bytes = fs::read(&body_path).unwrap_or_default();
+            Some((bytes, None))
+        } else if let Some(tmp) = clone_to_response_tempfile(&body_path) {
+            Some((Vec::new(), Some(tmp)))
+        } else {
+            // Fallback: inline read even at large size (avoids
+            // failing the request just because the temp-copy failed).
+            let bytes = fs::read(&body_path).unwrap_or_default();
+            Some((bytes, None))
+        }
+    }
+
     /// Try to update an existing entry's headers / freshness window
     /// from a `304 Not Modified` response. Returns the refreshed body
-    /// if there was a matching entry, `None` otherwise.
+    /// (inline or via tempfile path) if there was a matching entry,
+    /// `None` otherwise.
     pub fn refresh_after_304(
         &mut self,
         key: &str,
         headers: &[(String, String)],
-    ) -> Option<Vec<u8>> {
+    ) -> Option<(Vec<u8>, Option<PathBuf>)> {
         // Fault the entry in if it's only on disk.
         let _ = self.lookup(key);
         let (entry, dk) = self.map.get_mut(key)?;
@@ -192,13 +231,18 @@ impl HttpCache {
                 _ => {}
             }
         }
-        let body = entry.body.clone();
         let _ = write_meta(dk, entry);
-        Some(body)
+        self.read_body_for_response(key)
     }
 
     /// Insert a fresh entry from a fetched response, if the response
     /// is cacheable. Returns whether something was stored.
+    ///
+    /// Streams the body to disk without ever materializing it in
+    /// memory: if the source `Response` has `body_path`, we
+    /// `fs::copy` from the source tempfile (reflink on capable
+    /// filesystems). Only in-memory bodies under the spill
+    /// threshold pass through RAM, and those are already there.
     pub fn store(&mut self, key: &str, response: &Response) -> bool {
         if !is_status_cacheable(response.status) {
             return false;
@@ -206,10 +250,10 @@ impl HttpCache {
         if response_forbids_cache(response) {
             return false;
         }
-        let body_bytes = response.body_bytes();
+        let body_size = response.body_size();
         // Per-entry hard cap — refuse to cache anything bigger than
         // the whole disk budget (would force-evict everything else).
-        if body_bytes.len() as u64 > self.max_bytes {
+        if body_size > self.max_bytes {
             return false;
         }
         let now = Instant::now();
@@ -221,7 +265,7 @@ impl HttpCache {
             status: response.status,
             reason: response.reason.clone(),
             headers: response.headers.clone(),
-            body: body_bytes.clone(),
+            body_size,
             fresh_until,
             etag: response.header("ETag").map(str::to_string),
             last_modified: response.header("Last-Modified").map(str::to_string),
@@ -232,7 +276,7 @@ impl HttpCache {
         let dk = DiskKey {
             origin: origin.clone(),
             url_hex: url_hex.clone(),
-            body_size: body_bytes.len() as u64,
+            body_size,
         };
 
         // Make sure the origin's directory exists.
@@ -242,7 +286,15 @@ impl HttpCache {
             return false;
         }
 
-        if write_body_atomic(&dk, &body_bytes).is_err() {
+        // Write body. If the source response already spilled to disk,
+        // copy file-to-file (reflink-friendly) instead of pulling the
+        // whole body through a Vec.
+        let body_ok = if let Some(src) = &response.body_path {
+            copy_body_atomic(&dk, src).is_ok()
+        } else {
+            write_body_atomic(&dk, &response.body).is_ok()
+        };
+        if !body_ok {
             return false;
         }
         if write_meta(&dk, &entry).is_err() {
@@ -317,12 +369,31 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn read_meta_and_body(dk: &DiskKey) -> Option<CachedEntry> {
+fn read_meta(dk: &DiskKey) -> Option<CachedEntry> {
     let meta = fs::read(dk.meta_path()).ok()?;
-    let body = fs::read(dk.body_path()).ok()?;
-    let mut entry = parse_meta(&meta)?;
-    entry.body = body;
-    Some(entry)
+    parse_meta(&meta)
+}
+
+fn copy_body_atomic(dk: &DiskKey, src: &std::path::Path) -> std::io::Result<()> {
+    let target = dk.body_path();
+    let tmp = target.with_extension("body.tmp");
+    fs::copy(src, &tmp)?;
+    fs::rename(&tmp, &target)
+}
+
+/// Make a fresh tempfile that mirrors the cache body file. Used so a
+/// `Response` returned from a cache hit can own its body file (and
+/// have `Response::Drop` clean it up) without touching the canonical
+/// cache copy.
+fn clone_to_response_tempfile(cache_body: &std::path::Path) -> Option<PathBuf> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut tmp = std::env::temp_dir();
+    tmp.push(format!("daboss-cachehit-{stamp:x}.bin"));
+    fs::copy(cache_body, &tmp).ok()?;
+    Some(tmp)
 }
 
 fn write_meta(dk: &DiskKey, entry: &CachedEntry) -> std::io::Result<()> {
@@ -361,6 +432,7 @@ fn encode_meta(entry: &CachedEntry) -> Vec<u8> {
     out.extend_from_slice(&fresh_ms.to_le_bytes());
     write_lp_opt(&mut out, entry.etag.as_deref());
     write_lp_opt(&mut out, entry.last_modified.as_deref());
+    out.extend_from_slice(&entry.body_size.to_le_bytes());
     out.extend_from_slice(&(entry.headers.len() as u32).to_le_bytes());
     for (k, v) in &entry.headers {
         write_lp_str(&mut out, k);
@@ -387,6 +459,7 @@ fn parse_meta(buf: &[u8]) -> Option<CachedEntry> {
     };
     let etag = p.read_lp_opt()?;
     let last_modified = p.read_lp_opt()?;
+    let body_size = p.read_u64()?;
     let n = p.read_u32()? as usize;
     let mut headers = Vec::with_capacity(n);
     for _ in 0..n {
@@ -398,7 +471,7 @@ fn parse_meta(buf: &[u8]) -> Option<CachedEntry> {
         status,
         reason,
         headers,
-        body: Vec::new(),
+        body_size,
         fresh_until,
         etag,
         last_modified,
@@ -635,9 +708,10 @@ mod tests {
         let r = make(&[("ETag", "\"abc\"")]);
         let key = unique_key("304");
         cache.store(&key, &r);
-        let body = cache
+        let (body, path) = cache
             .refresh_after_304(&key, &[("Cache-Control".into(), "max-age=60".into())])
             .unwrap();
+        assert!(path.is_none(), "small body should come back inline");
         assert_eq!(body, b"hello");
         assert!(cache.lookup(&key).unwrap().is_fresh(Instant::now()));
     }
@@ -651,7 +725,23 @@ mod tests {
             assert!(cache.store(&key, &r));
         }
         let mut cache = HttpCache::new();
-        let entry = cache.lookup(&key).unwrap();
-        assert_eq!(entry.body, b"hello");
+        let _entry = cache.lookup(&key).unwrap();
+        let (body, _) = cache.read_body_for_response(&key).unwrap();
+        assert_eq!(body, b"hello");
+    }
+
+    #[test]
+    fn large_body_returns_tempfile_path() {
+        let key = unique_key("large-hit");
+        let mut big = make(&[("Cache-Control", "max-age=3600")]);
+        big.body = vec![b'X'; (CACHE_HIT_INLINE_THRESHOLD as usize) + 1024];
+        let mut cache = HttpCache::new();
+        assert!(cache.store(&key, &big));
+        let (inline, path) = cache.read_body_for_response(&key).unwrap();
+        assert!(inline.is_empty(), "large body should arrive via path");
+        let path = path.expect("expected a tempfile path for the large entry");
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), big.body.len());
+        let _ = std::fs::remove_file(&path);
     }
 }

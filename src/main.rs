@@ -117,6 +117,8 @@ fn run_png_export(url_str: &str) -> Result<(), net::Error> {
     }
     let style_tree = css::style_dom(&dom, &sheets);
 
+    prefetch_link_resources(&dom, &client, &base_url);
+
     let mut images = layout::ImageCache::new();
     prefetch_images(&dom, &client, &base_url, &mut images);
     prefetch_background_images(&dom, &style_tree, &client, &base_url, &mut images);
@@ -515,6 +517,8 @@ impl Browser {
             &css::InteractionState::EMPTY,
             &css_viewport,
         );
+
+        prefetch_link_resources(&dom, &self.client, &parsed);
 
         let mut images = layout::ImageCache::new();
         prefetch_images(&dom, &self.client, &parsed, &mut images);
@@ -2330,6 +2334,8 @@ fn load_iframe_document(
     }
     let style_tree = css::style_dom(&dom, &sheets);
 
+    prefetch_link_resources(&dom, client, &abs);
+
     let mut images = layout::ImageCache::new();
     prefetch_images(&dom, client, &abs, &mut images);
     prefetch_background_images(&dom, &style_tree, client, &abs, &mut images);
@@ -3552,6 +3558,96 @@ impl Browser {
                 }
             }
         }
+    }
+}
+
+// ---------------- <link rel=preload|prefetch> warming ----------------
+
+/// Cap on background URL warming per page. Lighthouse warns at >5
+/// preloads; 24 leaves headroom for chatty sites without letting a
+/// malicious page burn through arbitrary network/disk budget.
+const MAX_LINK_PRELOADS: usize = 24;
+
+/// Walk the DOM for `<link rel="preload">` and `<link rel="prefetch">`
+/// elements and best-effort fetch each `href`. The HTTP cache layer
+/// stores the responses, so a later request — JS `fetch()`, a future
+/// navigation, an XHR — hits the cache instead of the network.
+///
+/// We don't try to use the result here; the win is purely warming
+/// `HttpCache`. Failures are silently ignored.
+fn prefetch_link_resources(dom: &dom::Dom, client: &net::Client, base_url: &url::Url) -> usize {
+    let mut hrefs: Vec<(String, Option<String>)> = Vec::new();
+    collect_link_preload_hrefs(dom, dom.document(), &mut hrefs);
+    let mut warmed = 0usize;
+    for (href, as_attr) in hrefs.into_iter().take(MAX_LINK_PRELOADS) {
+        if href.is_empty() {
+            continue;
+        }
+        let Ok(abs) = base_url.join(&href) else {
+            continue;
+        };
+        // Skip non-http(s) schemes — data:, blob:, about: have no
+        // network round-trip to warm.
+        if !matches!(abs.scheme(), "http" | "https") {
+            continue;
+        }
+        match client.get(abs.as_str()) {
+            Ok(_) => {
+                warmed += 1;
+                tracing::debug!(
+                    href = %abs,
+                    as_attr = as_attr.as_deref().unwrap_or(""),
+                    "preload: warmed cache",
+                );
+            }
+            Err(e) => {
+                tracing::debug!(href = %abs, error = %e, "preload: fetch failed");
+            }
+        }
+    }
+    warmed
+}
+
+fn collect_link_preload_hrefs(
+    dom: &dom::Dom,
+    node: dom::NodeId,
+    out: &mut Vec<(String, Option<String>)>,
+) {
+    if out.len() >= MAX_LINK_PRELOADS {
+        return;
+    }
+    if let dom::NodeKind::Element { tag, attrs } = &dom.node(node).kind {
+        if tag == "link" {
+            let rel = attrs
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("rel"))
+                .map(|(_, v)| v.to_ascii_lowercase());
+            let is_warming_hint = rel
+                .as_deref()
+                .map(|r| {
+                    r.split_ascii_whitespace()
+                        .any(|tok| tok == "preload" || tok == "prefetch")
+                })
+                .unwrap_or(false);
+            if is_warming_hint {
+                let href = attrs
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("href"))
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default();
+                let as_attr = attrs
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("as"))
+                    .map(|(_, v)| v.clone());
+                if !href.is_empty() {
+                    out.push((href, as_attr));
+                }
+            }
+        }
+    }
+    let kids: Vec<dom::NodeId> = dom.children(node).collect();
+    for c in kids {
+        collect_link_preload_hrefs(dom, c, out);
     }
 }
 

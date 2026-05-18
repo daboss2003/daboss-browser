@@ -7,6 +7,14 @@
 //! relying-party id so `get()` can pick a matching credential when
 //! the page sends an `allowCredentials` list.
 //!
+//! Persistence: credentials are written to disk under
+//! `<data_dir>/daboss-webauthn/<rp-id>/<cred-id-hex>.bin` so they
+//! survive process restarts (passkeys are useless if the user has
+//! to re-enroll every launch). On `install()` we lazily fault every
+//! file into the in-memory registry. On `create()` and after each
+//! `get()` we re-persist the credential atomically (tempfile +
+//! rename) so a crash mid-write can't corrupt the entry.
+//!
 //! Encoded outputs:
 //!   * `clientDataJSON` — the spec's CollectedClientData with `type`,
 //!     `challenge` (base64url), `origin`. UTF-8 bytes go into an
@@ -25,6 +33,9 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
 
 use boa_engine::{
     js_string,
@@ -34,6 +45,9 @@ use boa_engine::{
 };
 
 use ring::{digest, rand::SecureRandom, signature};
+
+const CRED_MAGIC: &[u8; 4] = b"DBWA";
+const CRED_VERSION: u8 = 1;
 
 #[derive(Clone)]
 pub struct Credential {
@@ -56,6 +70,10 @@ thread_local! {
     pub(crate) static CRED_NEXT_ID: RefCell<u32> = const { RefCell::new(1) };
     pub(crate) static SYSTEM_RNG: RefCell<Option<std::rc::Rc<ring::rand::SystemRandom>>> =
         const { RefCell::new(None) };
+    /// `true` after the on-disk credential store has been faulted
+    /// into the in-memory registry. Gated so multiple `install()`
+    /// calls on the same thread don't load duplicates.
+    static CRED_DISK_LOADED: RefCell<bool> = const { RefCell::new(false) };
 }
 
 fn rng() -> std::rc::Rc<ring::rand::SystemRandom> {
@@ -79,6 +97,7 @@ fn next_cred_id() -> u32 {
 }
 
 pub fn install(ctx: &mut Context) {
+    load_credentials_from_disk_once();
     let realm = ctx.realm().clone();
     let create_fn = boa_engine::object::FunctionObjectBuilder::new(
         &realm,
@@ -272,7 +291,8 @@ fn credentials_create(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRes
         sign_count: 0,
     };
     let id = next_cred_id();
-    CREDENTIALS.with(|r| r.borrow_mut().insert(id, cred));
+    CREDENTIALS.with(|r| r.borrow_mut().insert(id, cred.clone()));
+    persist_credential(&cred);
 
     // Build authData + attestationObject.
     let rp_id_hash = sha256(rp_id.as_bytes());
@@ -387,6 +407,7 @@ fn credentials_get(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult
             c.sign_count = cred.sign_count;
         }
     });
+    persist_credential(&cred);
 
     let rp_id_hash = sha256(cred.rp_id.as_bytes());
     let auth_data = build_auth_data(
@@ -812,4 +833,149 @@ fn ab_from_bytes(ctx: &mut Context, bytes: &[u8]) -> JsValue {
 
 fn empty_obj(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     Ok(ObjectInitializer::new(ctx).build().into())
+}
+
+// =================== disk persistence ===================
+
+fn webauthn_root() -> PathBuf {
+    let mut p = super::opfs::data_dir_path();
+    p.push("daboss-webauthn");
+    let _ = fs::create_dir_all(&p);
+    p
+}
+
+fn cred_dir(rp_id: &str) -> PathBuf {
+    let rp = super::opfs::sanitise_path_component(rp_id);
+    let mut p = webauthn_root();
+    p.push(rp);
+    let _ = fs::create_dir_all(&p);
+    p
+}
+
+fn cred_file(rp_id: &str, credential_id: &[u8]) -> PathBuf {
+    let mut p = cred_dir(rp_id);
+    p.push(format!("{}.bin", hex_encode(credential_id)));
+    p
+}
+
+fn persist_credential(cred: &Credential) {
+    let bytes = encode_credential(cred);
+    let target = cred_file(&cred.rp_id, &cred.credential_id);
+    let tmp = target.with_extension("bin.tmp");
+    if let Ok(mut f) = fs::File::create(&tmp) {
+        if f.write_all(&bytes).is_err() {
+            return;
+        }
+        drop(f);
+        let _ = fs::rename(&tmp, &target);
+    }
+}
+
+fn load_credentials_from_disk_once() {
+    let already = CRED_DISK_LOADED.with(|f| {
+        let was = *f.borrow();
+        if !was {
+            *f.borrow_mut() = true;
+        }
+        was
+    });
+    if already {
+        return;
+    }
+    let root = webauthn_root();
+    let Ok(rps) = fs::read_dir(&root) else { return };
+    let mut loaded: Vec<Credential> = Vec::new();
+    for rp_dir in rps.flatten() {
+        let path = rp_dir.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Ok(files) = fs::read_dir(&path) else { continue };
+        for f in files.flatten() {
+            let fpath = f.path();
+            if fpath.extension().and_then(|e| e.to_str()) != Some("bin") {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&fpath) else { continue };
+            if let Some(cred) = decode_credential(&bytes) {
+                loaded.push(cred);
+            }
+        }
+    }
+    CREDENTIALS.with(|r| {
+        let mut map = r.borrow_mut();
+        for cred in loaded {
+            let id = next_cred_id();
+            map.insert(id, cred);
+        }
+    });
+}
+
+fn encode_credential(cred: &Credential) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64 + cred.pkcs8.len() + cred.public_key.len());
+    out.extend_from_slice(CRED_MAGIC);
+    out.push(CRED_VERSION);
+    write_lp(&mut out, &cred.credential_id);
+    write_lp(&mut out, cred.rp_id.as_bytes());
+    write_lp(&mut out, &cred.pkcs8);
+    write_lp(&mut out, &cred.public_key);
+    write_lp(&mut out, &cred.user_handle);
+    out.extend_from_slice(&cred.sign_count.to_le_bytes());
+    out
+}
+
+fn decode_credential(buf: &[u8]) -> Option<Credential> {
+    if buf.len() < 9 || &buf[..4] != CRED_MAGIC {
+        return None;
+    }
+    let mut p = 4usize;
+    if buf[p] != CRED_VERSION {
+        return None;
+    }
+    p += 1;
+    let credential_id = read_lp(buf, &mut p)?;
+    let rp_id = String::from_utf8(read_lp(buf, &mut p)?).ok()?;
+    let pkcs8 = read_lp(buf, &mut p)?;
+    let public_key = read_lp(buf, &mut p)?;
+    let user_handle = read_lp(buf, &mut p)?;
+    if p + 4 > buf.len() {
+        return None;
+    }
+    let sign_count = u32::from_le_bytes([buf[p], buf[p + 1], buf[p + 2], buf[p + 3]]);
+    Some(Credential {
+        credential_id,
+        rp_id,
+        pkcs8,
+        public_key,
+        user_handle,
+        sign_count,
+    })
+}
+
+fn write_lp(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(bytes);
+}
+
+fn read_lp(buf: &[u8], p: &mut usize) -> Option<Vec<u8>> {
+    if *p + 4 > buf.len() {
+        return None;
+    }
+    let n = u32::from_le_bytes([buf[*p], buf[*p + 1], buf[*p + 2], buf[*p + 3]]) as usize;
+    *p += 4;
+    if *p + n > buf.len() {
+        return None;
+    }
+    let out = buf[*p..*p + n].to_vec();
+    *p += n;
+    Some(out)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
 }

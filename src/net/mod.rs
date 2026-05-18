@@ -330,17 +330,21 @@ impl Client {
         let is_get = matches!(method, Method::Get);
         if is_get {
             let now = std::time::Instant::now();
-            let cached = self.cache.borrow_mut().lookup(&cache_key).cloned();
-            if let Some(entry) = cached {
+            let cached_meta = self.cache.borrow_mut().lookup(&cache_key).cloned();
+            if let Some(entry) = cached_meta {
                 if entry.is_fresh(now) {
                     tracing::debug!(%url, "cache: fresh hit");
-                    return Ok(Response {
-                        status: entry.status,
-                        reason: entry.reason,
-                        headers: entry.headers,
-                        body: entry.body,
-                        body_path: None,
-                    });
+                    if let Some((body, body_path)) =
+                        self.cache.borrow_mut().read_body_for_response(&cache_key)
+                    {
+                        return Ok(Response {
+                            status: entry.status,
+                            reason: entry.reason,
+                            headers: entry.headers,
+                            body,
+                            body_path,
+                        });
+                    }
                 }
             }
         }
@@ -495,7 +499,7 @@ impl Client {
                     .cache
                     .borrow_mut()
                     .refresh_after_304(&cache_key, &response.headers);
-                if let Some(body) = refreshed {
+                if let Some((body, body_path)) = refreshed {
                     tracing::debug!(%url, "cache: 304 refresh");
                     // Substitute the cached body but keep the new
                     // response's headers so the cascade up the stack
@@ -505,7 +509,7 @@ impl Client {
                         reason: "OK".into(),
                         headers: response.headers.clone(),
                         body,
-                        body_path: None,
+                        body_path,
                     });
                 }
             } else if (200..400).contains(&response.status) {

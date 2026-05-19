@@ -20,6 +20,24 @@ up the work without re-deriving context.
 
 ## Just shipped
 
+- [x] **CSS anchor positioning** (this session) — `ComputedStyle`
+      gains `anchor_name`, `position_anchor`, and per-side
+      `anchor_top/right/bottom/left: Option<AnchorRef>`. Cascade
+      parses `anchor-name: --foo`, `position-anchor: --foo`, and
+      `anchor(<name>? <side>)` inside inset properties. Layout
+      runs a post-pass after the main tree is built: it collects
+      every node with `anchor-name` into a `HashMap<name, Rect>`,
+      then for each `position: absolute|fixed` element with any
+      inset anchor reference resolves the target edge and shifts
+      the subtree. Two fall-out fixes: the CSS parser now
+      recognises dashed-idents (`--foo`) as keyword values
+      (previously the leading `-` routed to numeric parsing and
+      the ident was silently consumed one char at a time), and
+      `offset_from` returns `None` for `Value::Function { name:
+      "anchor", .. }` so the plain inset path doesn't fight the
+      anchor pass. Tests cover bottom-edge alignment,
+      `position-anchor` defaulting, and `right: anchor(--a right)`
+      pulling the element's left edge back by its width.
 - [x] `24e8829` **CSS subgrid (columns)** — `ComputedStyle` gains
       `subgrid_columns` / `subgrid_rows` flags. Cascade parses
       `grid-template-{columns,rows}: subgrid` into the flag. Layout
@@ -65,8 +83,6 @@ up the work without re-deriving context.
 
 ## Pending (each is its own session)
 
-- [ ] **CSS anchor positioning** — `anchor-name` / `position-anchor`
-  / `anchor()`. Layout-time bipartite tracking.
 - [ ] **CSS masking** — `mask-image` / `mask-mode`. Paint-side
   per-pixel multiply against the mask alpha.
 - [ ] **Source maps** — fetch `//# sourceMappingURL=` for each

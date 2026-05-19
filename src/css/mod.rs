@@ -8,12 +8,12 @@ pub use cascade::{selector_matches, InteractionState, StyleTree};
 pub use parser::{parse, parse_selector_list_str};
 #[allow(unused_imports)]
 pub use types::{
-    AlignContent, AlignItems, AnimationRule, BackgroundImage, BorderStyle, BoxShadow, BoxSides,
-    BoxSizing, Color, ComputedStyle, Dimension, Direction, Display, FilterFunction,
-    FlexDirection, FlexWrap, FontStyle, GridAutoFlow, GridLine, GridPlacement, GridTrack,
-    JustifyContent, MediaCondition, MediaQuery, Overflow, Position, Selector, Stylesheet,
-    TableLayout, TextAlign, TextDecoration, TextOverflow, TimingFunction, Transform2D,
-    TransitionRule, Viewport, WhiteSpace,
+    AlignContent, AlignItems, AnchorRef, AnchorSide, AnimationRule, BackgroundImage, BorderStyle,
+    BoxShadow, BoxSides, BoxSizing, Color, ComputedStyle, Dimension, Direction, Display,
+    FilterFunction, FlexDirection, FlexWrap, FontStyle, GridAutoFlow, GridLine, GridPlacement,
+    GridTrack, JustifyContent, MediaCondition, MediaQuery, Overflow, Position, Selector,
+    Stylesheet, TableLayout, TextAlign, TextDecoration, TextOverflow, TimingFunction,
+    Transform2D, TransitionRule, Viewport, WhiteSpace,
 };
 
 use crate::dom::{Dom, NodeId, NodeKind};

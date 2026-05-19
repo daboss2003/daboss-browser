@@ -523,6 +523,30 @@ pub enum Position {
     Sticky,
 }
 
+/// `anchor(<name>? <side>)` reference parsed off the value of `top`,
+/// `right`, `bottom`, or `left`. `name` is `None` when the call omits
+/// the dashed-ident — the element's `position-anchor` is used at
+/// layout time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnchorRef {
+    pub name: Option<String>,
+    pub side: AnchorSide,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorSide {
+    Top,
+    Right,
+    Bottom,
+    Left,
+    Center,
+    /// Logical "start" / "end" — for the toy we treat as Top/Left for
+    /// block-axis lookups and Left/Right for inline-axis (i.e. an LTR
+    /// approximation).
+    Start,
+    End,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoxSizing {
     ContentBox,
@@ -899,6 +923,22 @@ pub struct ComputedStyle {
     /// `z-index` painting order. `None` means "auto" (default DOM order).
     pub z_index: Option<i32>,
 
+    // ----- Anchor positioning -----
+    /// `anchor-name: --foo` — this element registers as an anchor under
+    /// the given dashed-ident. Multiple anchor-name values join with a
+    /// comma in the spec; we keep only the first for the toy.
+    pub anchor_name: Option<String>,
+    /// `position-anchor: --foo` — default anchor for un-named
+    /// `anchor()` calls in this element's inset properties.
+    pub position_anchor: Option<String>,
+    /// `top: anchor(--foo bottom)` etc. When present, supersedes the
+    /// plain length in the matching side during the post-layout
+    /// anchor-positioning pass. Name=None means "use position-anchor".
+    pub anchor_top: Option<AnchorRef>,
+    pub anchor_right: Option<AnchorRef>,
+    pub anchor_bottom: Option<AnchorRef>,
+    pub anchor_left: Option<AnchorRef>,
+
     // ----- Sizing constraints -----
     pub box_sizing: BoxSizing,
     pub min_width: Option<f32>,
@@ -981,6 +1021,12 @@ impl ComputedStyle {
             align_self: None,
             justify_self: None,
             position: Position::Static,
+            anchor_name: None,
+            position_anchor: None,
+            anchor_top: None,
+            anchor_right: None,
+            anchor_bottom: None,
+            anchor_left: None,
             top: None,
             right: None,
             bottom: None,

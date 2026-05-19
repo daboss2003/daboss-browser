@@ -616,6 +616,25 @@ impl<'a> Parser<'a> {
 
     fn parse_one_value(&mut self) -> Option<Value> {
         let c = self.peek()?;
+        // A dashed-ident (`--foo`) must be tried before the numeric
+        // branch — otherwise `-` falls into `parse_numeric` which
+        // resets and returns None, leaving the lexer to consume the
+        // ident one character at a time and produce nothing.
+        if c == '-' && self.input[self.pos..].starts_with("--") {
+            let start = self.pos;
+            self.advance(); // '-'
+            self.advance(); // '-'
+            while let Some(nc) = self.peek() {
+                if nc.is_ascii_alphanumeric() || nc == '_' || nc == '-' {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            let name = self.input[start..self.pos].to_string();
+            // Preserve case for dashed-idents (--Foo and --foo differ).
+            return Some(Value::Keyword(name));
+        }
         match c {
             '"' | '\'' => self.parse_string_lit().map(Value::String),
             '#' => self.parse_hex_color(),

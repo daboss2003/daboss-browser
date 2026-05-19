@@ -1263,10 +1263,44 @@ fn apply_declaration(
                 };
             }
         }
-        "top" => style.top = offset_from(value, style.font_size, parent),
-        "right" => style.right = offset_from(value, style.font_size, parent),
-        "bottom" => style.bottom = offset_from(value, style.font_size, parent),
-        "left" => style.left = offset_from(value, style.font_size, parent),
+        "top" => {
+            style.anchor_top = anchor_ref_from(value);
+            style.top = offset_from(value, style.font_size, parent);
+        }
+        "right" => {
+            style.anchor_right = anchor_ref_from(value);
+            style.right = offset_from(value, style.font_size, parent);
+        }
+        "bottom" => {
+            style.anchor_bottom = anchor_ref_from(value);
+            style.bottom = offset_from(value, style.font_size, parent);
+        }
+        "left" => {
+            style.anchor_left = anchor_ref_from(value);
+            style.left = offset_from(value, style.font_size, parent);
+        }
+        "anchor-name" => {
+            style.anchor_name = match value {
+                Value::Keyword(k) if k == "none" => None,
+                Value::Keyword(k) => Some(k.clone()),
+                Value::List(items) => items.iter().find_map(|v| {
+                    if let Value::Keyword(k) = v {
+                        if k != "," {
+                            return Some(k.clone());
+                        }
+                    }
+                    None
+                }),
+                _ => None,
+            };
+        }
+        "position-anchor" => {
+            style.position_anchor = match value {
+                Value::Keyword(k) if k == "auto" || k == "none" => None,
+                Value::Keyword(k) => Some(k.clone()),
+                _ => None,
+            };
+        }
         "z-index" => {
             if let Value::Number(n) = value {
                 style.z_index = Some(*n as i32);
@@ -2005,8 +2039,54 @@ fn angle_to_radians(raw: f32, source: Option<&Value>) -> f32 {
 fn offset_from(v: &Value, em: f32, parent: Option<&ComputedStyle>) -> Option<f32> {
     match v {
         Value::Keyword(k) if k == "auto" => None,
+        Value::Function { name, .. } if name == "anchor" => None,
         _ => length_to_px(v, em, parent),
     }
+}
+
+/// Parse `anchor(<name>? <side>)` off the value of an inset property.
+/// `name` is a dashed-ident (`--foo`); `side` is one of top/right/
+/// bottom/left/center/start/end. Anything else returns `None`.
+fn anchor_ref_from(v: &Value) -> Option<crate::css::AnchorRef> {
+    let Value::Function { name, args } = v else {
+        return None;
+    };
+    if name != "anchor" {
+        return None;
+    }
+    // Args are a flat list of tokens; commas appear as Keyword(",").
+    // Take everything before the first comma (the side argument).
+    let mut anchor_name: Option<String> = None;
+    let mut side: Option<crate::css::AnchorSide> = None;
+    for a in args {
+        if matches!(a, Value::Keyword(k) if k == ",") {
+            break;
+        }
+        if let Value::Keyword(k) = a {
+            if k.starts_with("--") {
+                anchor_name = Some(k.clone());
+                continue;
+            }
+            let parsed = match k.as_str() {
+                "top" => Some(crate::css::AnchorSide::Top),
+                "right" => Some(crate::css::AnchorSide::Right),
+                "bottom" => Some(crate::css::AnchorSide::Bottom),
+                "left" => Some(crate::css::AnchorSide::Left),
+                "center" => Some(crate::css::AnchorSide::Center),
+                "start" => Some(crate::css::AnchorSide::Start),
+                "end" => Some(crate::css::AnchorSide::End),
+                _ => None,
+            };
+            if parsed.is_some() {
+                side = parsed;
+            }
+        }
+    }
+    let side = side?;
+    Some(crate::css::AnchorRef {
+        name: anchor_name,
+        side,
+    })
 }
 
 fn apply_flex_shorthand(value: &Value, style: &mut ComputedStyle, parent: Option<&ComputedStyle>) {

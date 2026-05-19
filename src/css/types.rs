@@ -600,6 +600,24 @@ pub enum TextAlign {
     Right,
     Center,
     Justify,
+    /// Direction-aware: maps to Left for LTR, Right for RTL.
+    Start,
+    /// Direction-aware: maps to Right for LTR, Left for RTL.
+    End,
+}
+
+impl TextAlign {
+    /// Resolve `start`/`end` against the writing direction.
+    /// Other values pass through unchanged.
+    pub fn resolved(self, dir: Direction) -> TextAlign {
+        match (self, dir) {
+            (TextAlign::Start, Direction::Ltr) => TextAlign::Left,
+            (TextAlign::Start, Direction::Rtl) => TextAlign::Right,
+            (TextAlign::End, Direction::Ltr) => TextAlign::Right,
+            (TextAlign::End, Direction::Rtl) => TextAlign::Left,
+            (other, _) => other,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -2331,6 +2331,8 @@ fn text_align_to_css(t: &css::TextAlign) -> String {
         css::TextAlign::Right => "right",
         css::TextAlign::Center => "center",
         css::TextAlign::Justify => "justify",
+        css::TextAlign::Start => "start",
+        css::TextAlign::End => "end",
     }
     .to_string()
 }

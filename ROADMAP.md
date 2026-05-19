@@ -20,6 +20,21 @@ up the work without re-deriving context.
 
 ## Just shipped
 
+- [x] **Real bidi text shaping** (this session) — cosmic-text
+      already runs the Unicode bidi algorithm per line during
+      shape, so mixed Arabic/Hebrew/Latin runs were already
+      visually reordered. What was missing:
+      * `TextAlign::Start` / `TextAlign::End` variants +
+        `.resolved(direction)` mapper. Parsed in cascade.
+      * `dir="rtl"` HTML attribute mapped to
+        `Direction::Rtl` during cascade, auto-flipping default
+        `text-align: Left` to `Right`.
+      * Author `text-align` is now propagated onto every
+        `BufferLine` via `set_align(Some(Align::*))` so
+        per-line alignment honours CSS instead of
+        cosmic-text's default LTR=Left / RTL=Right behaviour.
+      Tests cover `dir="rtl"` flipping direction +
+      `text-align: start` resolving via direction.
 - [x] **Real WebGL 2 surface** (this session) —
   `getContext("webgl2")` now routes to a versioned constructor
   that, on top of the existing WebGL 1 entry points, adds:
@@ -38,9 +53,6 @@ up the work without re-deriving context.
 
 ## Pending (each is its own session)
 
-- [ ] **Real bidi text shaping** — Arabic + Hebrew + LTR mixed
-  lines. Needs ICU UBidi or harfbuzz bidi support. cosmic-text
-  has some bidi knobs to enable.
 - [ ] **CSS subgrid** — extend `Grid` layout to inherit tracks
   from the parent when `grid-template-{columns,rows}: subgrid`
   is set.

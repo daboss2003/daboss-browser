@@ -654,6 +654,25 @@ fn compute_one(
         _ => return style,
     };
 
+    // Honour the HTML `dir` attribute: `dir="rtl"` flips the
+    // computed direction before any CSS rules apply (CSS author
+    // rules can still override with `direction: ...`).
+    if let Some((_, v)) = attrs.iter().find(|(k, _)| k.eq_ignore_ascii_case("dir")) {
+        match v.to_ascii_lowercase().as_str() {
+            "rtl" => {
+                style.direction = crate::css::types::Direction::Rtl;
+                // Default text-align should follow direction.
+                if matches!(style.text_align, TextAlign::Left) {
+                    style.text_align = TextAlign::Right;
+                }
+            }
+            "ltr" => {
+                style.direction = crate::css::types::Direction::Ltr;
+            }
+            _ => {} // "auto" — leave as inherited
+        }
+    }
+
     // Collect matches with specificity + source order. Shadow DOM
     // scoping: a stylesheet's `scope` field decides whether its
     // rules can match `node`. UA rules ignore scope (they're the
@@ -888,6 +907,8 @@ fn apply_declaration(
                     "right" => TextAlign::Right,
                     "center" => TextAlign::Center,
                     "justify" => TextAlign::Justify,
+                    "start" => TextAlign::Start,
+                    "end" => TextAlign::End,
                     _ => TextAlign::Left,
                 };
             }
@@ -2717,6 +2738,56 @@ mod tests {
         let sheet = parser::parse("p { --gap: 4px; padding: calc(var(--gap) * 2); }");
         let s = style_for(&dom, &sheet, "p");
         assert!((s.padding.top - 8.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn dir_rtl_attribute_flips_direction_and_default_align() {
+        let mut dom = crate::dom::Dom::default();
+        let doc = dom.document();
+        let p = dom.create_element(
+            "p".to_string(),
+            vec![("dir".to_string(), "rtl".to_string())],
+        );
+        dom.append_child(doc, p);
+        let sheet = parser::parse("p { color: black; }");
+        let tree = StyleTree::compute(&dom, &[&sheet]);
+        let s = tree.get(p);
+        assert!(matches!(s.direction, crate::css::Direction::Rtl));
+        // Default text-align of Left got auto-flipped to Right
+        // for the RTL paragraph.
+        assert!(matches!(s.text_align, TextAlign::Right));
+    }
+
+    #[test]
+    fn text_align_start_resolves_via_direction() {
+        let dom = html::parse("<p>hello</p>");
+        let sheet = parser::parse("p { text-align: start; }");
+        let tree = StyleTree::compute(&dom, &[&sheet]);
+        let id = find_node(&dom, &dom.document(), "p").unwrap();
+        let resolved = tree.get(id).text_align.resolved(tree.get(id).direction);
+        assert!(
+            matches!(resolved, TextAlign::Left),
+            "LTR + start should resolve to Left, got {:?}",
+            resolved
+        );
+    }
+
+    fn find_node(
+        dom: &crate::dom::Dom,
+        from: &NodeId,
+        tag: &str,
+    ) -> Option<NodeId> {
+        if let NodeKind::Element { tag: t, .. } = &dom.node(*from).kind {
+            if t == tag {
+                return Some(*from);
+            }
+        }
+        for c in dom.children(*from).collect::<Vec<_>>() {
+            if let Some(found) = find_node(dom, &c, tag) {
+                return Some(found);
+            }
+        }
+        None
     }
 
     #[test]

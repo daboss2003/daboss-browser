@@ -11,9 +11,9 @@
 
 use std::ops::Range;
 
-use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Style, Weight, Wrap};
+use cosmic_text::{Align, Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Style, Weight, Wrap};
 
-use crate::css::{ComputedStyle, FontStyle, Overflow, StyleTree, TextOverflow};
+use crate::css::{ComputedStyle, FontStyle, Overflow, StyleTree, TextAlign, TextOverflow};
 use crate::dom::NodeId;
 
 use super::PseudoKind;
@@ -112,6 +112,25 @@ impl TextLayout {
         }
 
         buffer.set_rich_text(&mut self.system, rich, Attrs::new(), Shaping::Advanced);
+        // Propagate the CSS text-align onto every BufferLine.
+        // cosmic-text already runs the Unicode bidi algorithm per
+        // line during shape; leaving `align = None` would default
+        // to Left for LTR / Right for RTL, but explicit author
+        // alignment must override that.
+        let resolved_align = parent_style.text_align.resolved(parent_style.direction);
+        let line_align = match resolved_align {
+            TextAlign::Left => Some(Align::Left),
+            TextAlign::Right => Some(Align::Right),
+            TextAlign::Center => Some(Align::Center),
+            TextAlign::Justify => Some(Align::Justified),
+            // Start/End fell through to Left/Right above; this
+            // arm is only reachable if `resolved()` returns them
+            // (shouldn't happen, but be conservative).
+            TextAlign::Start | TextAlign::End => None,
+        };
+        for line in buffer.lines.iter_mut() {
+            line.set_align(line_align);
+        }
         buffer.shape_until_scroll(&mut self.system, false);
 
         let mut glyphs = Vec::new();

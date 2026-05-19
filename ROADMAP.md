@@ -20,8 +20,7 @@ up the work without re-deriving context.
 
 ## Just shipped
 
-- [x] **CSS Paint Worklets actually executing** (this session)
-      — new `js::paint_worklet` module owns a per-document
+- [x] `b721799` **CSS Paint Worklets actually executing** — new `js::paint_worklet` module owns a per-document
       `PAINT_WORKLETS` registry (`name -> class JsObject`) and a
       per-element `PAINT_WORKLET_COMMANDS` table of recorded
       `DrawCmd`s. `CSS.paintWorklet.addModule(url)` no longer

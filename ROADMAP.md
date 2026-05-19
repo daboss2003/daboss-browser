@@ -20,6 +20,25 @@ up the work without re-deriving context.
 
 ## Just shipped
 
+- [x] **Source maps + DevTools Sources panel** (this session) —
+      new `source_map` module: scrape
+      `//# sourceMappingURL=` / legacy `//@` from a script tail,
+      parse the JSON v3 format (custom recursive-descent parser to
+      avoid pulling serde for this one consumer), and base64-VLQ
+      decode the `mappings` blob into a per-line table of
+      `Segment { gen_col, source_index, source_line, source_col,
+      name_index }`. Parsed maps live in a thread-local
+      `SOURCE_MAPS` registry. The JS engine's
+      `run_initial_scripts` calls into the scraper; if the URL is
+      a `data:application/json;base64,...` blob it decodes inline
+      and registers under `<inline #N>`. New devtools
+      `Panel::Sources` between Storage and Picker lists all
+      registered maps with their source file count, mapping row
+      count, and a preview of the first `sourcesContent` blob
+      (capped at 40 lines). External (http) source-map URLs would
+      need a fetch hook the shell hasn't wired yet; data: URLs
+      are the dominant production-bundle form so this covers the
+      90% case.
 - [x] `1b5be15` **CSS masking** — `ComputedStyle` gains
       `mask_image: Option<BackgroundImage>` (reuses the existing
       `Url` / `LinearGradient` enum) + `mask_mode: MaskMode`
@@ -99,9 +118,6 @@ up the work without re-deriving context.
 
 ## Pending (each is its own session)
 
-- [ ] **Source maps** — fetch `//# sourceMappingURL=` for each
-  script/stylesheet, parse VLQ mappings, hook into devtools so
-  the Sources panel shows the original file.
 - [ ] **Per-tile damage tracking** — split each layer's pixmap
   into 256×256 tiles, hash per tile. Only re-render the dirty
   tiles. Needs subtree → tile invalidation mapping.

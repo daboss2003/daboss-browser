@@ -84,6 +84,7 @@ pub enum Panel {
     Dom,
     Network,
     Storage,
+    Sources,
     Picker,
 }
 
@@ -94,6 +95,7 @@ impl Panel {
             Panel::Dom => "Elements",
             Panel::Network => "Network",
             Panel::Storage => "Storage",
+            Panel::Sources => "Sources",
             Panel::Picker => "Picker",
         }
     }
@@ -104,7 +106,8 @@ impl Panel {
             Panel::Console => Panel::Dom,
             Panel::Dom => Panel::Network,
             Panel::Network => Panel::Storage,
-            Panel::Storage => Panel::Picker,
+            Panel::Storage => Panel::Sources,
+            Panel::Sources => Panel::Picker,
             Panel::Picker => Panel::Console,
         }
     }

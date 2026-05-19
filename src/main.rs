@@ -13,6 +13,7 @@ mod js;
 mod layout;
 mod net;
 mod paint;
+mod source_map;
 mod video;
 mod webrtc;
 mod ws;
@@ -3254,6 +3255,20 @@ fn paint_devtools_panel(
             );
             return;
         }
+        devtools::Panel::Sources => {
+            paint_sources_panel(
+                font_system,
+                swash_cache,
+                buffer,
+                width,
+                height,
+                scroll_top,
+                scroll_bottom,
+                line_h,
+                metrics_body,
+            );
+            return;
+        }
         devtools::Panel::Console => {}
     }
 
@@ -3700,6 +3715,77 @@ fn paint_storage_panel(
                 truncate_chars(v, 80)
             ),
         ));
+    }
+
+    paint_panel_lines(
+        font_system,
+        swash_cache,
+        buffer,
+        width,
+        height,
+        scroll_top,
+        scroll_bottom,
+        line_h,
+        metrics,
+        &lines,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_sources_panel(
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    buffer: &mut [u32],
+    width: u32,
+    height: u32,
+    scroll_top: u32,
+    scroll_bottom: u32,
+    line_h: i32,
+    metrics: Metrics,
+) {
+    let mut lines: Vec<(CtColor, String)> = Vec::new();
+    let header = CtColor::rgb(140, 200, 255);
+    let key = CtColor::rgb(220, 220, 220);
+    let muted = CtColor::rgb(160, 160, 180);
+    let code = CtColor::rgb(220, 230, 200);
+
+    let maps = source_map::snapshot();
+    lines.push((
+        header,
+        format!("Source maps ({} loaded)", maps.len()),
+    ));
+    if maps.is_empty() {
+        lines.push((
+            muted,
+            "  (no maps — emit `//# sourceMappingURL=data:application/json;base64,...` from a script to populate)".to_string(),
+        ));
+    }
+    for (key_name, map) in &maps {
+        lines.push((header, String::new()));
+        lines.push((key, format!("{key_name}")));
+        if let Some(f) = &map.file {
+            lines.push((muted, format!("  file: {f}")));
+        }
+        lines.push((
+            muted,
+            format!(
+                "  sources: {} · mappings rows: {}",
+                map.sources.len(),
+                map.mappings.len()
+            ),
+        ));
+        // Preview the first source's content if present so the panel
+        // looks like a working "Sources" view rather than a manifest.
+        if let Some(Some(content)) = map.sources_content.first() {
+            let name = map.sources.first().cloned().unwrap_or_default();
+            lines.push((header, format!("  ── {name} ──")));
+            for src_line in content.lines().take(40) {
+                lines.push((code, format!("    {src_line}")));
+            }
+            if content.lines().count() > 40 {
+                lines.push((muted, "    ... (truncated)".to_string()));
+            }
+        }
     }
 
     paint_panel_lines(

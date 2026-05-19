@@ -741,6 +741,16 @@ impl JsEngine {
         }
         let (rc, listeners_rc) = self.install_thread_locals(dom);
         for (i, src) in scripts.iter().enumerate() {
+            // Source-map discovery: a trailing `//# sourceMappingURL=`
+            // comment that points at a `data:` URL with an inline JSON
+            // payload parses immediately. External URLs would need a
+            // network fetch we don't yet wire from inside the engine,
+            // so they're left for the shell to register.
+            if let Some(url) = crate::source_map::extract_source_map_url(src) {
+                if let Some(map) = decode_inline_data_url_map(&url) {
+                    crate::source_map::register(format!("<inline #{i}>"), map);
+                }
+            }
             if let Err(e) = self.ctx.eval(Source::from_bytes(src.as_bytes())) {
                 eprintln!("[js] script #{i} threw: {e}");
             }
@@ -1107,6 +1117,75 @@ impl JsEngine {
 /// Aliases `window` (and `self`) to the global object so scripts that
 /// reach into `window.something` or expect `self === globalThis` work.
 /// Cheap because both are just `Attribute::WRITABLE` properties — direct
+/// Decode a `data:application/json;base64,...` source-map URL into a
+/// `SourceMap`. Returns `None` for unsupported schemes (http/https
+/// would need a fetch we don't wire here) or malformed payloads.
+fn decode_inline_data_url_map(url: &str) -> Option<crate::source_map::SourceMap> {
+    let rest = url.strip_prefix("data:")?;
+    let (header, payload) = rest.split_once(',')?;
+    // The header is `mime[;base64]` — we only care about the base64
+    // flag and accept any mime (Chrome emits
+    // `application/json` here but tools vary).
+    let is_base64 = header
+        .split(';')
+        .any(|seg| seg.trim().eq_ignore_ascii_case("base64"));
+    let json = if is_base64 {
+        let decoded = base64_decode(payload)?;
+        String::from_utf8(decoded).ok()?
+    } else {
+        // URL-encoded form (rfc3986): percent decode.
+        percent_decode(payload)
+    };
+    crate::source_map::parse(&json)
+}
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+    for &b in bytes {
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => break,
+            b' ' | b'\n' | b'\r' | b'\t' => continue,
+            _ => return None,
+        };
+        buf = (buf << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1u32 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    out.push(byte);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// assignments to `window.foo = ...` mutate the global, matching browser
 /// behaviour.
 /// Hang `getSelection` / `createRange` off both `document` and the
@@ -2585,6 +2664,62 @@ mod tests {
     use super::*;
     use crate::html;
     use crate::js::dom::find_for_test_by_id;
+
+    #[test]
+    fn inline_script_registers_source_map_from_data_url() {
+        // A `<script>` body that ends with a base64-encoded inline
+        // source map should be picked up at exec time and surface
+        // in the SOURCE_MAPS registry under an `<inline #N>` key.
+        crate::source_map::clear();
+        // Minimal valid v3 map.
+        let map_json = r#"{"version":3,"sources":["a.ts"],"sourcesContent":["const a=1;"],"mappings":""}"#;
+        let mut b64 = String::new();
+        {
+            // Tiny inline base64 encoder so we don't depend on a crate.
+            let bytes = map_json.as_bytes();
+            const ALPH: &[u8] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut i = 0;
+            while i + 2 < bytes.len() {
+                let n = ((bytes[i] as u32) << 16)
+                    | ((bytes[i + 1] as u32) << 8)
+                    | bytes[i + 2] as u32;
+                b64.push(ALPH[(n >> 18) as usize & 0x3f] as char);
+                b64.push(ALPH[(n >> 12) as usize & 0x3f] as char);
+                b64.push(ALPH[(n >> 6) as usize & 0x3f] as char);
+                b64.push(ALPH[n as usize & 0x3f] as char);
+                i += 3;
+            }
+            let rem = bytes.len() - i;
+            if rem == 1 {
+                let n = (bytes[i] as u32) << 16;
+                b64.push(ALPH[(n >> 18) as usize & 0x3f] as char);
+                b64.push(ALPH[(n >> 12) as usize & 0x3f] as char);
+                b64.push_str("==");
+            } else if rem == 2 {
+                let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8);
+                b64.push(ALPH[(n >> 18) as usize & 0x3f] as char);
+                b64.push(ALPH[(n >> 12) as usize & 0x3f] as char);
+                b64.push(ALPH[(n >> 6) as usize & 0x3f] as char);
+                b64.push('=');
+            }
+        }
+        let script = format!(
+            "var x = 1;\n//# sourceMappingURL=data:application/json;base64,{b64}\n"
+        );
+        let mut dom = html::parse(&format!(
+            "<html><body><script>{script}</script></body></html>"
+        ));
+        let _engine = JsEngine::new(&mut dom);
+        let snap = crate::source_map::snapshot();
+        assert!(
+            snap.iter().any(|(k, m)| k.starts_with("<inline")
+                && m.sources == vec!["a.ts".to_string()]),
+            "expected an inline source map under <inline #N>, got {:?}",
+            snap.iter().map(|(k, _)| k).collect::<Vec<_>>()
+        );
+        crate::source_map::clear();
+    }
 
     #[test]
     fn dispatch_runs_registered_listener_on_target() {

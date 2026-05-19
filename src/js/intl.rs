@@ -31,6 +31,7 @@ use boa_engine::{
 
 #[derive(Default, Clone)]
 struct NumberFormatOpts {
+    locale: String,
     style: String,             // "decimal" / "currency" / "percent" / "unit"
     currency: Option<String>,  // ISO code when style == currency
     minimum_fraction_digits: Option<u32>,
@@ -40,6 +41,7 @@ struct NumberFormatOpts {
 
 #[derive(Default, Clone)]
 struct DateTimeFormatOpts {
+    locale: String,
     year: Option<String>,
     month: Option<String>,
     day: Option<String>,
@@ -47,6 +49,243 @@ struct DateTimeFormatOpts {
     minute: Option<String>,
     second: Option<String>,
     weekday: Option<String>,
+}
+
+/// Per-locale formatting tables. Hand-curated for the most common
+/// locales pages target. Falls back to `en-US` for anything we
+/// don't know.
+#[derive(Clone, Copy)]
+struct LocaleData {
+    decimal: &'static str,
+    group: &'static str,
+    // Currency placement: "prefix" → "$1,000", "suffix" → "1.000 €".
+    currency_after: bool,
+    // Currency-name → symbol override. Empty falls back to the
+    // global currency_glyph lookup.
+    currency_symbol: &'static str,
+    // Date order: "mdy" (US), "dmy" (most of Europe), "ymd" (Japan, China).
+    date_order: &'static str,
+    long_months: [&'static str; 12],
+    short_months: [&'static str; 12],
+    weekdays: [&'static str; 7], // Sunday=0..Saturday=6
+}
+
+const LOCALE_EN_US: LocaleData = LocaleData {
+    decimal: ".",
+    group: ",",
+    currency_after: false,
+    currency_symbol: "",
+    date_order: "mdy",
+    long_months: [
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December",
+    ],
+    short_months: [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ],
+    weekdays: [
+        "Sunday", "Monday", "Tuesday", "Wednesday",
+        "Thursday", "Friday", "Saturday",
+    ],
+};
+
+const LOCALE_EN_GB: LocaleData = LocaleData {
+    decimal: ".",
+    group: ",",
+    currency_after: false,
+    currency_symbol: "",
+    date_order: "dmy",
+    long_months: LOCALE_EN_US.long_months,
+    short_months: LOCALE_EN_US.short_months,
+    weekdays: LOCALE_EN_US.weekdays,
+};
+
+const LOCALE_DE_DE: LocaleData = LocaleData {
+    decimal: ",",
+    group: ".",
+    currency_after: true,
+    currency_symbol: "",
+    date_order: "dmy",
+    long_months: [
+        "Januar", "Februar", "März", "April", "Mai", "Juni",
+        "Juli", "August", "September", "Oktober", "November", "Dezember",
+    ],
+    short_months: [
+        "Jan", "Feb", "Mär", "Apr", "Mai", "Jun",
+        "Jul", "Aug", "Sep", "Okt", "Nov", "Dez",
+    ],
+    weekdays: [
+        "Sonntag", "Montag", "Dienstag", "Mittwoch",
+        "Donnerstag", "Freitag", "Samstag",
+    ],
+};
+
+const LOCALE_FR_FR: LocaleData = LocaleData {
+    decimal: ",",
+    group: " ", // U+00A0 NBSP is more correct, but ASCII space is fine for the toy
+    currency_after: true,
+    currency_symbol: "",
+    date_order: "dmy",
+    long_months: [
+        "janvier", "février", "mars", "avril", "mai", "juin",
+        "juillet", "août", "septembre", "octobre", "novembre", "décembre",
+    ],
+    short_months: [
+        "janv.", "févr.", "mars", "avr.", "mai", "juin",
+        "juil.", "août", "sept.", "oct.", "nov.", "déc.",
+    ],
+    weekdays: [
+        "dimanche", "lundi", "mardi", "mercredi",
+        "jeudi", "vendredi", "samedi",
+    ],
+};
+
+const LOCALE_ES_ES: LocaleData = LocaleData {
+    decimal: ",",
+    group: ".",
+    currency_after: true,
+    currency_symbol: "",
+    date_order: "dmy",
+    long_months: [
+        "enero", "febrero", "marzo", "abril", "mayo", "junio",
+        "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+    ],
+    short_months: [
+        "ene", "feb", "mar", "abr", "may", "jun",
+        "jul", "ago", "sep", "oct", "nov", "dic",
+    ],
+    weekdays: [
+        "domingo", "lunes", "martes", "miércoles",
+        "jueves", "viernes", "sábado",
+    ],
+};
+
+const LOCALE_JA_JP: LocaleData = LocaleData {
+    decimal: ".",
+    group: ",",
+    currency_after: false,
+    currency_symbol: "¥",
+    date_order: "ymd",
+    long_months: [
+        "1月", "2月", "3月", "4月", "5月", "6月",
+        "7月", "8月", "9月", "10月", "11月", "12月",
+    ],
+    short_months: [
+        "1月", "2月", "3月", "4月", "5月", "6月",
+        "7月", "8月", "9月", "10月", "11月", "12月",
+    ],
+    weekdays: [
+        "日曜日", "月曜日", "火曜日", "水曜日",
+        "木曜日", "金曜日", "土曜日",
+    ],
+};
+
+const LOCALE_ZH_CN: LocaleData = LocaleData {
+    decimal: ".",
+    group: ",",
+    currency_after: false,
+    currency_symbol: "¥",
+    date_order: "ymd",
+    long_months: [
+        "一月", "二月", "三月", "四月", "五月", "六月",
+        "七月", "八月", "九月", "十月", "十一月", "十二月",
+    ],
+    short_months: [
+        "1月", "2月", "3月", "4月", "5月", "6月",
+        "7月", "8月", "9月", "10月", "11月", "12月",
+    ],
+    weekdays: [
+        "星期日", "星期一", "星期二", "星期三",
+        "星期四", "星期五", "星期六",
+    ],
+};
+
+const LOCALE_PT_BR: LocaleData = LocaleData {
+    decimal: ",",
+    group: ".",
+    currency_after: false,
+    currency_symbol: "R$",
+    date_order: "dmy",
+    long_months: [
+        "janeiro", "fevereiro", "março", "abril", "maio", "junho",
+        "julho", "agosto", "setembro", "outubro", "novembro", "dezembro",
+    ],
+    short_months: [
+        "jan", "fev", "mar", "abr", "mai", "jun",
+        "jul", "ago", "set", "out", "nov", "dez",
+    ],
+    weekdays: [
+        "domingo", "segunda", "terça", "quarta",
+        "quinta", "sexta", "sábado",
+    ],
+};
+
+const LOCALE_RU_RU: LocaleData = LocaleData {
+    decimal: ",",
+    group: " ",
+    currency_after: true,
+    currency_symbol: "₽",
+    date_order: "dmy",
+    long_months: [
+        "январь", "февраль", "март", "апрель", "май", "июнь",
+        "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь",
+    ],
+    short_months: [
+        "янв.", "февр.", "март", "апр.", "май", "июнь",
+        "июль", "авг.", "сент.", "окт.", "нояб.", "дек.",
+    ],
+    weekdays: [
+        "воскресенье", "понедельник", "вторник", "среда",
+        "четверг", "пятница", "суббота",
+    ],
+};
+
+const LOCALE_AR_SA: LocaleData = LocaleData {
+    decimal: "٫",
+    group: "٬",
+    currency_after: false,
+    currency_symbol: "﷼",
+    date_order: "dmy",
+    long_months: [
+        "يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو",
+        "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر",
+    ],
+    short_months: [
+        "يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو",
+        "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر",
+    ],
+    weekdays: [
+        "الأحد", "الإثنين", "الثلاثاء", "الأربعاء",
+        "الخميس", "الجمعة", "السبت",
+    ],
+};
+
+fn locale_for(tag: &str) -> LocaleData {
+    let tag = tag.to_ascii_lowercase();
+    // Two-pass lookup: exact match first, then language-only fallback.
+    let exact = match tag.as_str() {
+        "en-us" => Some(LOCALE_EN_US),
+        "en-gb" | "en-au" | "en-nz" | "en-ca" | "en-ie" | "en-za" => Some(LOCALE_EN_GB),
+        "de" | "de-de" | "de-at" | "de-ch" => Some(LOCALE_DE_DE),
+        "fr" | "fr-fr" | "fr-ca" | "fr-be" | "fr-ch" => Some(LOCALE_FR_FR),
+        "es" | "es-es" | "es-mx" | "es-ar" | "es-cl" | "es-co" => Some(LOCALE_ES_ES),
+        "ja" | "ja-jp" => Some(LOCALE_JA_JP),
+        "zh" | "zh-cn" | "zh-hans" | "zh-hans-cn" => Some(LOCALE_ZH_CN),
+        "pt-br" | "pt" => Some(LOCALE_PT_BR),
+        "ru" | "ru-ru" => Some(LOCALE_RU_RU),
+        "ar" | "ar-sa" | "ar-ae" | "ar-eg" => Some(LOCALE_AR_SA),
+        "en" => Some(LOCALE_EN_US),
+        _ => None,
+    };
+    if let Some(l) = exact {
+        return l;
+    }
+    // Language-only fallback (`fr-CA` → fr, etc.).
+    if let Some((lang, _)) = tag.split_once('-') {
+        return locale_for(lang);
+    }
+    LOCALE_EN_US
 }
 
 thread_local! {
@@ -131,8 +370,19 @@ fn intl_supported_locales_of(
 // =================== Intl.NumberFormat ===================
 
 fn intl_number_format_ctor(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let locale_tag = args
+        .first()
+        .and_then(|v| {
+            if v.is_undefined() || v.is_null() {
+                None
+            } else {
+                v.to_string(ctx).ok().map(|s| s.to_std_string_escaped())
+            }
+        })
+        .unwrap_or_else(|| "en-US".to_string());
     let opts_obj = args.get(1).and_then(|v| v.as_object().cloned());
     let mut opts = NumberFormatOpts {
+        locale: locale_tag,
         style: "decimal".into(),
         use_grouping: true,
         ..Default::default()
@@ -233,6 +483,7 @@ fn resolved_options_stub(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsRes
 }
 
 fn format_number(n: f64, opts: &NumberFormatOpts) -> String {
+    let loc = locale_for(&opts.locale);
     let mut frac = match (opts.minimum_fraction_digits, opts.maximum_fraction_digits) {
         (Some(_), Some(max)) => max as usize,
         (Some(min), None) => min as usize,
@@ -251,18 +502,25 @@ fn format_number(n: f64, opts: &NumberFormatOpts) -> String {
     }
 
     let scaled = if opts.style == "percent" { n * 100.0 } else { n };
-    let mut s = format!("{:.*}", frac, scaled);
+    let raw = format!("{:.*}", frac, scaled);
+    // Replace the ASCII decimal point with the locale's marker.
+    let mut s = raw.replace('.', loc.decimal);
     if opts.use_grouping {
-        s = group_thousands(&s);
+        s = group_thousands_with(&s, loc.group, loc.decimal);
     }
     match opts.style.as_str() {
         "currency" => {
-            let symbol = opts.currency.as_deref().unwrap_or("$");
-            let glyph = currency_glyph(symbol);
-            if glyph.is_empty() {
-                format!("{symbol} {s}")
+            let code = opts.currency.as_deref().unwrap_or("USD");
+            let symbol = if !loc.currency_symbol.is_empty() {
+                loc.currency_symbol
             } else {
-                format!("{glyph}{s}")
+                let g = currency_glyph(code);
+                if g.is_empty() { code } else { g }
+            };
+            if loc.currency_after {
+                format!("{s} {symbol}")
+            } else {
+                format!("{symbol}{s}")
             }
         }
         "percent" => format!("{s}%"),
@@ -281,18 +539,20 @@ fn currency_glyph(code: &str) -> &'static str {
     }
 }
 
-fn group_thousands(s: &str) -> String {
-    let (int_part, rest) = match s.find('.') {
+/// Locale-aware thousands grouping. `decimal` is the locale's
+/// decimal marker (which we've already substituted into `s`).
+fn group_thousands_with(s: &str, group: &str, decimal: &str) -> String {
+    let (int_part, rest) = match s.find(decimal) {
         Some(i) => (&s[..i], &s[i..]),
         None => (s, ""),
     };
     let negative = int_part.starts_with('-');
     let digits = if negative { &int_part[1..] } else { int_part };
     let mut grouped = String::with_capacity(int_part.len() + int_part.len() / 3);
-    let bytes = digits.as_bytes();
+    let char_count = digits.chars().count();
     for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (bytes.len() - i) % 3 == 0 {
-            grouped.push(',');
+        if i > 0 && (char_count - i) % 3 == 0 {
+            grouped.push_str(group);
         }
         grouped.push(ch);
     }
@@ -310,8 +570,21 @@ fn intl_datetime_format_ctor(
     args: &[JsValue],
     ctx: &mut Context,
 ) -> JsResult<JsValue> {
+    let locale_tag = args
+        .first()
+        .and_then(|v| {
+            if v.is_undefined() || v.is_null() {
+                None
+            } else {
+                v.to_string(ctx).ok().map(|s| s.to_std_string_escaped())
+            }
+        })
+        .unwrap_or_else(|| "en-US".to_string());
     let opts_obj = args.get(1).and_then(|v| v.as_object().cloned());
-    let mut opts = DateTimeFormatOpts::default();
+    let mut opts = DateTimeFormatOpts {
+        locale: locale_tag,
+        ..Default::default()
+    };
     if let Some(o) = &opts_obj {
         let pick = |obj: &JsObject, key: &str, ctx: &mut Context| -> Option<String> {
             obj.get(js_string!(key.to_string()), ctx)
@@ -402,24 +675,24 @@ fn extract_date_ms(v: &JsValue, ctx: &mut Context) -> JsResult<f64> {
 }
 
 fn format_date(ms: i64, opts: &DateTimeFormatOpts) -> String {
-    // Decompose milliseconds since UNIX epoch (UTC) into civil
-    // year/month/day/hour/min/sec via the standard algorithm.
+    let loc = locale_for(&opts.locale);
     let (y, mo, d, h, mi, s) = ms_to_civil(ms);
     let mut parts: Vec<String> = Vec::new();
 
-    if !opts.weekday.is_none() {
-        parts.push(weekday_name(weekday_of(ms)));
+    if opts.weekday.is_some() {
+        let w = weekday_of(ms) as usize;
+        parts.push(loc.weekdays[w].to_string());
     }
 
     if opts.year.is_some() || opts.month.is_some() || opts.day.is_some() {
-        // Default: YYYY-MM-DD when all three are requested.
         let ystr = match opts.year.as_deref() {
             Some("2-digit") => format!("{:02}", y % 100),
             _ => format!("{y:04}"),
         };
+        let mo_idx = (mo as usize).saturating_sub(1).min(11);
         let mostr = match opts.month.as_deref() {
-            Some("long") => long_month(mo),
-            Some("short") => short_month(mo),
+            Some("long") => loc.long_months[mo_idx].to_string(),
+            Some("short") => loc.short_months[mo_idx].to_string(),
             Some("numeric") => format!("{mo}"),
             _ => format!("{mo:02}"),
         };
@@ -427,9 +700,28 @@ fn format_date(ms: i64, opts: &DateTimeFormatOpts) -> String {
             Some("numeric") => format!("{d}"),
             _ => format!("{d:02}"),
         };
-        parts.push(format!("{mostr} {dstr}, {ystr}"));
+        let assembled = match loc.date_order {
+            "dmy" => format!("{dstr} {mostr} {ystr}"),
+            "ymd" => {
+                // Japanese style includes "年" / "月" / "日" suffixes
+                // when month/day are numeric. Long-month variant
+                // already includes "月", so drop the manual suffix.
+                if loc.long_months[0].contains('月') {
+                    format!("{ystr}年{mostr}{dstr}日")
+                } else {
+                    format!("{ystr}-{mostr}-{dstr}")
+                }
+            }
+            _ => format!("{mostr} {dstr}, {ystr}"),
+        };
+        parts.push(assembled);
     } else if opts.year.is_none() && opts.day.is_none() && opts.month.is_none() {
-        parts.push(format!("{mo:02}/{d:02}/{y:04}"));
+        let default = match loc.date_order {
+            "dmy" => format!("{d:02}/{mo:02}/{y:04}"),
+            "ymd" => format!("{y:04}/{mo:02}/{d:02}"),
+            _ => format!("{mo:02}/{d:02}/{y:04}"),
+        };
+        parts.push(default);
     }
 
     if opts.hour.is_some() || opts.minute.is_some() || opts.second.is_some() {

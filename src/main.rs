@@ -218,6 +218,10 @@ struct Page {
     /// opacity skip the subtree repaint cost when the subtree
     /// content hash is unchanged.
     layer_cache: std::rc::Rc<std::cell::RefCell<paint::LayerCache>>,
+    /// `position: fixed` overlays — painted out of the document
+    /// pixmap so they stay pinned during scroll. Refilled each
+    /// paint pass; consumed by the redraw blit.
+    fixed_overlays: std::rc::Rc<std::cell::RefCell<Vec<paint::FixedOverlay>>>,
     /// Rendered iframe contents, keyed by the iframe's NodeId in this page.
     iframes: std::collections::HashMap<dom::NodeId, IframeContent>,
     /// Audio elements keyed by their `<audio>` element id, prefetched
@@ -673,6 +677,7 @@ impl Browser {
             layer_cache: std::rc::Rc::new(std::cell::RefCell::new(
                 paint::LayerCache::new(),
             )),
+            fixed_overlays: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             iframes,
             audio: audio_map,
             video: video_map,
@@ -952,6 +957,12 @@ impl Browser {
         paint::PAINT_LAYER_CACHE.with(|slot| {
             *slot.borrow_mut() = Some(page.layer_cache.clone());
         });
+        // Drain any previous-pass fixed overlays and install the
+        // shared Vec so the painter can refill it.
+        page.fixed_overlays.borrow_mut().clear();
+        paint::PAINT_FIXED_OVERLAYS.with(|slot| {
+            *slot.borrow_mut() = Some(page.fixed_overlays.clone());
+        });
         let painted = paint::paint(
             &page.dom,
             &page.styles,
@@ -973,6 +984,9 @@ impl Browser {
             slot.borrow_mut().take();
         });
         paint::PAINT_LAYER_CACHE.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        paint::PAINT_FIXED_OVERLAYS.with(|slot| {
             slot.borrow_mut().take();
         });
         if let Some(mut pixmap) = painted {
@@ -1829,6 +1843,12 @@ impl Browser {
             paint_sticky_overlays(buffer, vw as u32, vh as u32, page, self.scroll_y);
         }
 
+        // `position: fixed` overlays are NOT blitted into the
+        // main framebuffer here; they go to the GPU as separate
+        // textures so the present path can composite them on top
+        // of the scrolled view via textured quads. See the
+        // present_with_overlays call below.
+
         // Input overlays — typed values painted on top of the page pixmap.
         if let Some(page) = &self.page {
             paint_input_overlays(
@@ -1901,7 +1921,55 @@ impl Browser {
                 [b, g, r, 0xFF]
             })
             .collect();
-        surface.present(&pixels_u8, vw as u32, vh as u32);
+
+        // Build the GPU-side overlay list from the painter's
+        // fixed-position pixmaps. The GpuPresenter samples each
+        // overlay texture at its viewport-relative pixel rect,
+        // skipping the per-pixel CPU blit we'd otherwise pay.
+        let mut overlay_bgra_storage: Vec<Vec<u8>> = Vec::new();
+        let mut overlay_meta: Vec<(u32, u32, f32, f32)> = Vec::new();
+        if let Some(page) = &self.page {
+            let overlays = page.fixed_overlays.borrow();
+            for overlay in overlays.iter() {
+                let w = overlay.pixmap.width();
+                let h = overlay.pixmap.height();
+                // tiny_skia pixmaps are premultiplied RGBA; the GPU
+                // sampler wants BGRA8UnormSrgb. Swizzle on upload.
+                let src = overlay.pixmap.data();
+                let mut dst = Vec::with_capacity(src.len());
+                for chunk in src.chunks_exact(4) {
+                    dst.extend_from_slice(&[chunk[2], chunk[1], chunk[0], chunk[3]]);
+                }
+                overlay_bgra_storage.push(dst);
+                overlay_meta.push((
+                    w,
+                    h,
+                    overlay.dest_x,
+                    CHROME_HEIGHT as f32 + overlay.dest_y,
+                ));
+            }
+        }
+        let overlay_layers: Vec<gpu::OverlayLayer<'_>> = overlay_bgra_storage
+            .iter()
+            .zip(overlay_meta.iter())
+            .map(|(bytes, meta)| gpu::OverlayLayer {
+                bgra: bytes,
+                width: meta.0,
+                height: meta.1,
+                dest_x: meta.2,
+                dest_y: meta.3,
+            })
+            .collect();
+        if overlay_layers.is_empty() {
+            surface.present(&pixels_u8, vw as u32, vh as u32);
+        } else {
+            surface.present_with_overlays(
+                &pixels_u8,
+                vw as u32,
+                vh as u32,
+                &overlay_layers,
+            );
+        }
     }
 }
 

@@ -119,6 +119,27 @@ thread_local! {
         std::cell::RefCell<Option<std::rc::Rc<std::cell::RefCell<LayerCache>>>> =
         const { std::cell::RefCell::new(None) };
 
+    /// Out-parameter the painter fills with `position: fixed` layer
+    /// pixmaps that the redraw path will composite ON TOP of the
+    /// scrolled page pixmap. The fixed-positioned subtree is NOT
+    /// baked into the main pixmap; this is what keeps a fixed
+    /// header pinned during scroll.
+    pub static PAINT_FIXED_OVERLAYS:
+        std::cell::RefCell<Option<std::rc::Rc<std::cell::RefCell<Vec<FixedOverlay>>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// One painted `position: fixed` layer, plus its viewport-relative
+/// destination rectangle. `pixmap` is sized to box dims + padding;
+/// `dest_x` / `dest_y` is the top-left in viewport coords (i.e. the
+/// final on-screen position, unaffected by document scroll).
+pub struct FixedOverlay {
+    pub pixmap: Pixmap,
+    pub dest_x: f32,
+    pub dest_y: f32,
+}
+
+thread_local! {
     /// Same hook for `<video>` elements: paint pulls the latest
     /// decoded frame from each VideoElement and composites at its
     /// box rect.
@@ -289,7 +310,7 @@ impl Painter {
             })
         };
         if let Some(cached) = cached_pixmap_opt {
-            self.composite_layer_pixmap(&cached, b.rect, pad, parent_ctx, style);
+            self.dispatch_layer_composite(&cached, b.rect, pad, parent_ctx, style);
             return true;
         }
 
@@ -335,8 +356,39 @@ impl Painter {
                 },
             );
         }
-        self.composite_layer_pixmap(&painted, b.rect, pad, parent_ctx, style);
+        self.dispatch_layer_composite(&painted, b.rect, pad, parent_ctx, style);
         true
+    }
+
+    /// Decide whether the layer pixmap belongs on the document
+    /// pixmap (default) or on the page's `fixed_overlays` list so
+    /// the redraw path can stamp it on top after scroll.
+    fn dispatch_layer_composite(
+        &mut self,
+        pixmap: &Pixmap,
+        box_rect: Rect,
+        pad: u32,
+        parent_ctx: PaintCtx,
+        style: &ComputedStyle,
+    ) {
+        if matches!(style.position, crate::css::Position::Fixed) {
+            if let Some(overlays_rc) = PAINT_FIXED_OVERLAYS.with(|s| s.borrow().clone()) {
+                let mut copy = match Pixmap::new(pixmap.width(), pixmap.height()) {
+                    Some(p) => p,
+                    None => return,
+                };
+                copy.data_mut().copy_from_slice(pixmap.data());
+                let dest_x = box_rect.x + parent_ctx.tx - pad as f32;
+                let dest_y = box_rect.y + parent_ctx.ty - pad as f32;
+                overlays_rc.borrow_mut().push(FixedOverlay {
+                    pixmap: copy,
+                    dest_x,
+                    dest_y,
+                });
+                return;
+            }
+        }
+        self.composite_layer_pixmap(pixmap, box_rect, pad, parent_ctx, style);
     }
 
     fn composite_layer_pixmap(
@@ -1227,22 +1279,43 @@ fn _refs() {
     let _ = Shader::SolidColor;
 }
 
-/// True when `will-change` opts this element into its own
-/// composited layer. We treat `transform`, `opacity`, `filter`, and
-/// `contents` as promotion triggers — pages set these explicitly to
-/// promise the browser that the property animates and the painted
-/// content is worth caching.
+/// True when this element warrants its own composited layer.
+///
+/// The cache replays its pixmap with a straight blit at the layer's
+/// box origin — it doesn't reapply transforms or filters at
+/// composite time. So we promote only on signals where the cached
+/// pixmap is genuinely transform-independent:
+///   * `will-change` — the page explicitly opted in.
+///   * `position: fixed` — sticky chrome / overlays. The fixed
+///     position itself is honoured by layout; cache survives scroll.
+///   * `opacity < 1` — the alpha multiplies in at composite time,
+///     so the cache is transform-independent.
+///
+/// `transform` and `filter` still go through the un-cached
+/// `paint_subtree_with_{transform,filter}` paths above this gate,
+/// because their pixel-level math needs to happen on the live
+/// subtree, not on a previously-cached snapshot.
 fn is_layer_root(style: &ComputedStyle) -> bool {
-    let Some(wc) = &style.will_change else {
-        return false;
-    };
-    wc.split(|c: char| c == ',' || c.is_whitespace())
-        .any(|tok| {
-            matches!(
-                tok.trim(),
-                "transform" | "opacity" | "filter" | "contents" | "scroll-position"
-            )
-        })
+    if let Some(wc) = &style.will_change {
+        let matched = wc
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .any(|tok| {
+                matches!(
+                    tok.trim(),
+                    "transform" | "opacity" | "filter" | "contents" | "scroll-position"
+                )
+            });
+        if matched {
+            return true;
+        }
+    }
+    if matches!(style.position, crate::css::Position::Fixed) {
+        return true;
+    }
+    if style.opacity < 1.0 - 1e-4 {
+        return true;
+    }
+    false
 }
 
 /// Hash the inputs that, if unchanged frame-to-frame, mean the

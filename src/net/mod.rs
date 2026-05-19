@@ -323,16 +323,21 @@ impl Client {
             return Err(Error::TooManyRedirects(self.max_redirects));
         }
 
-        // HSTS upgrade — if a host previously sent
-        // `Strict-Transport-Security` we never speak HTTP to it again.
+        // HSTS upgrade — covers two sources: hosts that previously
+        // sent `Strict-Transport-Security` during this run AND a
+        // curated subset of the real HSTS preload list (chrome
+        // ships ~100k entries; we ship ~30 highest-traffic ones).
+        // Either source forces http:// → https:// before any DNS
+        // or TCP work.
         let mut url = url;
         if url.scheme() == "http" {
             let host_lower = url.host_str().map(str::to_ascii_lowercase);
             if let Some(host) = host_lower {
-                let hit = self.hsts.borrow().contains(&host);
-                if hit {
+                let runtime_hit = self.hsts.borrow().contains(&host);
+                let preload_hit = is_hsts_preloaded(&host);
+                if runtime_hit || preload_hit {
                     let _ = url.set_scheme("https");
-                    tracing::info!(%host, "HSTS upgrade to https");
+                    tracing::info!(%host, runtime_hit, preload_hit, "HSTS upgrade to https");
                 }
             }
         }
@@ -633,6 +638,82 @@ enum Method {
         body: Vec<u8>,
         content_type: String,
     },
+}
+
+/// Curated subset of Chrome's HSTS preload list. The full list is
+/// ~100k entries; we ship the top-of-the-long-tail (major
+/// platforms + frequently-targeted properties) so users never
+/// transit plain HTTP to them even if no prior STS header was
+/// observed.
+///
+/// `*.` prefix means "the listed host AND all subdomains" (the
+/// `includeSubDomains` flag in the real preload list). Plain
+/// entries match only the exact host.
+const HSTS_PRELOAD: &[&str] = &[
+    "*.google.com",
+    "*.youtube.com",
+    "*.gmail.com",
+    "*.googleapis.com",
+    "*.gstatic.com",
+    "*.googleusercontent.com",
+    "*.cloudflare.com",
+    "*.facebook.com",
+    "*.instagram.com",
+    "*.whatsapp.com",
+    "*.twitter.com",
+    "*.x.com",
+    "*.linkedin.com",
+    "*.github.com",
+    "*.gitlab.com",
+    "*.microsoft.com",
+    "*.live.com",
+    "*.outlook.com",
+    "*.office.com",
+    "*.azure.com",
+    "*.bing.com",
+    "*.apple.com",
+    "*.icloud.com",
+    "*.amazon.com",
+    "*.amazonaws.com",
+    "*.stripe.com",
+    "*.paypal.com",
+    "*.netflix.com",
+    "*.spotify.com",
+    "*.dropbox.com",
+    "*.cloudflare.net",
+    "*.cdn.cloudflare.net",
+    "*.discord.com",
+    "*.slack.com",
+    "*.zoom.us",
+    "*.openai.com",
+    "*.anthropic.com",
+    "*.chatgpt.com",
+    "*.mozilla.org",
+    "*.wikipedia.org",
+    "*.wikimedia.org",
+    "*.shopify.com",
+    "*.notion.so",
+    "*.figma.com",
+];
+
+fn is_hsts_preloaded(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    for entry in HSTS_PRELOAD {
+        if let Some(base) = entry.strip_prefix("*.") {
+            if host == base {
+                return true;
+            }
+            if host.ends_with(base) {
+                let prefix_end = host.len() - base.len();
+                if host.as_bytes().get(prefix_end - 1) == Some(&b'.') {
+                    return true;
+                }
+            }
+        } else if host == *entry {
+            return true;
+        }
+    }
+    false
 }
 
 /// Forward a finished request to the devtools network panel.

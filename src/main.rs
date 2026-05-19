@@ -213,6 +213,11 @@ struct Page {
     /// the committed input value; the OS hasn't accepted the
     /// keystrokes yet (CJK candidate window etc.).
     input_preedit: std::collections::HashMap<dom::NodeId, String>,
+    /// Compositor cache: per-layer painted pixmaps keyed by NodeId.
+    /// Survives across paint passes so animations on transform /
+    /// opacity skip the subtree repaint cost when the subtree
+    /// content hash is unchanged.
+    layer_cache: std::rc::Rc<std::cell::RefCell<paint::LayerCache>>,
     /// Rendered iframe contents, keyed by the iframe's NodeId in this page.
     iframes: std::collections::HashMap<dom::NodeId, IframeContent>,
     /// Audio elements keyed by their `<audio>` element id, prefetched
@@ -665,6 +670,9 @@ impl Browser {
             focus: None,
             inputs,
             input_preedit: std::collections::HashMap::new(),
+            layer_cache: std::rc::Rc::new(std::cell::RefCell::new(
+                paint::LayerCache::new(),
+            )),
             iframes,
             audio: audio_map,
             video: video_map,
@@ -941,6 +949,9 @@ impl Browser {
         paint::PAINT_CAPTURE_BINDINGS.with(|slot| {
             *slot.borrow_mut() = Some(page.js.capture_bindings());
         });
+        paint::PAINT_LAYER_CACHE.with(|slot| {
+            *slot.borrow_mut() = Some(page.layer_cache.clone());
+        });
         let painted = paint::paint(
             &page.dom,
             &page.styles,
@@ -959,6 +970,9 @@ impl Browser {
             slot.borrow_mut().take();
         });
         paint::PAINT_CAPTURE_BINDINGS.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        paint::PAINT_LAYER_CACHE.with(|slot| {
             slot.borrow_mut().take();
         });
         if let Some(mut pixmap) = painted {

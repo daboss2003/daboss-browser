@@ -774,6 +774,13 @@ pub struct ComputedStyle {
     /// `container-name` — author-supplied identifier for filtered
     /// `@container <name> (...)` queries.
     pub container_name: Option<String>,
+    /// `will-change` — comma-separated, lower-cased token list. Used
+    /// as a hint to promote this element into its own composited
+    /// layer; the painter checks for `transform` / `opacity` /
+    /// `filter` and caches the layer's pixmap by content hash so a
+    /// CSS animation that only mutates those properties skips the
+    /// subtree repaint cost.
+    pub will_change: Option<String>,
     /// `transition: <prop> <duration> [<timing>] [<delay>]` entries.
     /// When a tracked property changes between cascades, the browser
     /// shell starts a running animation that interpolates the old →
@@ -902,6 +909,7 @@ impl ComputedStyle {
             hyphens: None,
             container_type: None,
             container_name: None,
+            will_change: None,
             transitions: Vec::new(),
             animations: Vec::new(),
             box_shadow: None,

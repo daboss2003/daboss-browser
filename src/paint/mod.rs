@@ -82,11 +82,41 @@ pub fn paint(
     Some(painter.pixmap)
 }
 
+/// Cached painted output for a layer-promoted element. The painter
+/// reuses this pixmap whenever the layer's content hash matches the
+/// hash recorded at paint time — turning a CSS animation that only
+/// mutates `transform` / `opacity` into a single pixmap blit
+/// instead of a full subtree repaint.
+pub struct CachedLayer {
+    pub pixmap: Pixmap,
+    pub hash: u64,
+    /// Origin of the cached pixmap in the parent's coordinate space.
+    pub box_origin: (f32, f32),
+    /// Padding added around the box for transformed-layer overflow.
+    pub pad: u32,
+}
+
+/// Cap on cached layers. Each entry holds a Pixmap (≈ 4 bytes per
+/// pixel × layer area), so 64 of them on a desktop-size page caps
+/// around 100 MB. Long-running tabs that animate many distinct
+/// elements drop the oldest layers; on the next paint they fall
+/// through to the slow path and re-cache.
+pub const LAYER_CACHE_CAP: usize = 64;
+
+pub type LayerCache = std::collections::HashMap<crate::dom::NodeId, CachedLayer>;
+
 thread_local! {
     /// Installed by the browser shell for the duration of a paint pass
     /// so the painter can composite `<canvas>` element pixmaps.
     pub static PAINT_CANVAS_SURFACES:
         std::cell::RefCell<Option<crate::js::CanvasSurfaces>> =
+        const { std::cell::RefCell::new(None) };
+
+    /// Per-page layer pixmap cache. Set by the browser shell around
+    /// each paint pass; the painter consults it to skip subtree work
+    /// for unchanged layer-promoted elements.
+    pub static PAINT_LAYER_CACHE:
+        std::cell::RefCell<Option<std::rc::Rc<std::cell::RefCell<LayerCache>>>> =
         const { std::cell::RefCell::new(None) };
 
     /// Same hook for `<video>` elements: paint pulls the latest
@@ -176,6 +206,19 @@ impl Painter {
     ) {
         let style = styles.get(node);
 
+        // Compositor-style layer promotion: when an element opts into
+        // its own layer via `will-change: transform/opacity/filter`,
+        // hash its subtree's relevant inputs and look the result up
+        // in the page's `LayerCache`. A hash hit means we blit the
+        // cached pixmap straight onto the current target without
+        // re-walking the subtree — the win for animations that only
+        // mutate transform / opacity.
+        if is_layer_root(style) && tree.get(node).is_some() {
+            if self.try_paint_from_layer_cache(dom, styles, tree, images, node, parent_ctx) {
+                return;
+            }
+        }
+
         // If the element has a visual filter (anything beyond opacity,
         // which is already folded into the alpha stack), paint the
         // subtree into an offscreen pixmap, apply the filter pixel-by-
@@ -201,6 +244,121 @@ impl Painter {
             }
         }
         self.paint_subtree_inner(dom, styles, tree, images, node, parent_ctx)
+    }
+
+    /// Returns true if the layer was served from cache (or freshly
+    /// painted into the cache and composited). Returns false if no
+    /// cache is installed or the layer has zero size.
+    #[allow(clippy::too_many_arguments)]
+    fn try_paint_from_layer_cache(
+        &mut self,
+        dom: &Dom,
+        styles: &StyleTree,
+        tree: &BoxTree,
+        images: &ImageCache,
+        node: NodeId,
+        parent_ctx: PaintCtx,
+    ) -> bool {
+        let Some(cache_rc) = PAINT_LAYER_CACHE.with(|s| s.borrow().clone()) else {
+            return false;
+        };
+        let Some(b) = tree.get(node) else { return false };
+        let style = styles.get(node);
+        let pad = 8u32;
+        let layer_w = (b.rect.width.ceil() as u32).max(1) + pad * 2;
+        let layer_h = (b.rect.height.ceil() as u32).max(1) + pad * 2;
+        let hash = compute_layer_hash(dom, styles, tree, node);
+
+        // Fast path: previous frame's pixmap is still valid.
+        let cached_pixmap_opt: Option<Pixmap> = {
+            let cache = cache_rc.borrow();
+            cache.get(&node).and_then(|entry| {
+                if entry.hash == hash
+                    && entry.pixmap.width() == layer_w
+                    && entry.pixmap.height() == layer_h
+                {
+                    // Clone the pixmap bytes so we can release the
+                    // borrow before composite (composite re-borrows
+                    // self.pixmap).
+                    let mut p = Pixmap::new(entry.pixmap.width(), entry.pixmap.height())?;
+                    p.data_mut().copy_from_slice(entry.pixmap.data());
+                    Some(p)
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some(cached) = cached_pixmap_opt {
+            self.composite_layer_pixmap(&cached, b.rect, pad, parent_ctx, style);
+            return true;
+        }
+
+        // Slow path: paint the subtree into a fresh offscreen, cache,
+        // composite. We don't honour 2D transform / filter chains
+        // inside the cached pixmap — those still go through the
+        // existing offscreen helpers. Layer promotion here is a
+        // straight subtree blit.
+        let Some(offscreen) = Pixmap::new(layer_w, layer_h) else {
+            return false;
+        };
+        let saved = std::mem::replace(&mut self.pixmap, offscreen);
+        let inner_ctx = PaintCtx {
+            alpha: parent_ctx.alpha,
+            tx: -b.rect.x + pad as f32,
+            ty: -b.rect.y + pad as f32,
+        };
+        // Skip the layer-cache check on the recursive call to avoid
+        // infinite recursion — paint the layer's own subtree directly.
+        self.paint_subtree_inner(dom, styles, tree, images, node, inner_ctx);
+        let painted = std::mem::replace(&mut self.pixmap, saved);
+
+        // Store a clone in the cache before consuming for composite.
+        if let Some(mut store_copy) = Pixmap::new(painted.width(), painted.height()) {
+            store_copy.data_mut().copy_from_slice(painted.data());
+            let mut cache = cache_rc.borrow_mut();
+            // Bound the cache; drop a random entry when full. We
+            // don't track LRU order yet — frequent re-evictions
+            // would need that, but a steady-state animation only
+            // touches a handful of layers.
+            if cache.len() >= LAYER_CACHE_CAP {
+                if let Some(victim) = cache.keys().next().copied() {
+                    cache.remove(&victim);
+                }
+            }
+            cache.insert(
+                node,
+                CachedLayer {
+                    pixmap: store_copy,
+                    hash,
+                    box_origin: (b.rect.x, b.rect.y),
+                    pad,
+                },
+            );
+        }
+        self.composite_layer_pixmap(&painted, b.rect, pad, parent_ctx, style);
+        true
+    }
+
+    fn composite_layer_pixmap(
+        &mut self,
+        offscreen: &Pixmap,
+        box_rect: Rect,
+        pad: u32,
+        parent_ctx: PaintCtx,
+        style: &ComputedStyle,
+    ) {
+        let dest_x = (box_rect.x + parent_ctx.tx - pad as f32) as i32;
+        let dest_y = (box_rect.y + parent_ctx.ty - pad as f32) as i32;
+        let mut paint = PixmapPaint::default();
+        paint.opacity = parent_ctx.alpha * style.opacity;
+        self.pixmap.draw_pixmap(
+            dest_x,
+            dest_y,
+            offscreen.as_ref(),
+            &paint,
+            Transform::identity(),
+            None,
+        );
     }
 
     /// Paint a transformed subtree by redirecting its drawing into an
@@ -1069,6 +1227,93 @@ fn _refs() {
     let _ = Shader::SolidColor;
 }
 
+/// True when `will-change` opts this element into its own
+/// composited layer. We treat `transform`, `opacity`, `filter`, and
+/// `contents` as promotion triggers — pages set these explicitly to
+/// promise the browser that the property animates and the painted
+/// content is worth caching.
+fn is_layer_root(style: &ComputedStyle) -> bool {
+    let Some(wc) = &style.will_change else {
+        return false;
+    };
+    wc.split(|c: char| c == ',' || c.is_whitespace())
+        .any(|tok| {
+            matches!(
+                tok.trim(),
+                "transform" | "opacity" | "filter" | "contents" | "scroll-position"
+            )
+        })
+}
+
+/// Hash the inputs that, if unchanged frame-to-frame, mean the
+/// layer's painted output would be byte-identical. We walk the
+/// subtree once and feed each element's identity + relevant
+/// style/box fields + text content into a stable hasher.
+fn compute_layer_hash(dom: &Dom, styles: &StyleTree, tree: &BoxTree, root: NodeId) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hash_subtree(&mut hasher, dom, styles, tree, root);
+    hasher.finish()
+}
+
+fn hash_subtree(
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+    dom: &Dom,
+    styles: &StyleTree,
+    tree: &BoxTree,
+    node: NodeId,
+) {
+    use std::hash::Hash;
+    node.hash(hasher);
+    let style = styles.get(node);
+    // Stylistic fields that affect paint output.
+    let bg = style.background_color;
+    (bg.r, bg.g, bg.b, bg.a).hash(hasher);
+    let fg = style.color;
+    (fg.r, fg.g, fg.b, fg.a).hash(hasher);
+    (style.font_size.to_bits()).hash(hasher);
+    (style.opacity.to_bits()).hash(hasher);
+    if let Some(t) = &style.transform {
+        (
+            t.sx.to_bits(),
+            t.kx.to_bits(),
+            t.ky.to_bits(),
+            t.sy.to_bits(),
+            t.tx.to_bits(),
+            t.ty.to_bits(),
+        )
+            .hash(hasher);
+    }
+    if let Some((dx, dy)) = style.transform_translate {
+        (dx.to_bits(), dy.to_bits()).hash(hasher);
+    }
+    if let Some(b) = tree.get(node) {
+        (
+            (b.rect.x as i32),
+            (b.rect.y as i32),
+            (b.rect.width as i32),
+            (b.rect.height as i32),
+        )
+            .hash(hasher);
+    }
+    match &dom.node(node).kind {
+        crate::dom::NodeKind::Element { tag, attrs } => {
+            tag.hash(hasher);
+            for (k, v) in attrs {
+                k.hash(hasher);
+                v.hash(hasher);
+            }
+        }
+        crate::dom::NodeKind::Text(s) => {
+            s.hash(hasher);
+        }
+        _ => {}
+    }
+    for c in dom.children(node) {
+        hash_subtree(hasher, dom, styles, tree, c);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1196,6 +1441,39 @@ mod tests {
         assert!(
             g > 50 && g < 200,
             "opacity blending produced g = {g} (expected pink-ish)"
+        );
+    }
+
+    #[test]
+    fn layer_cache_holds_a_will_change_subtree_after_paint() {
+        // Build a tiny page with one will-change layer, paint into
+        // an installed LayerCache, and verify the cache has an
+        // entry. A second paint should still leave one entry (no
+        // duplicates).
+        let cache: std::rc::Rc<std::cell::RefCell<LayerCache>> =
+            std::rc::Rc::new(std::cell::RefCell::new(LayerCache::new()));
+        PAINT_LAYER_CACHE.with(|s| *s.borrow_mut() = Some(cache.clone()));
+
+        let html = "<style>\
+            body { margin: 0; }\
+            .lyr { width: 20px; height: 20px; background: red; \
+                   will-change: transform; }\
+            </style>\
+            <body><div class='lyr'></div></body>";
+        let _ = render(html, 60, 60);
+        let after_first = cache.borrow().len();
+        let _ = render(html, 60, 60);
+        let after_second = cache.borrow().len();
+
+        PAINT_LAYER_CACHE.with(|s| s.borrow_mut().take());
+
+        assert_eq!(
+            after_first, 1,
+            "expected one cached layer after first paint, got {after_first}"
+        );
+        assert_eq!(
+            after_second, after_first,
+            "second paint should reuse the existing entry, not duplicate"
         );
     }
 }

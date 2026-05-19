@@ -1234,6 +1234,13 @@ fn apply_declaration(
                 _ => None,
             };
         }
+        "will-change" => {
+            style.will_change = match value {
+                Value::Keyword(k) if k == "auto" => None,
+                Value::Keyword(k) => Some(k.to_ascii_lowercase()),
+                _ => stringify_value(value).map(|s| s.to_ascii_lowercase()),
+            };
+        }
         "container" => {
             // Shorthand: `container: <name> [/ <type>]`. Best-effort
             // parse — split on `/`, name first, type second.

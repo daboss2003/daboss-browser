@@ -1323,7 +1323,7 @@ fn is_layer_root(style: &ComputedStyle) -> bool {
 /// subtree once and feed each element's identity + relevant
 /// style/box fields + text content into a stable hasher.
 fn compute_layer_hash(dom: &Dom, styles: &StyleTree, tree: &BoxTree, root: NodeId) -> u64 {
-    use std::hash::{Hash, Hasher};
+    use std::hash::Hasher;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     hash_subtree(&mut hasher, dom, styles, tree, root);
     hasher.finish()
@@ -1548,5 +1548,93 @@ mod tests {
             after_second, after_first,
             "second paint should reuse the existing entry, not duplicate"
         );
+    }
+
+    /// Smoke test: throw a chunky SPA-shaped page at the full
+    /// pipeline (cascade → layout → paint) and confirm nothing
+    /// panics + we get sensibly-sized output. Exercises:
+    /// flex / grid containers, inline text wrapping, gradients,
+    /// borders, transforms, opacity, filters, fixed position,
+    /// will-change layer promotion, color-space functions,
+    /// container queries, and nested ::before / ::after.
+    #[test]
+    fn kitchen_sink_renders_without_panic() {
+        let html = r#"
+            <!doctype html>
+            <html>
+            <head>
+              <style>
+                body { margin: 0; font-family: sans-serif; color: oklch(0.2 0.05 240); }
+                .topbar {
+                  position: fixed; top: 0; left: 0; right: 0; height: 48px;
+                  background: linear-gradient(to right, #2563eb, #7c3aed);
+                  color: white; padding: 12px 20px;
+                }
+                .topbar::before { content: 'X · '; opacity: 0.8; }
+                .container { display: grid; grid-template-columns: 220px 1fr;
+                             gap: 16px; padding: 64px 20px 20px; }
+                .sidebar { background: #f3f4f6; border: 1px solid #e5e7eb;
+                           padding: 12px; border-radius: 8px; }
+                .card { background: hsl(0 0% 100%); border: 1px solid #d1d5db;
+                        border-radius: 12px; padding: 20px; margin-bottom: 16px;
+                        box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+                .card.featured { will-change: transform; transform: scale(1.0);
+                                 background: color(display-p3 0.95 0.97 1); }
+                .card.faded { opacity: 0.65; filter: blur(0.5px); }
+                .row { display: flex; gap: 8px; align-items: center; }
+                .badge { background: lab(60 40 30); color: white;
+                         padding: 2px 8px; border-radius: 9999px;
+                         font-size: 12px; }
+                .clamped { display: -webkit-box; -webkit-line-clamp: 2;
+                           -webkit-box-orient: vertical; overflow: hidden; }
+                @container (min-width: 400px) {
+                  .card { padding: 24px; }
+                }
+              </style>
+            </head>
+            <body>
+              <div class="topbar">Daboss kitchen-sink smoke test</div>
+              <div class="container">
+                <nav class="sidebar">
+                  <div>Home</div>
+                  <div>Docs</div>
+                  <div>About</div>
+                </nav>
+                <main>
+                  <article class="card featured">
+                    <div class="row">
+                      <h2>Featured</h2>
+                      <span class="badge">new</span>
+                    </div>
+                    <p class="clamped">Lorem ipsum dolor sit amet, consectetur
+                      adipiscing elit. Sed do eiusmod tempor incididunt ut
+                      labore et dolore magna aliqua. Ut enim ad minim veniam.
+                    </p>
+                  </article>
+                  <article class="card">
+                    <h3>Standard card</h3>
+                    <p>Body copy that should wrap across multiple lines and
+                       exercise text shaping in the inline layout path.</p>
+                  </article>
+                  <article class="card faded">
+                    <h3>Faded card</h3>
+                    <p>Opacity + blur filter combined.</p>
+                  </article>
+                </main>
+              </div>
+            </body>
+            </html>
+        "#;
+        let pixmap = render(html, 1024, 800);
+        // Non-zero alpha somewhere — we actually painted content.
+        let any_solid = pixmap.data().chunks_exact(4).any(|px| px[3] > 0);
+        assert!(any_solid, "rendered pixmap is entirely transparent");
+        // Topbar gradient should put a saturated colour into the
+        // first row of pixels. (Y=8, somewhere in the strip.)
+        let row_idx = 8 * 1024 * 4;
+        let in_topbar = pixmap.data()[row_idx + 512 * 4..row_idx + 512 * 4 + 4]
+            .iter()
+            .any(|&c| c > 20);
+        assert!(in_topbar, "topbar strip didn't paint");
     }
 }

@@ -21,9 +21,9 @@ use std::collections::HashMap;
 
 use boa_engine::{
     js_string,
-    object::{builtins::JsArray, ObjectInitializer},
+    object::ObjectInitializer,
     property::Attribute,
-    Context, JsResult, JsValue, NativeFunction,
+    Context, JsResult, JsValue,
 };
 
 use crate::dom::{Dom, NodeId, NodeKind};

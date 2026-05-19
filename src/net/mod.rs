@@ -19,7 +19,7 @@ pub use self::csp::Csp;
 pub use self::error::{Error, Result};
 pub use self::http::{Request, Response};
 pub use self::permissions_policy::PermissionsPolicy;
-pub use self::sri::{verify_integrity, SriVerdict};
+pub use self::sri::verify_integrity;
 // `RequestContext` is defined directly in this module — see below.
 
 use std::cell::RefCell;

@@ -22,7 +22,6 @@
 //! the rest of the crate can push them.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::SystemTime;
 

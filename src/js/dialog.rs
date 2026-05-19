@@ -21,7 +21,7 @@ use boa_engine::{
     js_string,
     object::ObjectInitializer,
     property::Attribute,
-    Context, JsResult, JsValue, NativeFunction,
+    Context, JsResult, JsValue,
 };
 
 use crate::dom::{NodeId, NodeKind};

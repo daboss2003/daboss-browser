@@ -468,7 +468,7 @@ fn credentials_get(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult
 
 // ============ helpers ============
 
-fn current_origin(ctx: &mut Context) -> url::Origin {
+fn current_origin(_ctx: &mut Context) -> url::Origin {
     let url = super::engine::JS_BASE_URL.with(|u| u.borrow().clone());
     url.map(|u| u.origin())
         .unwrap_or_else(|| url::Origin::new_opaque())

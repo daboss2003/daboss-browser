@@ -21,7 +21,6 @@ use std::cell::RefCell;
 use boa_engine::{
     js_string,
     object::{builtins::JsArray, ObjectInitializer},
-    property::Attribute,
     Context, JsObject, JsResult, JsValue, NativeFunction,
 };
 

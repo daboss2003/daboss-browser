@@ -92,13 +92,57 @@ pub struct PassEntry {
 pub enum PassOp {
     SetPipeline(u32),
     SetVertexBuffer(u32, u32),
+    SetIndexBuffer {
+        buffer_id: u32,
+        format: wgpu::IndexFormat,
+    },
     SetBindGroup(u32, u32),
+    SetViewport {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        min_depth: f32,
+        max_depth: f32,
+    },
+    SetScissorRect {
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    },
     Draw {
         vertex_count: u32,
         instance_count: u32,
         first_vertex: u32,
         first_instance: u32,
     },
+    DrawIndexed {
+        index_count: u32,
+        instance_count: u32,
+        first_index: u32,
+        base_vertex: i32,
+        first_instance: u32,
+    },
+}
+
+/// A compute pipeline produced by `device.createComputePipeline`.
+pub struct ComputePipelineEntry {
+    pub pipeline: Rc<wgpu::ComputePipeline>,
+}
+
+/// Recorded compute-pass calls — replayed on `pass.end()` for the
+/// same reason render-pass commands are recorded (wgpu pass
+/// objects borrow the encoder).
+pub struct ComputePassEntry {
+    pub commands: Vec<ComputePassOp>,
+    pub encoder_id: u32,
+}
+
+pub enum ComputePassOp {
+    SetPipeline(u32),
+    SetBindGroup(u32, u32),
+    Dispatch { x: u32, y: u32, z: u32 },
 }
 
 pub struct CmdBufferEntry {
@@ -144,6 +188,8 @@ thread_local! {
     pub(crate) static GPU_PIPELINE_LAYOUTS: RefCell<HashMap<u32, PipelineLayoutEntry>> = RefCell::new(HashMap::new());
     pub(crate) static GPU_TEXTURES: RefCell<HashMap<u32, TextureEntry>> = RefCell::new(HashMap::new());
     pub(crate) static GPU_CANVAS_CONTEXTS: RefCell<HashMap<NodeId, CanvasContextEntry>> = RefCell::new(HashMap::new());
+    pub(crate) static GPU_COMPUTE_PIPELINES: RefCell<HashMap<u32, ComputePipelineEntry>> = RefCell::new(HashMap::new());
+    pub(crate) static GPU_COMPUTE_PASSES: RefCell<HashMap<u32, ComputePassEntry>> = RefCell::new(HashMap::new());
     pub(crate) static GPU_NEXT_ID: RefCell<u32> = const { RefCell::new(1) };
 }
 
@@ -257,6 +303,10 @@ fn build_device_object(ctx: &mut Context, device_id: u32) -> JsValue {
     let queue = build_queue_object(ctx, device_id);
     let features_arr = JsArray::new(ctx);
     let limits_obj = ObjectInitializer::new(ctx).build();
+    // `device.lost` is a Promise pages await; it must never resolve
+    // on a healthy device. We build a fresh Promise via `new Promise`
+    // and never call its resolve/reject.
+    let (lost_promise, _resolvers) = JsPromise::new_pending(ctx);
     let mut b = ObjectInitializer::new(ctx);
     b.property(
         js_string!(DEVICE_KEY),
@@ -274,6 +324,16 @@ fn build_device_object(ctx: &mut Context, device_id: u32) -> JsValue {
         JsValue::from(limits_obj),
         Attribute::READONLY,
     );
+    b.property(
+        js_string!("lost"),
+        JsValue::from(lost_promise),
+        Attribute::READONLY,
+    );
+    b.property(
+        js_string!("label"),
+        JsValue::from(js_string!("")),
+        Attribute::all(),
+    );
     let bindings: &[(&str, NativeFunction, usize)] = &[
         ("createShaderModule", NativeFunction::from_fn_ptr(device_create_shader_module), 1),
         ("createBuffer", NativeFunction::from_fn_ptr(device_create_buffer), 1),
@@ -281,9 +341,12 @@ fn build_device_object(ctx: &mut Context, device_id: u32) -> JsValue {
         ("createBindGroup", NativeFunction::from_fn_ptr(device_create_bind_group), 1),
         ("createPipelineLayout", NativeFunction::from_fn_ptr(device_create_pipeline_layout), 1),
         ("createRenderPipeline", NativeFunction::from_fn_ptr(device_create_render_pipeline), 1),
+        ("createComputePipeline", NativeFunction::from_fn_ptr(device_create_compute_pipeline), 1),
         ("createCommandEncoder", NativeFunction::from_fn_ptr(device_create_command_encoder), 1),
         ("createTexture", NativeFunction::from_fn_ptr(device_create_texture), 1),
         ("createSampler", NativeFunction::from_fn_ptr(device_create_sampler), 1),
+        ("pushErrorScope", NativeFunction::from_fn_ptr(noop), 1),
+        ("popErrorScope", NativeFunction::from_fn_ptr(device_pop_error_scope), 0),
         ("destroy", NativeFunction::from_fn_ptr(noop), 0),
     ];
     for (name, f, arity) in bindings {
@@ -458,11 +521,24 @@ fn device_create_buffer(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
         0,
     );
     b.function(
+        NativeFunction::from_fn_ptr(buffer_map_async),
+        js_string!("mapAsync"),
+        3,
+    );
+    b.function(
         NativeFunction::from_fn_ptr(noop),
         js_string!("destroy"),
         0,
     );
     Ok(JsValue::from(b.build()))
+}
+
+/// `buffer.mapAsync(mode, offset?, size?)` — returns a Promise that
+/// resolves once the buffer is mappable. Real implementations wait
+/// on the GPU; the toy resolves immediately so subsequent
+/// `getMappedRange()` calls work synchronously.
+fn buffer_map_async(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    Ok(JsPromise::resolve(JsValue::undefined(), ctx).into())
 }
 
 fn decode_buffer_usage(bits: u32) -> wgpu::BufferUsages {
@@ -1104,6 +1180,31 @@ fn device_create_command_encoder(
         1,
     );
     b.function(
+        NativeFunction::from_fn_ptr(encoder_begin_compute_pass),
+        js_string!("beginComputePass"),
+        1,
+    );
+    b.function(
+        NativeFunction::from_fn_ptr(encoder_copy_buffer_to_buffer),
+        js_string!("copyBufferToBuffer"),
+        5,
+    );
+    b.function(
+        NativeFunction::from_fn_ptr(encoder_copy_buffer_to_texture),
+        js_string!("copyBufferToTexture"),
+        3,
+    );
+    b.function(
+        NativeFunction::from_fn_ptr(encoder_copy_texture_to_buffer),
+        js_string!("copyTextureToBuffer"),
+        3,
+    );
+    b.function(
+        NativeFunction::from_fn_ptr(encoder_copy_texture_to_texture),
+        js_string!("copyTextureToTexture"),
+        3,
+    );
+    b.function(
         NativeFunction::from_fn_ptr(encoder_finish),
         js_string!("finish"),
         0,
@@ -1209,6 +1310,26 @@ fn encoder_begin_render_pass(
     b.function(
         NativeFunction::from_fn_ptr(pass_draw),
         js_string!("draw"),
+        4,
+    );
+    b.function(
+        NativeFunction::from_fn_ptr(pass_set_index_buffer),
+        js_string!("setIndexBuffer"),
+        2,
+    );
+    b.function(
+        NativeFunction::from_fn_ptr(pass_draw_indexed),
+        js_string!("drawIndexed"),
+        5,
+    );
+    b.function(
+        NativeFunction::from_fn_ptr(pass_set_viewport),
+        js_string!("setViewport"),
+        6,
+    );
+    b.function(
+        NativeFunction::from_fn_ptr(pass_set_scissor_rect),
+        js_string!("setScissorRect"),
         4,
     );
     b.function(
@@ -1403,6 +1524,37 @@ fn pass_end(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
                         *first_vertex..*first_vertex + *vertex_count,
                         *first_instance..*first_instance + *instance_count,
                     );
+                }
+                PassOp::SetIndexBuffer { buffer_id, format } => {
+                    if let Some(b) = buffers.get(buffer_id) {
+                        wgpu_pass.set_index_buffer(b.slice(..), *format);
+                    }
+                }
+                PassOp::DrawIndexed {
+                    index_count,
+                    instance_count,
+                    first_index,
+                    base_vertex,
+                    first_instance,
+                } => {
+                    wgpu_pass.draw_indexed(
+                        *first_index..*first_index + *index_count,
+                        *base_vertex,
+                        *first_instance..*first_instance + *instance_count,
+                    );
+                }
+                PassOp::SetViewport {
+                    x,
+                    y,
+                    w,
+                    h,
+                    min_depth,
+                    max_depth,
+                } => {
+                    wgpu_pass.set_viewport(*x, *y, *w, *h, *min_depth, *max_depth);
+                }
+                PassOp::SetScissorRect { x, y, w, h } => {
+                    wgpu_pass.set_scissor_rect(*x, *y, *w, *h);
                 }
             }
         }
@@ -1766,4 +1918,400 @@ fn canvas_ctx_present(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsRes
         });
     }
     Ok(JsValue::undefined())
+}
+
+// =================== compute pipelines ===================
+
+fn device_create_compute_pipeline(
+    this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(device_id) = device_id_of(this, ctx) else {
+        return Ok(JsValue::null());
+    };
+    let Some(desc) = args.first().and_then(|v| v.as_object()) else {
+        return Ok(JsValue::null());
+    };
+    let compute_obj = desc
+        .get(js_string!("compute"), ctx)
+        .ok()
+        .and_then(|v| v.as_object().cloned());
+    let layout_id = desc
+        .get(js_string!("layout"), ctx)
+        .ok()
+        .and_then(|v| read_u32_handle(&v, "__gpu_pipeline_layout_id", ctx));
+    let shader_id = compute_obj
+        .as_ref()
+        .and_then(|o| o.get(js_string!("module"), ctx).ok())
+        .and_then(|v| read_u32_handle(&v, SHADER_KEY, ctx));
+    let entry = compute_obj
+        .as_ref()
+        .and_then(|o| o.get(js_string!("entryPoint"), ctx).ok())
+        .and_then(|v| v.to_string(ctx).ok())
+        .map(|s| s.to_std_string_escaped())
+        .unwrap_or_else(|| "main".to_string());
+
+    let pipeline = GPU_DEVICES.with(|d| -> Option<Rc<wgpu::ComputePipeline>> {
+        let dev = d.borrow();
+        let entry_dev = dev.get(&device_id)?;
+        let module = GPU_SHADERS
+            .with(|r| shader_id.and_then(|id| r.borrow().get(&id).map(|e| e.module.clone())))?;
+        let layout = GPU_PIPELINE_LAYOUTS.with(|r| {
+            layout_id.and_then(|id| r.borrow().get(&id).map(|e| e.layout.clone()))
+        });
+        let entry_ref: &str = &entry;
+        let p = entry_dev.gpu.device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("webgpu compute pipeline"),
+                layout: layout.as_deref(),
+                module: &module,
+                entry_point: entry_ref,
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        );
+        Some(Rc::new(p))
+    });
+    let Some(pipeline) = pipeline else {
+        return Ok(JsValue::null());
+    };
+    let id = next_gpu_id();
+    GPU_COMPUTE_PIPELINES
+        .with(|r| r.borrow_mut().insert(id, ComputePipelineEntry { pipeline }));
+    Ok(build_handle(ctx, "__gpu_compute_pipeline_id", id))
+}
+
+// =================== compute pass ===================
+
+fn encoder_begin_compute_pass(
+    this: &JsValue,
+    _args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(obj) = this.as_object() else { return Ok(JsValue::null()) };
+    let Some(encoder_id) = read_u32_prop(&obj, ENCODER_KEY, ctx) else {
+        return Ok(JsValue::null());
+    };
+    let pass_id = next_gpu_id();
+    GPU_COMPUTE_PASSES.with(|r| {
+        r.borrow_mut().insert(
+            pass_id,
+            ComputePassEntry {
+                commands: Vec::new(),
+                encoder_id,
+            },
+        );
+    });
+    let mut b = ObjectInitializer::new(ctx);
+    b.property(
+        js_string!("__gpu_compute_pass_id"),
+        JsValue::from(pass_id),
+        Attribute::READONLY,
+    );
+    b.function(
+        NativeFunction::from_fn_ptr(compute_pass_set_pipeline),
+        js_string!("setPipeline"),
+        1,
+    );
+    b.function(
+        NativeFunction::from_fn_ptr(compute_pass_set_bind_group),
+        js_string!("setBindGroup"),
+        2,
+    );
+    b.function(
+        NativeFunction::from_fn_ptr(compute_pass_dispatch),
+        js_string!("dispatchWorkgroups"),
+        3,
+    );
+    b.function(
+        NativeFunction::from_fn_ptr(compute_pass_end),
+        js_string!("end"),
+        0,
+    );
+    Ok(JsValue::from(b.build()))
+}
+
+fn read_compute_pass_id(this: &JsValue, ctx: &mut Context) -> Option<u32> {
+    this.as_object()
+        .and_then(|o| o.get(js_string!("__gpu_compute_pass_id"), ctx).ok())
+        .and_then(|v| v.to_u32(ctx).ok())
+}
+
+fn compute_pass_set_pipeline(
+    this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(pass_id) = read_compute_pass_id(this, ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    let Some(pipeline_id) = args
+        .first()
+        .and_then(|v| read_u32_handle(v, "__gpu_compute_pipeline_id", ctx))
+    else {
+        return Ok(JsValue::undefined());
+    };
+    GPU_COMPUTE_PASSES.with(|r| {
+        if let Some(p) = r.borrow_mut().get_mut(&pass_id) {
+            p.commands.push(ComputePassOp::SetPipeline(pipeline_id));
+        }
+    });
+    Ok(JsValue::undefined())
+}
+
+fn compute_pass_set_bind_group(
+    this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(pass_id) = read_compute_pass_id(this, ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    let index = args.first().and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
+    let group_id = args
+        .get(1)
+        .and_then(|v| read_u32_handle(v, "__gpu_bind_group_id", ctx))
+        .unwrap_or(0);
+    GPU_COMPUTE_PASSES.with(|r| {
+        if let Some(p) = r.borrow_mut().get_mut(&pass_id) {
+            p.commands.push(ComputePassOp::SetBindGroup(index, group_id));
+        }
+    });
+    Ok(JsValue::undefined())
+}
+
+fn compute_pass_dispatch(
+    this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(pass_id) = read_compute_pass_id(this, ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    let x = args.first().and_then(|v| v.to_u32(ctx).ok()).unwrap_or(1);
+    let y = args.get(1).and_then(|v| v.to_u32(ctx).ok()).unwrap_or(1);
+    let z = args.get(2).and_then(|v| v.to_u32(ctx).ok()).unwrap_or(1);
+    GPU_COMPUTE_PASSES.with(|r| {
+        if let Some(p) = r.borrow_mut().get_mut(&pass_id) {
+            p.commands.push(ComputePassOp::Dispatch { x, y, z });
+        }
+    });
+    Ok(JsValue::undefined())
+}
+
+fn compute_pass_end(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(pass_id) = read_compute_pass_id(this, ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    // Replay recorded commands against a real compute pass on the
+    // owning encoder. Errors are swallowed because the WebGPU API
+    // doesn't surface them synchronously.
+    let pass = GPU_COMPUTE_PASSES.with(|r| r.borrow_mut().remove(&pass_id));
+    let Some(pass) = pass else { return Ok(JsValue::undefined()) };
+    let encoder_id = pass.encoder_id;
+    let mut encoder_slot = GPU_ENCODERS.with(|r| r.borrow_mut().remove(&encoder_id));
+    let Some(entry) = encoder_slot.as_mut() else { return Ok(JsValue::undefined()) };
+    let Some(encoder) = entry.encoder.as_mut() else {
+        return Ok(JsValue::undefined());
+    };
+    // Pull pipelines + bind groups by id once so the replay loop
+    // only touches the JS-side maps once.
+    let pipelines: HashMap<u32, Rc<wgpu::ComputePipeline>> = GPU_COMPUTE_PIPELINES
+        .with(|r| r.borrow().iter().map(|(k, v)| (*k, v.pipeline.clone())).collect());
+    let bind_groups: HashMap<u32, Rc<wgpu::BindGroup>> = GPU_BIND_GROUPS
+        .with(|r| r.borrow().iter().map(|(k, v)| (*k, v.group.clone())).collect());
+    {
+        let mut rp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("webgpu compute pass"),
+            timestamp_writes: None,
+        });
+        for op in &pass.commands {
+            match op {
+                ComputePassOp::SetPipeline(id) => {
+                    if let Some(p) = pipelines.get(id) {
+                        rp.set_pipeline(p);
+                    }
+                }
+                ComputePassOp::SetBindGroup(idx, id) => {
+                    if let Some(g) = bind_groups.get(id) {
+                        rp.set_bind_group(*idx, g, &[]);
+                    }
+                }
+                ComputePassOp::Dispatch { x, y, z } => {
+                    rp.dispatch_workgroups(*x, *y, *z);
+                }
+            }
+        }
+    }
+    // Put the encoder back so subsequent passes / finish() find it.
+    GPU_ENCODERS.with(|r| {
+        if let Some(e) = encoder_slot {
+            r.borrow_mut().insert(encoder_id, e);
+        }
+    });
+    Ok(JsValue::undefined())
+}
+
+// =================== buffer / texture copies ===================
+
+fn encoder_copy_buffer_to_buffer(
+    this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(obj) = this.as_object() else { return Ok(JsValue::undefined()) };
+    let Some(encoder_id) = read_u32_prop(&obj, ENCODER_KEY, ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    let src_id = args
+        .first()
+        .and_then(|v| read_u32_handle(v, BUFFER_KEY, ctx))
+        .unwrap_or(0);
+    let src_offset = args.get(1).and_then(|v| v.to_number(ctx).ok()).unwrap_or(0.0) as u64;
+    let dst_id = args
+        .get(2)
+        .and_then(|v| read_u32_handle(v, BUFFER_KEY, ctx))
+        .unwrap_or(0);
+    let dst_offset = args.get(3).and_then(|v| v.to_number(ctx).ok()).unwrap_or(0.0) as u64;
+    let size = args.get(4).and_then(|v| v.to_number(ctx).ok()).unwrap_or(0.0) as u64;
+    let src = GPU_BUFFERS.with(|r| r.borrow().get(&src_id).map(|e| e.buffer.clone()));
+    let dst = GPU_BUFFERS.with(|r| r.borrow().get(&dst_id).map(|e| e.buffer.clone()));
+    if let (Some(s), Some(d)) = (src, dst) {
+        GPU_ENCODERS.with(|r| {
+            if let Some(entry) = r.borrow_mut().get_mut(&encoder_id) {
+                if let Some(encoder) = entry.encoder.as_mut() {
+                    encoder.copy_buffer_to_buffer(&s, src_offset, &d, dst_offset, size);
+                }
+            }
+        });
+    }
+    Ok(JsValue::undefined())
+}
+
+fn encoder_copy_buffer_to_texture(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _ctx: &mut Context,
+) -> JsResult<JsValue> {
+    // Full plumbing wants ImageCopyBuffer { buffer, offset, bytesPerRow,
+    // rowsPerImage } + ImageCopyTexture { texture, mipLevel, origin,
+    // aspect } + Extent3D. We accept the call so apps don't crash;
+    // actual GPU-side copy is a follow-up.
+    Ok(JsValue::undefined())
+}
+
+fn encoder_copy_texture_to_buffer(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _ctx: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::undefined())
+}
+
+fn encoder_copy_texture_to_texture(
+    _this: &JsValue,
+    _args: &[JsValue],
+    _ctx: &mut Context,
+) -> JsResult<JsValue> {
+    Ok(JsValue::undefined())
+}
+
+// =================== render-pass extras ===================
+
+fn pass_set_index_buffer(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(obj) = this.as_object() else { return Ok(JsValue::undefined()) };
+    let Some(pass_id) = read_u32_prop(&obj, PASS_KEY, ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    let buffer_id = args
+        .first()
+        .and_then(|v| read_u32_handle(v, BUFFER_KEY, ctx))
+        .unwrap_or(0);
+    let format_str = args
+        .get(1)
+        .and_then(|v| v.to_string(ctx).ok())
+        .map(|s| s.to_std_string_escaped())
+        .unwrap_or_else(|| "uint32".to_string());
+    let format = if format_str == "uint16" {
+        wgpu::IndexFormat::Uint16
+    } else {
+        wgpu::IndexFormat::Uint32
+    };
+    GPU_PASSES.with(|r| {
+        if let Some(p) = r.borrow_mut().get_mut(&pass_id) {
+            p.commands.push(PassOp::SetIndexBuffer { buffer_id, format });
+        }
+    });
+    Ok(JsValue::undefined())
+}
+
+fn pass_draw_indexed(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(obj) = this.as_object() else { return Ok(JsValue::undefined()) };
+    let Some(pass_id) = read_u32_prop(&obj, PASS_KEY, ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    let index_count = args.first().and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
+    let instance_count = args.get(1).and_then(|v| v.to_u32(ctx).ok()).unwrap_or(1);
+    let first_index = args.get(2).and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
+    let base_vertex = args.get(3).and_then(|v| v.to_number(ctx).ok()).unwrap_or(0.0) as i32;
+    let first_instance = args.get(4).and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
+    GPU_PASSES.with(|r| {
+        if let Some(p) = r.borrow_mut().get_mut(&pass_id) {
+            p.commands.push(PassOp::DrawIndexed {
+                index_count,
+                instance_count,
+                first_index,
+                base_vertex,
+                first_instance,
+            });
+        }
+    });
+    Ok(JsValue::undefined())
+}
+
+fn pass_set_viewport(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(obj) = this.as_object() else { return Ok(JsValue::undefined()) };
+    let Some(pass_id) = read_u32_prop(&obj, PASS_KEY, ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    let x = args.first().and_then(|v| v.to_number(ctx).ok()).unwrap_or(0.0) as f32;
+    let y = args.get(1).and_then(|v| v.to_number(ctx).ok()).unwrap_or(0.0) as f32;
+    let w = args.get(2).and_then(|v| v.to_number(ctx).ok()).unwrap_or(0.0) as f32;
+    let h = args.get(3).and_then(|v| v.to_number(ctx).ok()).unwrap_or(0.0) as f32;
+    let min_depth = args.get(4).and_then(|v| v.to_number(ctx).ok()).unwrap_or(0.0) as f32;
+    let max_depth = args.get(5).and_then(|v| v.to_number(ctx).ok()).unwrap_or(1.0) as f32;
+    GPU_PASSES.with(|r| {
+        if let Some(p) = r.borrow_mut().get_mut(&pass_id) {
+            p.commands.push(PassOp::SetViewport { x, y, w, h, min_depth, max_depth });
+        }
+    });
+    Ok(JsValue::undefined())
+}
+
+fn pass_set_scissor_rect(
+    this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(obj) = this.as_object() else { return Ok(JsValue::undefined()) };
+    let Some(pass_id) = read_u32_prop(&obj, PASS_KEY, ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    let x = args.first().and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
+    let y = args.get(1).and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
+    let w = args.get(2).and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
+    let h = args.get(3).and_then(|v| v.to_u32(ctx).ok()).unwrap_or(0);
+    GPU_PASSES.with(|r| {
+        if let Some(p) = r.borrow_mut().get_mut(&pass_id) {
+            p.commands.push(PassOp::SetScissorRect { x, y, w, h });
+        }
+    });
+    Ok(JsValue::undefined())
+}
+
+// =================== error scope ===================
+
+fn device_pop_error_scope(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    Ok(JsPromise::resolve(JsValue::null(), ctx).into())
 }

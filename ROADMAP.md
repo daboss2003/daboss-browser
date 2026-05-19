@@ -20,7 +20,7 @@ up the work without re-deriving context.
 
 ## Just shipped
 
-- [x] **DevTools Sources panel with breakpoints** (this session) —
+- [x] `8e4d30a` **DevTools Sources panel with breakpoints** —
       the Sources panel is now interactive. `SourcesPanelState`
       tracks the selected source-map, selected file within the
       map, cursor line, and scroll position; the breakpoint set

@@ -1772,14 +1772,24 @@ impl Browser {
                     self.devtools.input.pop();
                 }
             }
-            Key::Named(NamedKey::ArrowUp) => {
-                if matches!(self.devtools.panel, devtools::Panel::Console) {
-                    self.devtools.history_prev();
+            Key::Named(NamedKey::ArrowUp) => match self.devtools.panel {
+                devtools::Panel::Console => self.devtools.history_prev(),
+                devtools::Panel::Sources => self.devtools.sources_cursor_up(1),
+                _ => {}
+            },
+            Key::Named(NamedKey::ArrowDown) => match self.devtools.panel {
+                devtools::Panel::Console => self.devtools.history_next(),
+                devtools::Panel::Sources => self.devtools.sources_cursor_down(1),
+                _ => {}
+            },
+            Key::Named(NamedKey::PageUp) => {
+                if matches!(self.devtools.panel, devtools::Panel::Sources) {
+                    self.devtools.sources_cursor_up(10);
                 }
             }
-            Key::Named(NamedKey::ArrowDown) => {
-                if matches!(self.devtools.panel, devtools::Panel::Console) {
-                    self.devtools.history_next();
+            Key::Named(NamedKey::PageDown) => {
+                if matches!(self.devtools.panel, devtools::Panel::Sources) {
+                    self.devtools.sources_cursor_down(10);
                 }
             }
             _ => {
@@ -1788,6 +1798,20 @@ impl Browser {
                         let s: &str = s.as_ref();
                         if !s.is_empty() && !s.chars().any(|c| c.is_control()) {
                             self.devtools.input.push_str(s);
+                        }
+                    }
+                } else if matches!(self.devtools.panel, devtools::Panel::Sources) {
+                    // Sources panel hotkeys: b = toggle breakpoint at
+                    // cursor, n = next map, s = next source file.
+                    if let Some(s) = text {
+                        match s.as_ref() {
+                            "b" => self.devtools.sources_toggle_breakpoint(),
+                            "n" => {
+                                self.devtools.refresh_sources();
+                                self.devtools.sources_next_map();
+                            }
+                            "s" => self.devtools.sources_next_source(),
+                            _ => {}
                         }
                     }
                 }
@@ -3267,6 +3291,7 @@ fn paint_devtools_panel(
                 scroll_bottom,
                 line_h,
                 metrics_body,
+                dt,
             );
             return;
         }
@@ -3743,49 +3768,102 @@ fn paint_sources_panel(
     scroll_bottom: u32,
     line_h: i32,
     metrics: Metrics,
+    dt: &devtools::DevTools,
 ) {
     let mut lines: Vec<(CtColor, String)> = Vec::new();
     let header = CtColor::rgb(140, 200, 255);
-    let key = CtColor::rgb(220, 220, 220);
+    let key_color = CtColor::rgb(220, 220, 220);
     let muted = CtColor::rgb(160, 160, 180);
     let code = CtColor::rgb(220, 230, 200);
+    let cursor_color = CtColor::rgb(255, 240, 140);
+    let bp_color = CtColor::rgb(255, 90, 90);
 
-    let maps = source_map::snapshot();
-    lines.push((
-        header,
-        format!("Source maps ({} loaded)", maps.len()),
-    ));
-    if maps.is_empty() {
+    if dt.sources.map_keys.is_empty() {
+        lines.push((header, "Source maps (0 loaded)".to_string()));
         lines.push((
             muted,
-            "  (no maps — emit `//# sourceMappingURL=data:application/json;base64,...` from a script to populate)".to_string(),
+            "  (no maps — run a script that ends with \
+             //# sourceMappingURL=data:application/json;base64,...)"
+                .to_string(),
         ));
-    }
-    for (key_name, map) in &maps {
-        lines.push((header, String::new()));
-        lines.push((key, format!("{key_name}")));
-        if let Some(f) = &map.file {
-            lines.push((muted, format!("  file: {f}")));
-        }
+    } else {
+        let active_key = dt
+            .sources
+            .selected_map
+            .and_then(|i| dt.sources.map_keys.get(i))
+            .cloned()
+            .unwrap_or_default();
         lines.push((
-            muted,
+            header,
             format!(
-                "  sources: {} · mappings rows: {}",
-                map.sources.len(),
-                map.mappings.len()
+                "Sources  ·  map [{} of {}] {}  ·  hotkeys: n=next-map s=next-source ↑↓=cursor PgUp/PgDn=10 b=toggle-bp",
+                dt.sources.selected_map.map(|i| i + 1).unwrap_or(0),
+                dt.sources.map_keys.len(),
+                active_key,
             ),
         ));
-        // Preview the first source's content if present so the panel
-        // looks like a working "Sources" view rather than a manifest.
-        if let Some(Some(content)) = map.sources_content.first() {
-            let name = map.sources.first().cloned().unwrap_or_default();
-            lines.push((header, format!("  ── {name} ──")));
-            for src_line in content.lines().take(40) {
-                lines.push((code, format!("    {src_line}")));
+        let file = dt.active_source_filename().unwrap_or_default();
+        lines.push((key_color, format!("── {file} ──")));
+
+        if let Some(content) = dt.active_source_content() {
+            // Build a scrolled, line-numbered, breakpoint-marked
+            // listing. We render a window of `viewport_lines` lines
+            // centred-ish on `cursor_line` by anchoring `scroll_top`.
+            let viewport_lines =
+                (((scroll_bottom - scroll_top) as i32) / line_h).max(1) as u32;
+            // Auto-scroll: if cursor is outside viewport, slide the
+            // window so it's centred. We can't mutate `dt` here, so
+            // we just derive a virtual scroll_top.
+            let cursor = dt.sources.cursor_line;
+            let visible_scroll_top = if cursor < dt.sources.scroll_top {
+                cursor
+            } else if cursor >= dt.sources.scroll_top + viewport_lines {
+                cursor.saturating_sub(viewport_lines.saturating_sub(1))
+            } else {
+                dt.sources.scroll_top
+            };
+            let total = content.lines().count() as u32;
+            let map_key = active_key.as_str();
+            let src_idx = dt.sources.selected_source.unwrap_or(0);
+            for (i, src_line) in content
+                .lines()
+                .enumerate()
+                .skip(visible_scroll_top as usize)
+                .take(viewport_lines as usize)
+            {
+                let line_no = i as u32;
+                let is_cursor = line_no == cursor;
+                let has_bp = dt.has_breakpoint(map_key, src_idx, line_no);
+                let marker = match (is_cursor, has_bp) {
+                    (true, true) => ">●",
+                    (true, false) => "> ",
+                    (false, true) => " ●",
+                    (false, false) => "  ",
+                };
+                let display = format!("{marker} {:>4} │ {}", line_no + 1, src_line);
+                let color = if has_bp {
+                    bp_color
+                } else if is_cursor {
+                    cursor_color
+                } else {
+                    code
+                };
+                lines.push((color, display));
             }
-            if content.lines().count() > 40 {
-                lines.push((muted, "    ... (truncated)".to_string()));
-            }
+            lines.push((
+                muted,
+                format!(
+                    "({} lines · cursor at {}/{})",
+                    total,
+                    cursor + 1,
+                    total
+                ),
+            ));
+        } else {
+            lines.push((
+                muted,
+                "  (selected source has no embedded content)".to_string(),
+            ));
         }
     }
 

@@ -740,6 +740,7 @@ impl JsEngine {
             return;
         }
         let (rc, listeners_rc) = self.install_thread_locals(dom);
+        install_breakpoint_hook(&mut self.ctx);
         for (i, src) in scripts.iter().enumerate() {
             // Source-map discovery: a trailing `//# sourceMappingURL=`
             // comment that points at a `data:` URL with an inline JSON
@@ -751,7 +752,9 @@ impl JsEngine {
                     crate::source_map::register(format!("<inline #{i}>"), map);
                 }
             }
-            if let Err(e) = self.ctx.eval(Source::from_bytes(src.as_bytes())) {
+            let key = format!("<inline #{i}>");
+            let rewritten = inject_breakpoint_hits(src, &key);
+            if let Err(e) = self.ctx.eval(Source::from_bytes(rewritten.as_bytes())) {
                 eprintln!("[js] script #{i} threw: {e}");
             }
         }
@@ -1117,6 +1120,78 @@ impl JsEngine {
 /// Aliases `window` (and `self`) to the global object so scripts that
 /// reach into `window.something` or expect `self === globalThis` work.
 /// Cheap because both are just `Attribute::WRITABLE` properties — direct
+/// Install the `__bp_hit` global the rewritten scripts call when
+/// execution crosses a breakpointed line. The implementation pushes
+/// a console message describing the hit + a short stack trace
+/// snapshot (just script_key:line for now — proper frame inspection
+/// would need boa instrumentation hooks). It returns `undefined` so
+/// the host expression isn't perturbed.
+fn install_breakpoint_hook(ctx: &mut Context) {
+    use crate::devtools::{push_console, ConsoleLevel};
+    fn hit(_: &JsValue, args: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+        let script_key = args
+            .first()
+            .map(|v| v.display().to_string())
+            .unwrap_or_default();
+        let line = args.get(1).map(|v| v.display().to_string()).unwrap_or_default();
+        push_console(
+            ConsoleLevel::Info,
+            format!(
+                "breakpoint hit at {}:{}",
+                strip_quotes(&script_key),
+                strip_quotes(&line)
+            ),
+        );
+        Ok(JsValue::undefined())
+    }
+    ctx.register_global_callable(
+        js_string!("__bp_hit"),
+        2,
+        NativeFunction::from_fn_ptr(hit),
+    )
+    .ok();
+}
+
+fn strip_quotes(s: &str) -> &str {
+    s.trim_matches(|c| c == '"' || c == '\'')
+}
+
+/// Rewrite a script body to insert `__bp_hit(...)` calls at the
+/// start of each line that has a breakpoint set. We split on `\n`
+/// and prefix matching lines with `__bp_hit("<key>", <line>);` —
+/// this works for top-level statements separated by newlines, which
+/// is the dominant case in hand-written and well-formatted bundled
+/// JS. The leading `;` defends against statements that ran off the
+/// previous line without explicit termination; ASI then folds it
+/// away. Inside template literals or multi-line expressions the
+/// injection would corrupt the source — a proper implementation
+/// would parse the JS first, but that's deferred until we have a
+/// reason to care about that case.
+fn inject_breakpoint_hits(src: &str, script_key: &str) -> String {
+    let bps: std::collections::HashSet<u32> = crate::source_map::breakpoints_for(script_key, 0)
+        .into_iter()
+        .collect();
+    if bps.is_empty() {
+        return src.to_string();
+    }
+    let mut out = String::with_capacity(src.len() + bps.len() * 32);
+    for (idx, line) in src.split('\n').enumerate() {
+        let line_no = idx as u32;
+        if bps.contains(&line_no) {
+            out.push_str(&format!(";__bp_hit({:?},{});", script_key, line_no));
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    // We added a trailing `\n` even if the original didn't end with
+    // one. Strip it back off so concat-style consumers see the same
+    // bytes when no breakpoint is present.
+    if !src.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
 /// Decode a `data:application/json;base64,...` source-map URL into a
 /// `SourceMap`. Returns `None` for unsupported schemes (http/https
 /// would need a fetch we don't wire here) or malformed payloads.
@@ -2664,6 +2739,57 @@ mod tests {
     use super::*;
     use crate::html;
     use crate::js::dom::find_for_test_by_id;
+
+    #[test]
+    fn inject_breakpoint_hits_prefixes_only_targeted_lines() {
+        crate::source_map::clear();
+        crate::source_map::toggle_breakpoint("<inline #0>", 0, 1);
+        let src = "var a = 1;\nvar b = 2;\nvar c = 3;";
+        let out = super::inject_breakpoint_hits(src, "<inline #0>");
+        // Line 0 untouched; line 1 prefixed; line 2 untouched.
+        let lines: Vec<&str> = out.split('\n').collect();
+        assert_eq!(lines[0], "var a = 1;");
+        assert!(
+            lines[1].starts_with(";__bp_hit("),
+            "expected line 1 to start with hit call, got {:?}",
+            lines[1]
+        );
+        assert!(lines[1].contains(",1);"));
+        assert!(lines[1].ends_with("var b = 2;"));
+        assert_eq!(lines[2], "var c = 3;");
+        crate::source_map::clear();
+    }
+
+    #[test]
+    fn breakpoint_hit_pushes_console_info_line() {
+        // Set a breakpoint on line 1 of the only inline script, run
+        // the script, and confirm a console info line landed in the
+        // shared devtools buffer.
+        crate::source_map::clear();
+        crate::source_map::toggle_breakpoint("<inline #0>", 0, 1);
+        // Capture the console buffer so we can inspect it after exec.
+        use crate::devtools::{ConsoleBuffer, ConsoleLevel, JS_CONSOLE_BUFFER};
+        let captured: ConsoleBuffer = std::rc::Rc::new(std::cell::RefCell::new(
+            std::collections::VecDeque::new(),
+        ));
+        JS_CONSOLE_BUFFER.with(|s| *s.borrow_mut() = Some(captured.clone()));
+        let mut dom = html::parse(
+            "<html><body><script>var a = 1;\nvar b = 2;</script></body></html>",
+        );
+        let _engine = JsEngine::new(&mut dom);
+        JS_CONSOLE_BUFFER.with(|s| s.borrow_mut().take());
+        let hit = captured.borrow().iter().any(|l| {
+            matches!(l.level, ConsoleLevel::Info)
+                && l.text.contains("breakpoint hit at <inline #0>")
+                && l.text.ends_with(":1")
+        });
+        assert!(
+            hit,
+            "expected breakpoint hit console line, buffer: {:?}",
+            captured.borrow().iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+        crate::source_map::clear();
+    }
 
     #[test]
     fn inline_script_registers_source_map_from_data_url() {

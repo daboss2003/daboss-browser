@@ -20,6 +20,29 @@ up the work without re-deriving context.
 
 ## Just shipped
 
+- [x] **DevTools Sources panel with breakpoints** (this session) —
+      the Sources panel is now interactive. `SourcesPanelState`
+      tracks the selected source-map, selected file within the
+      map, cursor line, and scroll position; the breakpoint set
+      itself lives in `source_map::BREAKPOINTS` so the JS engine
+      can query without depending on devtools. Hotkeys inside the
+      Sources panel: `n` (next map), `s` (next source file), `↑/↓`
+      (move cursor), `PgUp/PgDn` (jump 10 lines), `b` (toggle
+      breakpoint at cursor). The panel renders the selected source
+      with line numbers, a `>` cursor marker, and `●` markers in
+      red for breakpointed lines; viewport auto-scrolls to keep
+      the cursor visible. Execution hits: `run_initial_scripts`
+      now installs a global `__bp_hit` callable and rewrites each
+      script before evaluation — every line listed in
+      `breakpoints_for(<inline #N>, 0)` gets `;__bp_hit("<key>",
+      line);` prepended; a hit pushes an Info-level console
+      message. Inline scripts where `sources_content[0] == script
+      body` work cleanly (the common case); transpiled bundles
+      where lines come from non-trivial source-map mappings would
+      need the source-map's mappings consulted, which is the next
+      slice. Tests cover registry refresh on panel switch, cursor
+      clamp + toggle round-trip, the rewrite line-by-line, and an
+      end-to-end hit producing a console line.
 - [x] `7380302` **Compositor thread + GPU rasterisation** (first cut) — new `gpu_raster` module. `GpuRasterizer` owns a
       headless wgpu Device + Queue + a render pipeline that
       consumes a list of `GpuRect { x, y, w, h, color: [f32; 4] }`
@@ -160,10 +183,6 @@ up the work without re-deriving context.
 
 ## Pending (each is its own session)
 
-- [ ] **DevTools Sources panel with breakpoints** — needs boa
-  instrumentation hooks so we can pause on breakpoint lines +
-  step. Probably start with read-only source view + console-eval
-  on selected line.
 - [ ] **Storage partitioning by top-level origin** — every
   per-origin store (cookies, localStorage, IDB, OPFS, cache,
   SW registrations, push subs) currently keys on the inner

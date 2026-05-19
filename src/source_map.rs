@@ -59,6 +59,15 @@ thread_local! {
     /// synthetic `<inline #N>` key.
     pub static SOURCE_MAPS: RefCell<HashMap<String, SourceMap>> =
         RefCell::new(HashMap::new());
+
+    /// Active breakpoints, keyed by `(source_map_key, source_index,
+    /// line_number)`. Mutated by the DevTools Sources panel and read
+    /// by the JS engine before each script eval — when a script's
+    /// key matches and `source_index == 0` (i.e. the script body
+    /// itself is the original source), each line listed here is
+    /// prefixed with a `__bp_hit(...)` call at rewrite time.
+    pub static BREAKPOINTS: RefCell<std::collections::HashSet<(String, usize, u32)>> =
+        RefCell::new(std::collections::HashSet::new());
 }
 
 pub fn register(key: String, map: SourceMap) {
@@ -72,9 +81,41 @@ pub fn snapshot() -> Vec<(String, SourceMap)> {
     SOURCE_MAPS.with(|s| s.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect())
 }
 
+/// Toggle a breakpoint; returns the new state (true if the
+/// breakpoint is now set).
+pub fn toggle_breakpoint(map_key: &str, source_idx: usize, line: u32) -> bool {
+    let key = (map_key.to_string(), source_idx, line);
+    BREAKPOINTS.with(|s| {
+        let mut set = s.borrow_mut();
+        if set.remove(&key) {
+            false
+        } else {
+            set.insert(key);
+            true
+        }
+    })
+}
+
+pub fn has_breakpoint(map_key: &str, source_idx: usize, line: u32) -> bool {
+    BREAKPOINTS.with(|s| s.borrow().contains(&(map_key.to_string(), source_idx, line)))
+}
+
+/// All breakpoints for a single source-map key + source index. Used
+/// by the JS engine to inject hit calls into matching scripts.
+pub fn breakpoints_for(map_key: &str, source_idx: usize) -> Vec<u32> {
+    BREAKPOINTS.with(|s| {
+        s.borrow()
+            .iter()
+            .filter(|(k, idx, _)| k == map_key && *idx == source_idx)
+            .map(|(_, _, line)| *line)
+            .collect()
+    })
+}
+
 #[cfg(test)]
 pub fn clear() {
     SOURCE_MAPS.with(|s| s.borrow_mut().clear());
+    BREAKPOINTS.with(|s| s.borrow_mut().clear());
 }
 
 /// Scan `src` for a trailing `//# sourceMappingURL=...` or

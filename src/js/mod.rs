@@ -81,6 +81,7 @@ pub(crate) mod web_apis;
 pub(crate) mod wasm;
 pub(crate) mod web_classes;
 pub(crate) mod webauthn;
+pub mod webextensions;
 pub(crate) mod webcodecs;
 pub(crate) mod webgl;
 pub(crate) mod webgpu;

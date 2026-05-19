@@ -52,7 +52,7 @@ pub fn install(ctx: &mut Context) {
     install_document_pip(ctx);
     install_webxr(ctx);
     install_css_houdini(ctx);
-    install_webextensions_stub(ctx);
+    super::webextensions::install(ctx);
 }
 
 thread_local! {
@@ -1345,74 +1345,7 @@ fn css_escape(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsVa
     Ok(JsValue::from(js_string!(out)))
 }
 
-// =================== WebExtensions shim ===================
-
-fn install_webextensions_stub(ctx: &mut Context) {
-    // Just enough surface for pages that feature-detect
-    // `chrome.runtime.id` or `browser.runtime.getManifest`. We
-    // aren't actually an extension host — calls that try to
-    // install or message an extension reject.
-    let realm = ctx.realm().clone();
-    let get_manifest = boa_engine::object::FunctionObjectBuilder::new(
-        &realm,
-        NativeFunction::from_fn_ptr(|_, _, ctx: &mut Context| {
-            Ok(JsValue::from(ObjectInitializer::new(ctx).build()))
-        }),
-    )
-    .build();
-    let send_message = boa_engine::object::FunctionObjectBuilder::new(
-        &realm,
-        NativeFunction::from_fn_ptr(|_, _, ctx: &mut Context| {
-            let err: JsError = boa_engine::JsNativeError::error()
-                .with_message("Receiving end does not exist")
-                .into();
-            Ok(JsPromise::reject(err, ctx).into())
-        }),
-    )
-    .build();
-    let runtime = ObjectInitializer::new(ctx)
-        .property(js_string!("id"), JsValue::null(), Attribute::READONLY)
-        .property(
-            js_string!("getManifest"),
-            JsValue::from(get_manifest),
-            Attribute::READONLY,
-        )
-        .property(
-            js_string!("sendMessage"),
-            JsValue::from(send_message),
-            Attribute::READONLY,
-        )
-        .property(
-            js_string!("lastError"),
-            JsValue::null(),
-            Attribute::WRITABLE,
-        )
-        .build();
-    let chrome_obj = ObjectInitializer::new(ctx)
-        .property(
-            js_string!("runtime"),
-            JsValue::from(runtime.clone()),
-            Attribute::READONLY,
-        )
-        .build();
-    let browser_obj = ObjectInitializer::new(ctx)
-        .property(
-            js_string!("runtime"),
-            JsValue::from(runtime),
-            Attribute::READONLY,
-        )
-        .build();
-    let _ = ctx.register_global_property(
-        js_string!("chrome"),
-        chrome_obj,
-        Attribute::WRITABLE | Attribute::CONFIGURABLE,
-    );
-    let _ = ctx.register_global_property(
-        js_string!("browser"),
-        browser_obj,
-        Attribute::WRITABLE | Attribute::CONFIGURABLE,
-    );
-}
+// WebExtensions chrome.* surface moved to `js::webextensions`.
 
 // =================== WebXR ===================
 

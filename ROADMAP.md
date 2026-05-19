@@ -20,6 +20,37 @@ up the work without re-deriving context.
 
 ## Just shipped
 
+- [x] **WebExtensions runtime — real `chrome.*` surface** (this
+      session) — new `js::webextensions` module replaces the
+      feature-detection stub. `load(ctx, manifest_json)` parses
+      a manifest, synthesises a stable 32-char extension ID from
+      `name + version`, and stamps it as the active extension in
+      a thread-local. `install(ctx)` wires the chrome.* + browser.*
+      globals against the live extension:
+      * `chrome.runtime.{id, getManifest, getURL, sendMessage,
+        onMessage.{addListener, removeListener}}` — getURL emits
+        `chrome-extension://<id>/<path>`; sendMessage walks the
+        registered listeners and resolves the promise to the
+        last listener's return value.
+      * `chrome.storage.local.{get, set, remove, clear}` —
+        disk-backed under `<data_dir>/daboss-extension/<id>/storage.json`
+        as a hand-coded JSON object whose values are
+        pre-stringified JSON snippets (so the layer preserves
+        arbitrary value shapes without a full Rust JSON serdier).
+        An in-memory cache short-circuits the file read until a
+        write invalidates it.
+      * `chrome.scripting.executeScript({func})` — calls the
+        passed function in the current Context and wraps the
+        result in the `[{ result }]` array shape Chrome returns.
+      * `chrome.tabs.query` — stub returning an empty array so
+        extensions that walk tabs don't reject.
+      Tests cover ID stability, manifest round-trip, getURL
+      formatting, sendMessage→onMessage dispatch, and a storage
+      set/cache-invalidate/get cycle through the on-disk file.
+      Limitations: no separation between background, content,
+      and popup contexts (collapsed to one Context); no
+      declarativeNetRequest, alarms, or windows; no permission
+      gating on chrome.* calls.
 - [x] `b721799` **CSS Paint Worklets actually executing** — new `js::paint_worklet` module owns a per-document
       `PAINT_WORKLETS` registry (`name -> class JsObject`) and a
       per-element `PAINT_WORKLET_COMMANDS` table of recorded
@@ -249,8 +280,8 @@ up the work without re-deriving context.
 
 ## Pending (each is its own session)
 
-- [ ] **WebExtensions runtime (real)** — implement enough of
-  `chrome.*` so MV3 extensions can load. Massive.
+(nothing pending — every tier-2/3 item is shipped. Future work
+should land via separate proposals.)
 
 ## Completed
 

@@ -20,7 +20,7 @@ up the work without re-deriving context.
 
 ## Just shipped
 
-- [x] **First-Party Sets + CHIPS** (this session) — new
+- [x] `6d39ee5` **First-Party Sets + CHIPS partitioned cookies** — new
       `net::first_party_set` module with a curated `(member,
       primary)` table covering Google, Microsoft, GitHub, and
       Wikimedia properties plus a synthetic toy set used in

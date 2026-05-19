@@ -20,8 +20,7 @@ up the work without re-deriving context.
 
 ## Just shipped
 
-- [x] **Compositor thread + GPU rasterisation** (this session,
-      first cut) — new `gpu_raster` module. `GpuRasterizer` owns a
+- [x] `7380302` **Compositor thread + GPU rasterisation** (first cut) — new `gpu_raster` module. `GpuRasterizer` owns a
       headless wgpu Device + Queue + a render pipeline that
       consumes a list of `GpuRect { x, y, w, h, color: [f32; 4] }`
       and produces a `tiny_skia::Pixmap`. Two triangles per rect,

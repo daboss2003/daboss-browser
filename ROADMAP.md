@@ -20,7 +20,7 @@ up the work without re-deriving context.
 
 ## Just shipped
 
-- [x] **Per-tile damage tracking** (this session) — every
+- [x] `dbc9ef6` **Per-tile damage tracking** — every
       will-change layer pixmap is conceptually diced into 256×256
       tiles. `CachedLayer` gains `tile_input_hashes` (one per
       tile), `tile_cols`, and `tile_rows`. A new

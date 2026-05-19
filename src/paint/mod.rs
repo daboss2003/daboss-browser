@@ -323,10 +323,20 @@ impl Painter {
             return false;
         };
         let saved = std::mem::replace(&mut self.pixmap, offscreen);
+        // Neutralise the root style's contribution: when
+        // `paint_subtree_inner` calls `inner_ctx.with(style)` it
+        // multiplies in `style.opacity` and adds the root's
+        // `transform_translate`. To keep the cached pixmap
+        // transform-and-opacity-independent (the whole point — so
+        // a CSS animation reuses it), we pre-divide / pre-subtract
+        // those out here. composite_layer_pixmap re-applies the
+        // current values.
+        let neutralise_alpha = 1.0 / style.opacity.max(1e-3);
+        let (sx, sy) = style.transform_translate.unwrap_or((0.0, 0.0));
         let inner_ctx = PaintCtx {
-            alpha: parent_ctx.alpha,
-            tx: -b.rect.x + pad as f32,
-            ty: -b.rect.y + pad as f32,
+            alpha: parent_ctx.alpha * neutralise_alpha,
+            tx: -b.rect.x + pad as f32 - sx,
+            ty: -b.rect.y + pad as f32 - sy,
         };
         // Skip the layer-cache check on the recursive call to avoid
         // infinite recursion — paint the layer's own subtree directly.
@@ -399,10 +409,43 @@ impl Painter {
         parent_ctx: PaintCtx,
         style: &ComputedStyle,
     ) {
-        let dest_x = (box_rect.x + parent_ctx.tx - pad as f32) as i32;
-        let dest_y = (box_rect.y + parent_ctx.ty - pad as f32) as i32;
         let mut paint = PixmapPaint::default();
         paint.opacity = parent_ctx.alpha * style.opacity;
+
+        // If the layer carries a non-identity 2D transform, rebuild
+        // the same screen-space matrix that
+        // `paint_subtree_with_transform` uses for the un-cached
+        // path: T(screen + cx, screen + cy) ∘ M ∘ T(-cx, -cy) ∘
+        // T(-pad, -pad). The cached pixmap was painted with NO
+        // transform applied, so applying the matrix here yields
+        // the same on-screen pixels but reuses the subtree paint.
+        let transform = match &style.transform {
+            Some(t) if !t.is_pure_translate() => Some(*t),
+            _ => None,
+        };
+        if let Some(t) = transform {
+            let cx = box_rect.width / 2.0 + pad as f32;
+            let cy = box_rect.height / 2.0 + pad as f32;
+            let screen_x = box_rect.x + parent_ctx.tx;
+            let screen_y = box_rect.y + parent_ctx.ty;
+            let m = Transform::from_row(t.sx, t.kx, t.ky, t.sy, t.tx, t.ty);
+            let pre = Transform::from_translate(-cx, -cy);
+            let post = Transform::from_translate(screen_x + cx, screen_y + cy);
+            let final_xform = post.pre_concat(m).pre_concat(pre);
+            self.pixmap.draw_pixmap(
+                0,
+                0,
+                offscreen.as_ref(),
+                &paint,
+                final_xform,
+                None,
+            );
+            return;
+        }
+
+        // No transform — plain translate-and-blit.
+        let dest_x = (box_rect.x + parent_ctx.tx - pad as f32) as i32;
+        let dest_y = (box_rect.y + parent_ctx.ty - pad as f32) as i32;
         self.pixmap.draw_pixmap(
             dest_x,
             dest_y,
@@ -1281,20 +1324,21 @@ fn _refs() {
 
 /// True when this element warrants its own composited layer.
 ///
-/// The cache replays its pixmap with a straight blit at the layer's
-/// box origin — it doesn't reapply transforms or filters at
-/// composite time. So we promote only on signals where the cached
-/// pixmap is genuinely transform-independent:
-///   * `will-change` — the page explicitly opted in.
-///   * `position: fixed` — sticky chrome / overlays. The fixed
-///     position itself is honoured by layout; cache survives scroll.
-///   * `opacity < 1` — the alpha multiplies in at composite time,
-///     so the cache is transform-independent.
+/// The cache holds an UNTRANSFORMED pixmap of the subtree and
+/// re-applies opacity + transform at composite time. That makes:
+///   * `will-change: transform/opacity/filter` — explicit opt-in.
+///   * `position: fixed` — sticky chrome / overlays.
+///   * `opacity < 1` — alpha multiplies in at composite time.
+///   * Non-identity 2D transform (rotate / scale / skew / matrix
+///     or non-pure-translate compound) — composite via tiny-skia
+///     matrix on the cached untransformed pixmap. CSS keyframe
+///     animations on `transform` skip the subtree repaint cost
+///     entirely.
 ///
-/// `transform` and `filter` still go through the un-cached
-/// `paint_subtree_with_{transform,filter}` paths above this gate,
-/// because their pixel-level math needs to happen on the live
-/// subtree, not on a previously-cached snapshot.
+/// `filter:` chains still go through the un-cached
+/// `paint_subtree_with_filter` path because their pixel-level math
+/// happens during paint and would otherwise need to re-apply on
+/// every composite.
 fn is_layer_root(style: &ComputedStyle) -> bool {
     if let Some(wc) = &style.will_change {
         let matched = wc
@@ -1315,6 +1359,11 @@ fn is_layer_root(style: &ComputedStyle) -> bool {
     if style.opacity < 1.0 - 1e-4 {
         return true;
     }
+    if let Some(t) = &style.transform {
+        if !t.is_pure_translate() {
+            return true;
+        }
+    }
     false
 }
 
@@ -1322,10 +1371,14 @@ fn is_layer_root(style: &ComputedStyle) -> bool {
 /// layer's painted output would be byte-identical. We walk the
 /// subtree once and feed each element's identity + relevant
 /// style/box fields + text content into a stable hasher.
+///
+/// The root node's own `transform` + `opacity` are EXCLUDED — those
+/// re-apply at composite time, so a CSS animation that only
+/// mutates them must still hit the cache.
 fn compute_layer_hash(dom: &Dom, styles: &StyleTree, tree: &BoxTree, root: NodeId) -> u64 {
     use std::hash::Hasher;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    hash_subtree(&mut hasher, dom, styles, tree, root);
+    hash_subtree(&mut hasher, dom, styles, tree, root, true);
     hasher.finish()
 }
 
@@ -1335,6 +1388,7 @@ fn hash_subtree(
     styles: &StyleTree,
     tree: &BoxTree,
     node: NodeId,
+    is_root: bool,
 ) {
     use std::hash::Hash;
     node.hash(hasher);
@@ -1345,20 +1399,24 @@ fn hash_subtree(
     let fg = style.color;
     (fg.r, fg.g, fg.b, fg.a).hash(hasher);
     (style.font_size.to_bits()).hash(hasher);
-    (style.opacity.to_bits()).hash(hasher);
-    if let Some(t) = &style.transform {
-        (
-            t.sx.to_bits(),
-            t.kx.to_bits(),
-            t.ky.to_bits(),
-            t.sy.to_bits(),
-            t.tx.to_bits(),
-            t.ty.to_bits(),
-        )
-            .hash(hasher);
-    }
-    if let Some((dx, dy)) = style.transform_translate {
-        (dx.to_bits(), dy.to_bits()).hash(hasher);
+    // The layer-root's own opacity + transform composite later, so
+    // they're not part of the cached pixmap's identity.
+    if !is_root {
+        (style.opacity.to_bits()).hash(hasher);
+        if let Some(t) = &style.transform {
+            (
+                t.sx.to_bits(),
+                t.kx.to_bits(),
+                t.ky.to_bits(),
+                t.sy.to_bits(),
+                t.tx.to_bits(),
+                t.ty.to_bits(),
+            )
+                .hash(hasher);
+        }
+        if let Some((dx, dy)) = style.transform_translate {
+            (dx.to_bits(), dy.to_bits()).hash(hasher);
+        }
     }
     if let Some(b) = tree.get(node) {
         (
@@ -1383,7 +1441,7 @@ fn hash_subtree(
         _ => {}
     }
     for c in dom.children(node) {
-        hash_subtree(hasher, dom, styles, tree, c);
+        hash_subtree(hasher, dom, styles, tree, c, false);
     }
 }
 
@@ -1547,6 +1605,50 @@ mod tests {
         assert_eq!(
             after_second, after_first,
             "second paint should reuse the existing entry, not duplicate"
+        );
+    }
+
+    #[test]
+    fn layer_cache_survives_transform_animation() {
+        // Two paints of the same layer with DIFFERENT transforms
+        // should reuse the same cached pixmap — the whole point of
+        // transform-aware caching.
+        let cache: std::rc::Rc<std::cell::RefCell<LayerCache>> =
+            std::rc::Rc::new(std::cell::RefCell::new(LayerCache::new()));
+        PAINT_LAYER_CACHE.with(|s| *s.borrow_mut() = Some(cache.clone()));
+        // Both angles must produce non-identity transforms — rotate(0)
+        // is the identity and wouldn't trigger layer promotion.
+        let template = |angle: i32| -> String {
+            format!(
+                "<style>body{{margin:0}} \
+                 .l{{width:30px;height:30px;background:red;\
+                    transform:rotate({angle}deg)}}\
+                 </style><div class=l></div>"
+            )
+        };
+        let _ = render(&template(45), 80, 80);
+        let after_first: u64 = cache
+            .borrow()
+            .values()
+            .next()
+            .map(|e| e.hash)
+            .unwrap_or(0);
+        let _ = render(&template(90), 80, 80);
+        let after_second: u64 = cache
+            .borrow()
+            .values()
+            .next()
+            .map(|e| e.hash)
+            .unwrap_or(0);
+        PAINT_LAYER_CACHE.with(|s| s.borrow_mut().take());
+        assert_eq!(
+            cache.borrow().len(),
+            1,
+            "expected single cached entry across transform changes"
+        );
+        assert_eq!(
+            after_first, after_second,
+            "transform-only change should produce identical hashes"
         );
     }
 

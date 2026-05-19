@@ -20,7 +20,7 @@ up the work without re-deriving context.
 
 ## Just shipped
 
-- [x] **HTTP/2 connection pool** (this session) — the original
+- [x] `55dbf19` **HTTP/2 connection pool** — the original
       roadmap claim that `h2c.rs` / `h3c.rs` weren't wired was
       wrong: the live `net::Client` already does h3 → h2 → h1
       with ALPN-driven fallback and per-host blacklists. The

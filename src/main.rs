@@ -331,6 +331,9 @@ struct Browser {
     /// into. We swap this for whatever the wgpu presenter wants on
     /// each frame.
     framebuf: Vec<u32>,
+    /// Persistent BGRA byte buffer fed to the GPU each frame. Lives
+    /// on the Browser so we don't reallocate per redraw.
+    byte_buf: Vec<u8>,
     viewport_size: (u32, u32),
     scroll_y: f32,
     cursor: (f32, f32),
@@ -393,6 +396,7 @@ impl Browser {
             window: None,
             surface: None,
             framebuf: Vec::new(),
+            byte_buf: Vec::new(),
             viewport_size: (1024, 768),
             scroll_y: 0.0,
             cursor: (0.0, 0.0),
@@ -2035,18 +2039,22 @@ impl Browser {
             );
         }
 
-        // Repack u32 ARGB → BGRA bytes for the GPU upload. wgpu's
-        // `Bgra8UnormSrgb` matches a little-endian read of our u32s,
-        // but we treat it as bytes here for clarity.
-        let pixels_u8: Vec<u8> = buffer
-            .iter()
-            .flat_map(|p| {
-                let b = (*p & 0xFF) as u8;
-                let g = ((*p >> 8) & 0xFF) as u8;
-                let r = ((*p >> 16) & 0xFF) as u8;
-                [b, g, r, 0xFF]
-            })
-            .collect();
+        // Repack u32 ARGB → BGRA bytes for the GPU upload. We use a
+        // persistent buffer on Browser so we don't reallocate
+        // every frame (was: per-frame Vec<u8> via flat_map +
+        // collect, ~viewport*4 byte alloc per redraw).
+        let needed_bytes = buffer.len() * 4;
+        if self.byte_buf.len() != needed_bytes {
+            self.byte_buf.resize(needed_bytes, 0xFF);
+        }
+        for (i, p) in buffer.iter().enumerate() {
+            let off = i * 4;
+            self.byte_buf[off] = (*p & 0xFF) as u8;
+            self.byte_buf[off + 1] = ((*p >> 8) & 0xFF) as u8;
+            self.byte_buf[off + 2] = ((*p >> 16) & 0xFF) as u8;
+            self.byte_buf[off + 3] = 0xFF;
+        }
+        let pixels_u8: &[u8] = &self.byte_buf;
 
         // Build the GPU-side overlay list from the painter's
         // fixed-position pixmaps. The GpuPresenter samples each

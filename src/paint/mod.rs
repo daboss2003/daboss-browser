@@ -79,7 +79,16 @@ pub fn paint(
     painter.fill_background(Color::WHITE);
     let ctx = PaintCtx::root();
     painter.paint_subtree(dom, styles, tree, images, dom.document(), ctx);
-    Some(painter.pixmap)
+    // Hand the warm FontSystem + SwashCache back so the next
+    // paint reuses them instead of paying the fontdb scan again.
+    let Painter {
+        pixmap,
+        font_system,
+        swash_cache,
+    } = painter;
+    SHARED_FONT_SYSTEM.with(|slot| *slot.borrow_mut() = Some(font_system));
+    SHARED_SWASH.with(|slot| *slot.borrow_mut() = Some(swash_cache));
+    Some(pixmap)
 }
 
 /// Cached painted output for a layer-promoted element. The painter
@@ -194,21 +203,47 @@ struct Painter {
     swash_cache: SwashCache,
 }
 
+thread_local! {
+    /// Process-wide FontSystem + SwashCache. Re-using them across
+    /// paint passes is a significant perf win: `FontSystem::new()`
+    /// scans the system fontdb (hundreds of ms on first call) and
+    /// `SwashCache` holds glyph rasterisations that we'd otherwise
+    /// re-rasterise every redraw. Lazy-initialised on first paint;
+    /// the swash cache survives for the rest of the process.
+    static SHARED_FONT_SYSTEM: std::cell::RefCell<Option<FontSystem>> =
+        const { std::cell::RefCell::new(None) };
+    static SHARED_SWASH: std::cell::RefCell<Option<SwashCache>> =
+        const { std::cell::RefCell::new(None) };
+    /// Number of @font-face / FontFace.load fonts already loaded
+    /// into SHARED_FONT_SYSTEM, so we don't re-load the same bytes
+    /// on every paint as the registry grows.
+    static SHARED_FONTS_LOADED: std::cell::RefCell<usize> = const { std::cell::RefCell::new(0) };
+}
+
 impl Painter {
     fn new(width: u32, height: u32) -> Option<Self> {
-        Pixmap::new(width.max(1), height.max(1)).map(|pixmap| {
-            let mut font_system = FontSystem::new();
-            // Pull any JS-registered fonts (FontFace.load, @font-face)
-            // into this fontdb so `font-family: <custom>` matches.
+        let pixmap = Pixmap::new(width.max(1), height.max(1))?;
+        let font_system = SHARED_FONT_SYSTEM.with(|slot| {
+            let mut taken = slot.borrow_mut().take().unwrap_or_else(FontSystem::new);
+            // Top up with any newly-registered JS / @font-face
+            // sources since the last paint.
             let fonts = crate::js::fontloading::registered_font_bytes();
-            for (_family, bytes) in fonts {
-                font_system.db_mut().load_font_data(bytes);
+            let already = SHARED_FONTS_LOADED.with(|n| *n.borrow());
+            if fonts.len() > already {
+                for (_family, bytes) in fonts.iter().skip(already) {
+                    taken.db_mut().load_font_data(bytes.clone());
+                }
+                SHARED_FONTS_LOADED.with(|n| *n.borrow_mut() = fonts.len());
             }
-            Self {
-                pixmap,
-                font_system,
-                swash_cache: SwashCache::new(),
-            }
+            taken
+        });
+        let swash_cache = SHARED_SWASH
+            .with(|slot| slot.borrow_mut().take())
+            .unwrap_or_else(SwashCache::new);
+        Some(Self {
+            pixmap,
+            font_system,
+            swash_cache,
         })
     }
 

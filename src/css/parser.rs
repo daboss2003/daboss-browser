@@ -405,6 +405,7 @@ impl<'a> Parser<'a> {
                                 PseudoClass::Is(parse_inner_selector_list(arg))
                             }
                             "where" => PseudoClass::Where(parse_inner_selector_list(arg)),
+                            "has" => PseudoClass::Has(parse_inner_selector_list(arg)),
                             "nth-child" => PseudoClass::NthChild(parse_nth_arg(arg)),
                             "nth-of-type" => PseudoClass::NthOfType(parse_nth_arg(arg)),
                             "nth-last-child" => {
@@ -749,6 +750,11 @@ impl<'a> Parser<'a> {
                     let args = self.parse_function_args();
                     self.consume(')');
                     color_func_from_args(&args)
+                }
+                "color-mix" => {
+                    let args = self.parse_function_args();
+                    self.consume(')');
+                    color_mix_from_args(&args)
                 }
                 _ => {
                     // Unknown function — keep args so e.g. `transform:
@@ -1611,6 +1617,62 @@ fn lab_to_srgb(l: f32, a: f32, b: f32) -> (f32, f32, f32) {
     let lg = -0.9692660 * xd65 + 1.8760108 * yd65 + 0.0415560 * zd65;
     let lb = 0.0556434 * xd65 - 0.2040259 * yd65 + 1.0572252 * zd65;
     (linear_to_srgb(lr), linear_to_srgb(lg), linear_to_srgb(lb))
+}
+
+/// `color-mix(in <space>, <color1> [<pct>], <color2> [<pct>])` — mix
+/// two colours by mass. The `in <space>` prefix selects the
+/// interpolation space; for the toy we always mix in linear sRGB,
+/// which is close-enough for the common `oklch` / `srgb` spaces
+/// people target. Percentages default to 50% / 50%.
+fn color_mix_from_args(args: &[Value]) -> Option<Value> {
+    // Expected structure (parser flattens commas): keyword "in",
+    // keyword <space>, Color, [Percentage], Color, [Percentage].
+    // We skip until we find two Color values.
+    let mut colors: Vec<Color> = Vec::new();
+    let mut weights: Vec<Option<f32>> = Vec::new();
+    let mut last_was_color = false;
+    for v in args {
+        match v {
+            Value::Color(c) => {
+                colors.push(*c);
+                weights.push(None);
+                last_was_color = true;
+            }
+            Value::Percentage(p) if last_was_color => {
+                if let Some(slot) = weights.last_mut() {
+                    *slot = Some(p / 100.0);
+                }
+                last_was_color = false;
+            }
+            _ => {
+                last_was_color = false;
+            }
+        }
+    }
+    if colors.len() < 2 {
+        return None;
+    }
+    let (c1, c2) = (colors[0], colors[1]);
+    let (w1, w2) = match (weights[0], weights[1]) {
+        (None, None) => (0.5, 0.5),
+        (Some(a), None) => (a, 1.0 - a),
+        (None, Some(b)) => (1.0 - b, b),
+        (Some(a), Some(b)) => {
+            let total = (a + b).max(0.0001);
+            (a / total, b / total)
+        }
+    };
+    // Mix in linear sRGB by un-premultiplying then re-applying the
+    // gamma curve. Tolerates the toy's sRGB-only Color storage.
+    let lin = |c: u8| srgb_to_linear(c as f32 / 255.0);
+    let unlin = |x: f32| (linear_to_srgb(x) * 255.0).round().clamp(0.0, 255.0) as u8;
+    let mix = |a: u8, b: u8| unlin(lin(a) * w1 + lin(b) * w2);
+    Some(Value::Color(Color {
+        r: mix(c1.r, c2.r),
+        g: mix(c1.g, c2.g),
+        b: mix(c1.b, c2.b),
+        a: ((c1.a as f32 * w1 + c2.a as f32 * w2).round() as u8).clamp(0, 255),
+    }))
 }
 
 // color(space r g b [/ a]) — supports srgb, srgb-linear, display-p3.

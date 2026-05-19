@@ -354,18 +354,82 @@ fn domain_matches(host: &str, cookie_domain: &str) -> bool {
     host.as_bytes()[suffix_start - 1] == b'.'
 }
 
-/// Approximate eTLD+1 by taking the rightmost two DNS labels. This is
-/// correct for `.com`/`.net`/`.org` style TLDs and wrong for `.co.uk`
-/// / `.ac.jp` style — real browsers consult the Public Suffix List.
-/// Pulling PSL into the toy is a future-tightening; this gets us
-/// 90% of the way for the common case.
+/// Hand-curated subset of the Public Suffix List — the most common
+/// multi-label suffixes. Covers `.co.uk`, `.com.au`, `.github.io`,
+/// `.vercel.app`, etc. without bundling the full 13k-entry PSL.
+/// Real browsers consult the upstream PSL; this gets the
+/// top-of-the-long-tail right.
+const MULTI_LABEL_SUFFIXES: &[&str] = &[
+    // ccTLD second-level domains
+    "co.uk", "ac.uk", "gov.uk", "ltd.uk", "me.uk", "net.uk", "nhs.uk", "org.uk",
+    "com.au", "net.au", "org.au", "edu.au", "gov.au",
+    "co.nz", "net.nz", "org.nz", "ac.nz", "govt.nz",
+    "co.jp", "ac.jp", "ne.jp", "or.jp", "go.jp",
+    "com.br", "net.br", "org.br", "gov.br", "edu.br",
+    "co.kr", "ne.kr", "or.kr", "go.kr",
+    "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn",
+    "co.in", "net.in", "org.in", "gov.in",
+    "co.za", "org.za", "gov.za",
+    "com.mx", "org.mx",
+    "com.ar", "org.ar",
+    "com.sg", "org.sg",
+    "com.hk", "org.hk",
+    "com.tr",
+    "com.tw", "org.tw",
+    "com.my", "org.my",
+    // hosted-service PSL entries
+    "github.io",
+    "gitlab.io",
+    "vercel.app",
+    "netlify.app",
+    "herokuapp.com",
+    "azurewebsites.net",
+    "cloudfront.net",
+    "amazonaws.com",
+    "s3.amazonaws.com",
+    "appspot.com",
+    "firebaseapp.com",
+    "web.app",
+    "workers.dev",
+    "pages.dev",
+    "fly.dev",
+    "onrender.com",
+    "supabase.co",
+    "shopify.com",
+    "wordpress.com",
+    "blogspot.com",
+];
+
+/// Compute the registrable domain (eTLD+1) of `host`. Honours the
+/// curated multi-label suffix list above and falls back to the
+/// rightmost two DNS labels for everything else (correct for the
+/// long tail of two-label TLDs like .com / .net / .io).
 pub fn registrable_domain(host: &str) -> &str {
-    let Some(last_dot) = host.rfind('.') else {
-        return host;
+    // First, see if `host` ends in a known multi-label suffix.
+    // Pick the LONGEST match so a host like `static.s3.amazonaws.com`
+    // resolves against `s3.amazonaws.com` rather than the shorter
+    // `amazonaws.com` entry that also ends-matches.
+    let lower_host = host;
+    let best: Option<&&str> = MULTI_LABEL_SUFFIXES
+        .iter()
+        .filter(|s| {
+            let dot_then = format!(".{}", s);
+            lower_host.len() > s.len() && lower_host.ends_with(&dot_then)
+        })
+        .max_by_key(|s| s.len());
+    if let Some(suffix) = best {
+        let dot_then = format!(".{suffix}");
+        let prefix = &lower_host[..lower_host.len() - dot_then.len()];
+        let label_start = prefix.rfind('.').map(|i| i + 1).unwrap_or(0);
+        return &lower_host[label_start..];
+    }
+    // Fall back to the last-2-labels heuristic.
+    let Some(last_dot) = lower_host.rfind('.') else {
+        return lower_host;
     };
-    match host[..last_dot].rfind('.') {
-        Some(prior_dot) => &host[prior_dot + 1..],
-        None => host,
+    match lower_host[..last_dot].rfind('.') {
+        Some(prior_dot) => &lower_host[prior_dot + 1..],
+        None => lower_host,
     }
 }
 
@@ -608,6 +672,20 @@ mod tests {
         assert!(c.secure);
         assert!(c.http_only);
         assert!(c.expires_at.is_some());
+    }
+
+    #[test]
+    fn registrable_domain_handles_known_multi_label_suffixes() {
+        assert_eq!(registrable_domain("foo.bar.co.uk"), "bar.co.uk");
+        assert_eq!(registrable_domain("alice.github.io"), "alice.github.io");
+        assert_eq!(registrable_domain("user.gitlab.io"), "user.gitlab.io");
+        assert_eq!(
+            registrable_domain("static.s3.amazonaws.com"),
+            "static.s3.amazonaws.com"
+        );
+        // Plain TLDs still fall through.
+        assert_eq!(registrable_domain("www.example.com"), "example.com");
+        assert_eq!(registrable_domain("example.com"), "example.com");
     }
 
     #[test]

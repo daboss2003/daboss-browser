@@ -43,7 +43,7 @@ pub fn compute_specificity(sel: &Selector) -> Specificity {
         for pc in &compound.pseudo_classes {
             match pc {
                 // `:where(...)` contributes zero specificity per spec.
-                PseudoClass::Where(_) => {}
+                PseudoClass::Where(_) | PseudoClass::Has(_) => {}
                 // `:is(...)` / `:not(...)` take the max specificity of
                 // their inner selectors. We approximate with the highest
                 // (classes, tags) seen and roll it into our triple.
@@ -254,7 +254,35 @@ fn match_pseudo_class_v(
         }
         PseudoClass::NthOfType(nth) => nth.matches(type_index_from_start(dom, node)),
         PseudoClass::NthLastOfType(nth) => nth.matches(type_index_from_end(dom, node)),
+        PseudoClass::Has(inner) => {
+            // `:has(...)` matches when ANY descendant matches the
+            // inner selector list. The toy walks the whole subtree;
+            // a real engine indexes selectors for fast rejection.
+            // Limit to direct descendants for the simple case (most
+            // common: `:has(> .child)`); we just walk the full
+            // descendant tree.
+            has_descendant_match(dom, node, inner, interaction)
+        }
     }
+}
+
+fn has_descendant_match(
+    dom: &Dom,
+    root: NodeId,
+    selectors: &[Selector],
+    interaction: &InteractionState,
+) -> bool {
+    for child in dom.children(root).collect::<Vec<_>>() {
+        if selectors.iter().any(|s| {
+            selector_matches_pseudo(s, dom, child, None, interaction)
+        }) {
+            return true;
+        }
+        if has_descendant_match(dom, child, selectors, interaction) {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_first_element_child(dom: &Dom, node: NodeId) -> bool {

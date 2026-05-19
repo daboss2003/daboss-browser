@@ -309,6 +309,10 @@ pub enum PseudoClass {
     NthLastChild(Nth),
     /// `:nth-last-of-type(an+b)`.
     NthLastOfType(Nth),
+    /// `:has(<selectors>)` — matches if ANY descendant (or the
+    /// element itself for the leading-`:scope` variant) of the
+    /// element matches the inner selector list.
+    Has(Vec<Selector>),
 }
 
 #[derive(Debug, Clone, Copy)]

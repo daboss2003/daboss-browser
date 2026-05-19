@@ -20,7 +20,7 @@ up the work without re-deriving context.
 
 ## Just shipped
 
-- [x] **CSS masking** (this session) — `ComputedStyle` gains
+- [x] `1b5be15` **CSS masking** — `ComputedStyle` gains
       `mask_image: Option<BackgroundImage>` (reuses the existing
       `Url` / `LinearGradient` enum) + `mask_mode: MaskMode`
       (Alpha / Luminance / MatchSource). Cascade parses

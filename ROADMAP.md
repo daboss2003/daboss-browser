@@ -20,8 +20,7 @@ up the work without re-deriving context.
 
 ## Just shipped
 
-- [x] **Variable font axes wired into shape Attrs** (this
-      session) — `ComputedStyle` gains a parsed
+- [x] `bdcd3ed` **Variable font axes wired into shape Attrs** — `ComputedStyle` gains a parsed
       `font_variation_settings: Vec<(String, f32)>` (was a raw
       string before) and `font_stretch: u16` (the OS/2 width
       class). The cascade picks up `font-stretch` keywords

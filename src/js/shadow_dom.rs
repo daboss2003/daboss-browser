@@ -86,9 +86,155 @@ fn ce_define(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsVal
     let name = name_v.to_string(ctx)?.to_std_string_escaped();
     let ctor = args.get(1).cloned().unwrap_or(JsValue::undefined());
     CE_REGISTRY.with(|m| {
-        m.borrow_mut().insert(name, ctor);
+        m.borrow_mut().insert(name.clone(), ctor);
     });
+    // Walk the existing DOM and upgrade any element matching this
+    // tag — pages typically call `customElements.define(...)`
+    // AFTER the parser has placed the elements, so without this
+    // pass the constructor would never run.
+    let matches = super::with_dom(|dom| collect_matching_elements(dom, dom.document(), &name))
+        .unwrap_or_default();
+    for node_id in matches {
+        let handle = super::dom::make_element_handle(ctx, node_id);
+        try_upgrade_element(ctx, &name, &handle);
+    }
     Ok(JsValue::undefined())
+}
+
+fn collect_matching_elements(
+    dom: &crate::dom::Dom,
+    node: NodeId,
+    tag: &str,
+) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    walk_for_tag(dom, node, tag, &mut out);
+    out
+}
+
+fn walk_for_tag(dom: &crate::dom::Dom, node: NodeId, tag: &str, out: &mut Vec<NodeId>) {
+    if let NodeKind::Element { tag: t, .. } = &dom.node(node).kind {
+        if t.eq_ignore_ascii_case(tag) {
+            out.push(node);
+        }
+    }
+    for child in dom.children(node).collect::<Vec<_>>() {
+        walk_for_tag(dom, child, tag, out);
+    }
+}
+
+/// Run a registered custom element's constructor + lifecycle on
+/// `handle`. No-op when the tag isn't registered or the stored
+/// value isn't a callable. Skips elements that have already been
+/// upgraded (we tag them on the handle).
+pub fn try_upgrade_element(ctx: &mut Context, tag: &str, handle: &boa_engine::JsObject) {
+    let ctor_val = CE_REGISTRY.with(|m| m.borrow().get(tag).cloned());
+    let Some(ctor_val) = ctor_val else { return };
+    let Some(ctor_obj) = ctor_val.as_object() else { return };
+    let Some(ctor) = boa_engine::object::builtins::JsFunction::from_object(ctor_obj.clone())
+    else {
+        return;
+    };
+    let already_upgraded = handle
+        .get(js_string!("__ce_upgraded"), ctx)
+        .ok()
+        .map(|v| v.to_boolean())
+        .unwrap_or(false);
+    if already_upgraded {
+        return;
+    }
+    let _ = handle.set(
+        js_string!("__ce_upgraded"),
+        JsValue::from(true),
+        false,
+        ctx,
+    );
+    // Set the prototype to the constructor's `prototype` so that
+    // method calls (`connectedCallback`, `attributeChangedCallback`,
+    // any user methods) on the element handle resolve. Without
+    // this, `el.someMethod()` would fail.
+    if let Ok(proto_val) = ctor_obj.get(js_string!("prototype"), ctx) {
+        if let Some(proto_obj) = proto_val.as_object() {
+            let _ = handle.set_prototype(Some(proto_obj.clone()));
+        }
+    }
+    // Invoke the constructor with `this = element handle`.
+    let handle_val = JsValue::from(handle.clone());
+    let _ = ctor.call(&handle_val, &[], ctx);
+    // Fire connectedCallback if present. Spec semantics require
+    // the element to be in a "connected" tree; for the toy we
+    // fire optimistically — pages that gate on isConnected can
+    // still no-op.
+    if let Ok(cb_val) = handle.get(js_string!("connectedCallback"), ctx) {
+        if let Some(cb_obj) = cb_val.as_object() {
+            if let Some(cb) =
+                boa_engine::object::builtins::JsFunction::from_object(cb_obj.clone())
+            {
+                let _ = cb.call(&handle_val, &[], ctx);
+            }
+        }
+    }
+}
+
+/// Fire `attributeChangedCallback(name, oldValue, newValue, namespace?)`
+/// for a custom element when an observed attribute changes. The
+/// constructor's `observedAttributes` static array drives the list.
+pub fn fire_attribute_changed(
+    ctx: &mut Context,
+    tag: &str,
+    handle: &boa_engine::JsObject,
+    attr_name: &str,
+    old_value: Option<&str>,
+    new_value: Option<&str>,
+) {
+    let ctor_val = CE_REGISTRY.with(|m| m.borrow().get(tag).cloned());
+    let Some(ctor_val) = ctor_val else { return };
+    let Some(ctor_obj) = ctor_val.as_object() else { return };
+    // Read the static observedAttributes list.
+    let Ok(observed_val) = ctor_obj.get(js_string!("observedAttributes"), ctx) else {
+        return;
+    };
+    let Some(observed_obj) = observed_val.as_object() else {
+        return;
+    };
+    let len = observed_obj
+        .get(js_string!("length"), ctx)
+        .ok()
+        .and_then(|v| v.to_u32(ctx).ok())
+        .unwrap_or(0);
+    let mut watched = false;
+    for i in 0..len {
+        if let Ok(v) = observed_obj.get(i as u64, ctx) {
+            if let Ok(s) = v.to_string(ctx) {
+                if s.to_std_string_escaped().eq_ignore_ascii_case(attr_name) {
+                    watched = true;
+                    break;
+                }
+            }
+        }
+    }
+    if !watched {
+        return;
+    }
+    let Ok(cb_val) = handle.get(js_string!("attributeChangedCallback"), ctx) else {
+        return;
+    };
+    let Some(cb_obj) = cb_val.as_object() else { return };
+    let Some(cb) = boa_engine::object::builtins::JsFunction::from_object(cb_obj.clone()) else {
+        return;
+    };
+    let args = [
+        JsValue::from(js_string!(attr_name.to_string())),
+        match old_value {
+            Some(s) => JsValue::from(js_string!(s.to_string())),
+            None => JsValue::null(),
+        },
+        match new_value {
+            Some(s) => JsValue::from(js_string!(s.to_string())),
+            None => JsValue::null(),
+        },
+        JsValue::null(),
+    ];
+    let _ = cb.call(&JsValue::from(handle.clone()), &args, ctx);
 }
 
 fn ce_get(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {

@@ -935,12 +935,48 @@ fn element_set_attribute(this: &JsValue, args: &[JsValue], ctx: &mut Context) ->
             return Ok(JsValue::undefined());
         }
     }
-    with_dom_mut(|dom| dom.set_attribute(id, &name, value));
+    // Grab the old value before the mutation so a custom
+    // element's attributeChangedCallback sees the right `oldValue`.
+    let old_value = super::with_dom(|dom| {
+        if let crate::dom::NodeKind::Element { attrs, .. } = &dom.node(id).kind {
+            attrs
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&name))
+                .map(|(_, v)| v.clone())
+        } else {
+            None
+        }
+    })
+    .flatten();
+    let tag = super::with_dom(|dom| {
+        if let crate::dom::NodeKind::Element { tag, .. } = &dom.node(id).kind {
+            Some(tag.clone())
+        } else {
+            None
+        }
+    })
+    .flatten();
+    with_dom_mut(|dom| dom.set_attribute(id, &name, value.clone()));
     super::observers::push_mutation_record(super::observers::MutationRecord {
         kind: super::observers::MutationKind::Attributes,
         target: id,
-        attribute_name: Some(name),
+        attribute_name: Some(name.clone()),
     });
+    // If this element is a custom element with a registered
+    // constructor, fire attributeChangedCallback when the attr is
+    // in observedAttributes.
+    if let Some(tag) = tag {
+        if let Some(obj) = this.as_object() {
+            super::shadow_dom::fire_attribute_changed(
+                ctx,
+                &tag,
+                obj,
+                &name,
+                old_value.as_deref(),
+                Some(&value),
+            );
+        }
+    }
     Ok(JsValue::undefined())
 }
 
@@ -1037,9 +1073,18 @@ fn document_create_element(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
         return Ok(JsValue::null());
     };
     let tag = tag_val.to_string(ctx)?.to_std_string_escaped().to_ascii_lowercase();
+    let tag_for_upgrade = tag.clone();
     let id = super::with_dom_mut(|dom| dom.create_element(tag, Vec::new()));
     match id {
-        Some(id) => Ok(JsValue::from(make_element_handle(ctx, id))),
+        Some(id) => {
+            let handle = make_element_handle(ctx, id);
+            // If a custom element matches this tag, run its
+            // constructor + connectedCallback synchronously per
+            // spec (we don't have a parser-driven async upgrade
+            // queue; for a toy this is close enough).
+            super::shadow_dom::try_upgrade_element(ctx, &tag_for_upgrade, &handle);
+            Ok(JsValue::from(handle))
+        }
         None => Ok(JsValue::null()),
     }
 }

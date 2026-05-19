@@ -271,17 +271,27 @@ fn layout_block(
     let computed_content_height = child_y - content_y;
 
     let bp_v = border.top + border.bottom + padding.top + padding.bottom;
-    let mut content_height = match (style.height, intrinsic) {
-        (Dimension::Length(h), _) => {
+    // CSS aspect-ratio: when height is `auto` and the element has
+    // an aspect-ratio set, derive height from the resolved width.
+    // The reverse (width derived from height) would have to run
+    // earlier; we cover only the more common width-first case for
+    // now.
+    let aspect_derived_height = match (style.height, style.aspect_ratio) {
+        (Dimension::Auto, Some(ratio)) if ratio > 0.0 => Some(content_width / ratio),
+        _ => None,
+    };
+    let mut content_height = match (style.height, intrinsic, aspect_derived_height) {
+        (Dimension::Length(h), _, _) => {
             if style.box_sizing == BoxSizing::BorderBox {
                 (h - bp_v).max(0.0)
             } else {
                 h
             }
         }
+        (Dimension::Auto, _, Some(derived)) => derived,
         // Replaced element with `auto` height: use intrinsic height.
-        (Dimension::Auto, Some((_, ih))) => ih,
-        (Dimension::Percent(_), _) | (Dimension::Auto, None) => computed_content_height,
+        (Dimension::Auto, Some((_, ih)), None) => ih,
+        (Dimension::Percent(_), _, _) | (Dimension::Auto, None, None) => computed_content_height,
     };
     if let Some(min) = style.min_height {
         let min_h = if style.box_sizing == BoxSizing::BorderBox {

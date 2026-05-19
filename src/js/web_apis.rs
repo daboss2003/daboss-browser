@@ -44,6 +44,13 @@ pub fn install(ctx: &mut Context) {
     install_background_sync(ctx);
     install_web_transport(ctx);
     install_picture_in_picture(ctx);
+    install_payment_request(ctx);
+    install_web_locks(ctx);
+    install_compute_pressure(ctx);
+    install_idle_detector(ctx);
+    install_storage_buckets(ctx);
+    install_document_pip(ctx);
+    install_webxr(ctx);
 }
 
 thread_local! {
@@ -830,4 +837,311 @@ fn install_picture_in_picture(ctx: &mut Context) {
 
 fn pip_exit(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     Ok(JsPromise::resolve(JsValue::undefined(), ctx).into())
+}
+
+// =================== Payment Request ===================
+
+fn install_payment_request(ctx: &mut Context) {
+    let _ = ctx.register_global_callable(
+        js_string!("PaymentRequest"),
+        2,
+        NativeFunction::from_fn_ptr(payment_request_ctor),
+    );
+}
+
+fn payment_request_ctor(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let realm = ctx.realm().clone();
+    let show = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(payment_request_show),
+    )
+    .build();
+    let can_make = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(payment_request_can_make),
+    )
+    .build();
+    Ok(JsValue::from(
+        ObjectInitializer::new(ctx)
+            .property(js_string!("show"), JsValue::from(show), Attribute::READONLY)
+            .property(
+                js_string!("canMakePayment"),
+                JsValue::from(can_make),
+                Attribute::READONLY,
+            )
+            .property(js_string!("abort"), JsValue::from(0u32), Attribute::READONLY)
+            .build(),
+    ))
+}
+
+fn payment_request_show(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let err: JsError = boa_engine::JsNativeError::error()
+        .with_message("AbortError: no payment UI available")
+        .into();
+    Ok(JsPromise::reject(err, ctx).into())
+}
+
+fn payment_request_can_make(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    Ok(JsPromise::resolve(JsValue::from(false), ctx).into())
+}
+
+// =================== Web Locks ===================
+
+fn install_web_locks(ctx: &mut Context) {
+    let realm = ctx.realm().clone();
+    let request = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(locks_request),
+    )
+    .build();
+    let query = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(locks_query),
+    )
+    .build();
+    let locks = ObjectInitializer::new(ctx)
+        .property(js_string!("request"), JsValue::from(request), Attribute::READONLY)
+        .property(js_string!("query"), JsValue::from(query), Attribute::READONLY)
+        .build();
+    nav_set(ctx, "locks", JsValue::from(locks));
+}
+
+/// `navigator.locks.request(name, [opts], callback)` — runs the
+/// callback exclusively for the given lock name. Single-threaded
+/// runtime → no real contention; we invoke the callback
+/// synchronously inside the resolved Promise and return its result.
+fn locks_request(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    // Last argument is the callback; preceding args are name + opts.
+    let cb_val = args.iter().rev().find(|v| v.is_callable()).cloned();
+    let Some(cb_val) = cb_val else {
+        return Ok(JsPromise::resolve(JsValue::undefined(), ctx).into());
+    };
+    let Some(cb_obj) = cb_val.as_object() else {
+        return Ok(JsPromise::resolve(JsValue::undefined(), ctx).into());
+    };
+    let Some(cb) = boa_engine::object::builtins::JsFunction::from_object(cb_obj.clone()) else {
+        return Ok(JsPromise::resolve(JsValue::undefined(), ctx).into());
+    };
+    // Synthetic lock object passed to the callback.
+    let lock = ObjectInitializer::new(ctx)
+        .property(
+            js_string!("name"),
+            JsValue::from(js_string!("toy-lock")),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("mode"),
+            JsValue::from(js_string!("exclusive")),
+            Attribute::READONLY,
+        )
+        .build();
+    let result = cb
+        .call(&JsValue::undefined(), &[JsValue::from(lock)], ctx)
+        .unwrap_or(JsValue::undefined());
+    Ok(JsPromise::resolve(result, ctx).into())
+}
+
+fn locks_query(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let held = boa_engine::object::builtins::JsArray::new(ctx);
+    let pending = boa_engine::object::builtins::JsArray::new(ctx);
+    let empty = ObjectInitializer::new(ctx)
+        .property(js_string!("held"), JsValue::from(held), Attribute::READONLY)
+        .property(
+            js_string!("pending"),
+            JsValue::from(pending),
+            Attribute::READONLY,
+        )
+        .build();
+    Ok(JsPromise::resolve(JsValue::from(empty), ctx).into())
+}
+
+// =================== Compute Pressure / Idle Detector ===================
+
+fn install_compute_pressure(ctx: &mut Context) {
+    let _ = ctx.register_global_callable(
+        js_string!("PressureObserver"),
+        1,
+        NativeFunction::from_fn_ptr(pressure_observer_ctor),
+    );
+}
+
+fn pressure_observer_ctor(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let realm = ctx.realm().clone();
+    let observe = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(|_, _, ctx: &mut Context| {
+            Ok(JsPromise::resolve(JsValue::undefined(), ctx).into())
+        }),
+    )
+    .build();
+    Ok(JsValue::from(
+        ObjectInitializer::new(ctx)
+            .property(
+                js_string!("observe"),
+                JsValue::from(observe),
+                Attribute::READONLY,
+            )
+            .property(js_string!("unobserve"), JsValue::from(0u32), Attribute::READONLY)
+            .property(js_string!("disconnect"), JsValue::from(0u32), Attribute::READONLY)
+            .build(),
+    ))
+}
+
+fn install_idle_detector(ctx: &mut Context) {
+    let _ = ctx.register_global_callable(
+        js_string!("IdleDetector"),
+        0,
+        NativeFunction::from_fn_ptr(idle_detector_ctor),
+    );
+}
+
+fn idle_detector_ctor(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let realm = ctx.realm().clone();
+    let start = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(|_, _, ctx: &mut Context| {
+            Ok(JsPromise::resolve(JsValue::undefined(), ctx).into())
+        }),
+    )
+    .build();
+    let request_permission = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(|_, _, ctx: &mut Context| {
+            Ok(JsPromise::resolve(JsValue::from(js_string!("denied")), ctx).into())
+        }),
+    )
+    .build();
+    Ok(JsValue::from(
+        ObjectInitializer::new(ctx)
+            .property(js_string!("start"), JsValue::from(start), Attribute::READONLY)
+            .property(
+                js_string!("requestPermission"),
+                JsValue::from(request_permission),
+                Attribute::READONLY,
+            )
+            .property(
+                js_string!("userState"),
+                JsValue::from(js_string!("active")),
+                Attribute::READONLY,
+            )
+            .property(
+                js_string!("screenState"),
+                JsValue::from(js_string!("unlocked")),
+                Attribute::READONLY,
+            )
+            .build(),
+    ))
+}
+
+// =================== Storage Buckets ===================
+
+fn install_storage_buckets(ctx: &mut Context) {
+    let realm = ctx.realm().clone();
+    let open_or_create = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(|_, _, ctx: &mut Context| {
+            // Real spec returns a StorageBucket; we resolve a stub
+            // with the minimal getDirectory/clear surface.
+            let bucket = ObjectInitializer::new(ctx)
+                .property(
+                    js_string!("name"),
+                    JsValue::from(js_string!("default")),
+                    Attribute::READONLY,
+                )
+                .property(js_string!("persisted"), JsValue::from(true), Attribute::READONLY)
+                .build();
+            Ok(JsPromise::resolve(JsValue::from(bucket), ctx).into())
+        }),
+    )
+    .build();
+    let keys_fn = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(|_, _, ctx: &mut Context| {
+            let arr = boa_engine::object::builtins::JsArray::new(ctx);
+            Ok(JsPromise::resolve(JsValue::from(arr), ctx).into())
+        }),
+    )
+    .build();
+    let storage_buckets = ObjectInitializer::new(ctx)
+        .property(
+            js_string!("open"),
+            JsValue::from(open_or_create.clone()),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("keys"),
+            JsValue::from(keys_fn),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("delete"),
+            JsValue::from(0u32),
+            Attribute::READONLY,
+        )
+        .build();
+    nav_set(ctx, "storageBuckets", JsValue::from(storage_buckets));
+}
+
+// =================== Document PiP ===================
+
+fn install_document_pip(ctx: &mut Context) {
+    let realm = ctx.realm().clone();
+    let request_window = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(|_, _, ctx: &mut Context| {
+            let err: JsError = boa_engine::JsNativeError::error()
+                .with_message("NotSupportedError: document PiP not available")
+                .into();
+            Ok(JsPromise::reject(err, ctx).into())
+        }),
+    )
+    .build();
+    let doc_pip = ObjectInitializer::new(ctx)
+        .property(
+            js_string!("requestWindow"),
+            JsValue::from(request_window),
+            Attribute::READONLY,
+        )
+        .build();
+    let _ = ctx.register_global_property(
+        js_string!("documentPictureInPicture"),
+        doc_pip,
+        Attribute::WRITABLE | Attribute::CONFIGURABLE,
+    );
+}
+
+// =================== WebXR ===================
+
+fn install_webxr(ctx: &mut Context) {
+    let realm = ctx.realm().clone();
+    let is_supported = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(|_, _, ctx: &mut Context| {
+            Ok(JsPromise::resolve(JsValue::from(false), ctx).into())
+        }),
+    )
+    .build();
+    let request_session = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(|_, _, ctx: &mut Context| {
+            let err: JsError = boa_engine::JsNativeError::error()
+                .with_message("NotSupportedError: WebXR session unavailable")
+                .into();
+            Ok(JsPromise::reject(err, ctx).into())
+        }),
+    )
+    .build();
+    let xr = ObjectInitializer::new(ctx)
+        .property(
+            js_string!("isSessionSupported"),
+            JsValue::from(is_supported),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("requestSession"),
+            JsValue::from(request_session),
+            Attribute::READONLY,
+        )
+        .build();
+    nav_set(ctx, "xr", JsValue::from(xr));
 }

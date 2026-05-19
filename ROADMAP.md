@@ -20,6 +20,28 @@ up the work without re-deriving context.
 
 ## Just shipped
 
+- [x] **HLS VOD playback via m3u8 driver** (this session) — new
+      `net::hls` module: parses master + media playlists per
+      RFC 8216 (EXTM3U guard, EXT-X-STREAM-INF attribute lists
+      with quoted-comma handling, EXTINF segment durations,
+      EXT-X-TARGETDURATION, EXT-X-ENDLIST). Exports
+      `looks_like_hls(content_type, url)` (detects
+      `application/vnd.apple.mpegurl` MIME or `.m3u8` suffix),
+      `pick_top_variant(master)` (max-bandwidth picker), and
+      `fetch_and_concat(client, url, ctx)` that follows a master
+      playlist to its highest-bandwidth variant, sequentially
+      fetches each segment, and returns one concatenated buffer
+      ffmpeg can decode. `main::prefetch_video_elements` now
+      detects HLS in both the URL extension and the
+      Content-Type response header and runs the driver instead
+      of feeding a playlist body to ffmpeg (which it would
+      refuse). Six unit tests cover master + media playlist
+      parsing, the EXTM3U guard, top-variant selection, MIME +
+      suffix detection, and quoted-comma attribute parsing.
+      Limitations: VOD only (live playlist refresh not done),
+      no mid-playback bitrate switching, no DASH `.mpd`, no
+      hardware decode (still CPU via ffmpeg), no
+      EXT-X-MAP / EXT-X-KEY / byte-range / discontinuity tags.
 - [x] `bdcd3ed` **Variable font axes wired into shape Attrs** — `ComputedStyle` gains a parsed
       `font_variation_settings: Vec<(String, f32)>` (was a raw
       string before) and `font_stretch: u16` (the OS/2 width
@@ -327,9 +349,10 @@ off as they ship.
   positioning matching Chrome; multi-language fallback per
   Unicode block; emoji presentation selectors. Variation axes
   fold into Attrs as of this session — see "Just shipped".
-- [ ] **MSE / DASH / HLS adaptive streaming + hardware decode** —
-  ffmpeg decode works but MSE.appendBuffer doesn't truly stitch
-  segments; no manifest parser; no codec h/w accel.
+- [ ] **DASH manifest + adaptive bitrate switching** — HLS VOD
+  playback ships this session, but DASH `.mpd` manifests and
+  mid-playback bitrate switching are still TODO. Hardware
+  decode also remains CPU via ffmpeg.
 - [ ] **Real AudioWorklet realtime graph** — current AudioContext
   is stubbed at the source-node level; an actual realtime graph
   with sample-accurate scheduling is missing.

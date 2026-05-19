@@ -4690,8 +4690,56 @@ impl Browser {
             let Ok(abs) = base.join(&src) else { continue };
             let url_str = abs.to_string();
             let ctx = net::RequestContext::new().with_initiator(base.clone());
-            let Ok(resp) = self.client.get_with(&url_str, ctx) else { continue };
+            // HLS shortcut: when the URL or response Content-Type
+            // points at an `.m3u8`, run the playlist driver to
+            // pull every segment and concatenate before handing
+            // off to ffmpeg. Avoids spinning up ffmpeg on a
+            // playlist body (which it would refuse anyway).
+            if net::hls::looks_like_hls(None, &abs) {
+                let bytes = match net::hls::fetch_and_concat(
+                    &self.client,
+                    &abs,
+                    ctx.clone(),
+                ) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("[hls] {url_str}: {e}");
+                        continue;
+                    }
+                };
+                let Some(element) =
+                    video::VideoElement::from_bytes(bytes, autoplay, loop_)
+                else {
+                    eprintln!("[video] could not start decode for {url_str}");
+                    continue;
+                };
+                elements.borrow_mut().insert(id, element);
+                continue;
+            }
+            let Ok(resp) = self.client.get_with(&url_str, ctx.clone()) else { continue };
             if !(200..300).contains(&resp.status) {
+                continue;
+            }
+            let content_type = resp
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                .map(|(_, v)| v.as_str());
+            if net::hls::looks_like_hls(content_type, &abs) {
+                let bytes = match net::hls::fetch_and_concat(&self.client, &abs, ctx) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("[hls] {url_str}: {e}");
+                        continue;
+                    }
+                };
+                let Some(element) =
+                    video::VideoElement::from_bytes(bytes, autoplay, loop_)
+                else {
+                    eprintln!("[video] could not start decode for {url_str}");
+                    continue;
+                };
+                elements.borrow_mut().insert(id, element);
                 continue;
             }
             // Big videos likely spilled to disk — hand the path

@@ -18,13 +18,26 @@ up the work without re-deriving context.
 
 (nothing in flight — next item picks up from Pending)
 
+## Just shipped
+
+- [x] **Real WebGL 2 surface** (this session) —
+  `getContext("webgl2")` now routes to a versioned constructor
+  that, on top of the existing WebGL 1 entry points, adds:
+  VAOs, sampler / query / sync / transform-feedback handle
+  constructors, instanced draws + vertex-attrib divisor +
+  integer attrib pointer, 3D / array textures + immutable
+  storage, MRT (drawBuffers / clearBufferxx), uniform buffer
+  block surface, the `uniform*ui` + non-square matrix uniform
+  setters, blit/invalidate/readPixels/renderbuffer-multisample,
+  and ~90 new GLenum constants pages probe (UNIFORM_BUFFER,
+  RGBA8, COLOR_ATTACHMENT[0-7], SYNC_GPU_COMMANDS_COMPLETE,
+  etc.). Mostly state-tracking stubs that accept the call shape
+  so feature-detection + initial setup don't trip; real
+  driver-level wiring to wgpu equivalents is incremental
+  follow-up.
+
 ## Pending (each is its own session)
 
-- [ ] **Real WebGL 2 surface** — beyond the partial WebGL 1.
-  Many entry points (`createVertexArray`, `texStorage*`,
-  `bufferData` with offsets, `bindBufferRange`, transform
-  feedback, sampler objects, sync objects). Glow / Three.js
-  pages need this.
 - [ ] **Real bidi text shaping** — Arabic + Hebrew + LTR mixed
   lines. Needs ICU UBidi or harfbuzz bidi support. cosmic-text
   has some bidi knobs to enable.

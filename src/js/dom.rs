@@ -2160,7 +2160,10 @@ fn element_get_context(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> J
         if !is_canvas {
             return Ok(JsValue::null());
         }
-        return Ok(super::webgl::get_or_create_context(ctx, id));
+        let is_webgl2 = ty == "webgl2";
+        return Ok(super::webgl::get_or_create_context_versioned(
+            ctx, id, is_webgl2,
+        ));
     }
     if ty == "webgpu" {
         let is_canvas = with_dom(|dom| {

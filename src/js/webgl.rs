@@ -120,6 +120,24 @@ thread_local! {
 const CTX_NODE_KEY: &str = "__webgl_node";
 
 pub fn get_or_create_context(ctx: &mut Context, node: NodeId) -> JsValue {
+    get_or_create_context_versioned(ctx, node, false)
+}
+
+/// Same as `get_or_create_context` but lets the caller select
+/// WebGL 1 vs WebGL 2. The WebGL 2 surface keeps the entire WebGL
+/// 1 entry-point list and adds: VAOs, instanced draw / divisor,
+/// integer attrib pointer, 3D / array textures + immutable
+/// storage, multiple render targets, sampler objects, query
+/// objects, uniform buffer block binding, transform feedback,
+/// sync objects, and the `uniform*ui` family. Most additions are
+/// state-tracking stubs that accept the call shape so pages can
+/// initialise without crashing; a real driver wires each to the
+/// underlying wgpu equivalent.
+pub fn get_or_create_context_versioned(
+    ctx: &mut Context,
+    node: NodeId,
+    is_webgl2: bool,
+) -> JsValue {
     let state = JS_WEBGL.with(|slot| {
         let map = slot.borrow();
         map.as_ref().map(|rc| {
@@ -209,10 +227,243 @@ pub fn get_or_create_context(ctx: &mut Context, node: NodeId) -> JsValue {
         b.function(f.clone(), js_string!(*name), *arity);
     }
 
+    if is_webgl2 {
+        // WebGL 2 additions. Most are state-tracking stubs that
+        // accept the call so feature-detection + initial setup
+        // calls don't trip; a few (VAOs, sampler / query objects)
+        // mint real handles via webgl_make_handle so subsequent
+        // bind/use calls match.
+        let webgl2_stateful: &[(&str, NativeFunction, usize)] = &[
+            ("createVertexArray", NativeFunction::from_fn_ptr(webgl_make_handle), 0),
+            ("createSampler", NativeFunction::from_fn_ptr(webgl_make_handle), 0),
+            ("createQuery", NativeFunction::from_fn_ptr(webgl_make_handle), 0),
+            ("createTransformFeedback", NativeFunction::from_fn_ptr(webgl_make_handle), 0),
+            ("fenceSync", NativeFunction::from_fn_ptr(webgl_make_handle), 2),
+            ("getUniformBlockIndex", NativeFunction::from_fn_ptr(webgl_make_handle), 2),
+            ("getFragDataLocation", NativeFunction::from_fn_ptr(webgl_make_handle), 2),
+        ];
+        for (name, f, arity) in webgl2_stateful {
+            b.function(f.clone(), js_string!(*name), *arity);
+        }
+
+        let webgl2_stubs: &[&str] = &[
+            "bindVertexArray",
+            "deleteVertexArray",
+            "isVertexArray",
+            "bindSampler",
+            "deleteSampler",
+            "samplerParameteri",
+            "samplerParameterf",
+            "isSampler",
+            "bindBufferBase",
+            "bindBufferRange",
+            "uniformBlockBinding",
+            "getActiveUniformBlockParameter",
+            "getActiveUniformBlockName",
+            "getActiveUniforms",
+            "getUniformIndices",
+            "drawArraysInstanced",
+            "drawElementsInstanced",
+            "drawRangeElements",
+            "drawBuffers",
+            "vertexAttribDivisor",
+            "vertexAttribIPointer",
+            "vertexAttribI4i",
+            "vertexAttribI4ui",
+            "texImage3D",
+            "texSubImage3D",
+            "texStorage2D",
+            "texStorage3D",
+            "copyTexSubImage3D",
+            "compressedTexImage3D",
+            "compressedTexSubImage3D",
+            "uniform1ui",
+            "uniform2ui",
+            "uniform3ui",
+            "uniform4ui",
+            "uniform1uiv",
+            "uniform2uiv",
+            "uniform3uiv",
+            "uniform4uiv",
+            "uniformMatrix2x3fv",
+            "uniformMatrix3x2fv",
+            "uniformMatrix2x4fv",
+            "uniformMatrix4x2fv",
+            "uniformMatrix3x4fv",
+            "uniformMatrix4x3fv",
+            "beginQuery",
+            "endQuery",
+            "deleteQuery",
+            "isQuery",
+            "getQuery",
+            "getQueryParameter",
+            "beginTransformFeedback",
+            "endTransformFeedback",
+            "pauseTransformFeedback",
+            "resumeTransformFeedback",
+            "bindTransformFeedback",
+            "deleteTransformFeedback",
+            "isTransformFeedback",
+            "transformFeedbackVaryings",
+            "getTransformFeedbackVarying",
+            "deleteSync",
+            "isSync",
+            "clientWaitSync",
+            "waitSync",
+            "getSyncParameter",
+            "invalidateFramebuffer",
+            "invalidateSubFramebuffer",
+            "readBuffer",
+            "copyBufferSubData",
+            "getBufferSubData",
+            "renderbufferStorageMultisample",
+            "blitFramebuffer",
+            "framebufferTextureLayer",
+            "getInternalformatParameter",
+            "readPixels",
+            "clearBufferiv",
+            "clearBufferuiv",
+            "clearBufferfv",
+            "clearBufferfi",
+        ];
+        for name in webgl2_stubs {
+            b.function(
+                NativeFunction::from_fn_ptr(webgl_stub),
+                js_string!(*name),
+                1,
+            );
+        }
+
+        // WebGL 2 introduces a handful of additional GLenum
+        // constants over WebGL 1. Pages probe these via
+        // `gl.UNIFORM_BUFFER`, `gl.RGBA8`, etc.
+        for (k, v) in webgl2_constants() {
+            b.property(js_string!(*k), JsValue::from(*v), Attribute::READONLY);
+        }
+    }
+
     for (k, v) in webgl_constants() {
         b.property(js_string!(k), JsValue::from(v), Attribute::READONLY);
     }
     JsValue::from(b.build())
+}
+
+/// Mint a fresh opaque handle to back a WebGL 2 `createXxx`
+/// call. The handle is just a monotonic u32 stored on the
+/// state's handle counter — pages compare it to `null` to detect
+/// allocation failure.
+fn webgl_make_handle(this: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(state) = state_for(this, ctx) else {
+        return Ok(JsValue::null());
+    };
+    let h = new_handle(&state);
+    Ok(JsValue::from(h))
+}
+
+/// GLenum values that WebGL 2 adds on top of WebGL 1. Curated for
+/// the constants pages most commonly probe; not every single new
+/// enum is listed here (the spec defines hundreds).
+fn webgl2_constants() -> &'static [(&'static str, u32)] {
+    &[
+        // Buffer targets
+        ("COPY_READ_BUFFER", 0x8F36),
+        ("COPY_WRITE_BUFFER", 0x8F37),
+        ("PIXEL_PACK_BUFFER", 0x88EB),
+        ("PIXEL_UNPACK_BUFFER", 0x88EC),
+        ("TRANSFORM_FEEDBACK_BUFFER", 0x8C8E),
+        ("UNIFORM_BUFFER", 0x8A11),
+        // Buffer usage hints
+        ("STREAM_READ", 0x88E1),
+        ("STREAM_COPY", 0x88E2),
+        ("STATIC_READ", 0x88E5),
+        ("STATIC_COPY", 0x88E6),
+        ("DYNAMIC_READ", 0x88E9),
+        ("DYNAMIC_COPY", 0x88EA),
+        // Sized internal formats
+        ("R8", 0x8229),
+        ("R16F", 0x822D),
+        ("R32F", 0x822E),
+        ("R8UI", 0x8232),
+        ("RG8", 0x822B),
+        ("RG16F", 0x822F),
+        ("RG32F", 0x8230),
+        ("RGB8", 0x8051),
+        ("SRGB8", 0x8C41),
+        ("RGB565", 0x8D62),
+        ("RGB16F", 0x881B),
+        ("RGB32F", 0x8815),
+        ("RGBA8", 0x8058),
+        ("SRGB8_ALPHA8", 0x8C43),
+        ("RGB5_A1", 0x8057),
+        ("RGBA4", 0x8056),
+        ("RGBA16F", 0x881A),
+        ("RGBA32F", 0x8814),
+        ("DEPTH_COMPONENT24", 0x81A6),
+        ("DEPTH_COMPONENT32F", 0x8CAC),
+        ("DEPTH24_STENCIL8", 0x88F0),
+        // Texture targets
+        ("TEXTURE_3D", 0x806F),
+        ("TEXTURE_2D_ARRAY", 0x8C1A),
+        ("TEXTURE_WRAP_R", 0x8072),
+        ("TEXTURE_MIN_LOD", 0x813A),
+        ("TEXTURE_MAX_LOD", 0x813B),
+        ("TEXTURE_BASE_LEVEL", 0x813C),
+        ("TEXTURE_MAX_LEVEL", 0x813D),
+        ("TEXTURE_COMPARE_MODE", 0x884C),
+        ("TEXTURE_COMPARE_FUNC", 0x884D),
+        ("MAX_3D_TEXTURE_SIZE", 0x8073),
+        ("MAX_ARRAY_TEXTURE_LAYERS", 0x88FF),
+        ("MAX_COLOR_ATTACHMENTS", 0x8CDF),
+        ("MAX_DRAW_BUFFERS", 0x8824),
+        ("COLOR_ATTACHMENT0", 0x8CE0),
+        ("COLOR_ATTACHMENT1", 0x8CE1),
+        ("COLOR_ATTACHMENT2", 0x8CE2),
+        ("COLOR_ATTACHMENT3", 0x8CE3),
+        ("COLOR_ATTACHMENT4", 0x8CE4),
+        ("COLOR_ATTACHMENT5", 0x8CE5),
+        ("COLOR_ATTACHMENT6", 0x8CE6),
+        ("COLOR_ATTACHMENT7", 0x8CE7),
+        // Pixel types
+        ("UNSIGNED_INT_2_10_10_10_REV", 0x8368),
+        ("UNSIGNED_INT_10F_11F_11F_REV", 0x8C3B),
+        ("UNSIGNED_INT_5_9_9_9_REV", 0x8C3E),
+        ("FLOAT_32_UNSIGNED_INT_24_8_REV", 0x8DAD),
+        ("UNSIGNED_INT_24_8", 0x84FA),
+        ("HALF_FLOAT", 0x140B),
+        // Query targets
+        ("ANY_SAMPLES_PASSED", 0x8C2F),
+        ("ANY_SAMPLES_PASSED_CONSERVATIVE", 0x8D6A),
+        ("TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN", 0x8C88),
+        ("QUERY_RESULT", 0x8866),
+        ("QUERY_RESULT_AVAILABLE", 0x8867),
+        // Sync
+        ("SYNC_GPU_COMMANDS_COMPLETE", 0x9117),
+        ("ALREADY_SIGNALED", 0x911A),
+        ("TIMEOUT_EXPIRED", 0x911B),
+        ("CONDITION_SATISFIED", 0x911C),
+        ("WAIT_FAILED", 0x911D),
+        ("SYNC_FLUSH_COMMANDS_BIT", 0x00000001),
+        // Misc
+        ("READ_BUFFER", 0x0C02),
+        ("FRAGMENT_SHADER_DERIVATIVE_HINT", 0x8B8B),
+        ("MIN", 0x8007),
+        ("MAX", 0x8008),
+        ("MIN_PROGRAM_TEXEL_OFFSET", 0x8904),
+        ("MAX_PROGRAM_TEXEL_OFFSET", 0x8905),
+        ("MAX_VARYING_COMPONENTS", 0x8B4B),
+        ("MAX_VERTEX_OUTPUT_COMPONENTS", 0x9122),
+        ("MAX_FRAGMENT_INPUT_COMPONENTS", 0x9125),
+        ("RASTERIZER_DISCARD", 0x8C89),
+        ("VERTEX_ARRAY_BINDING", 0x85B5),
+        ("UNPACK_ROW_LENGTH", 0x0CF2),
+        ("UNPACK_IMAGE_HEIGHT", 0x806E),
+        ("UNPACK_SKIP_ROWS", 0x0CF3),
+        ("UNPACK_SKIP_PIXELS", 0x0CF4),
+        ("UNPACK_SKIP_IMAGES", 0x806D),
+        ("PACK_ROW_LENGTH", 0x0D02),
+        ("PACK_SKIP_ROWS", 0x0D03),
+        ("PACK_SKIP_PIXELS", 0x0D04),
+    ]
 }
 
 fn state_for(this: &JsValue, ctx: &mut Context) -> Option<Rc<RefCell<WebGlState>>> {

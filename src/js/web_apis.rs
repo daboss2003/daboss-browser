@@ -51,6 +51,8 @@ pub fn install(ctx: &mut Context) {
     install_storage_buckets(ctx);
     install_document_pip(ctx);
     install_webxr(ctx);
+    install_css_houdini(ctx);
+    install_webextensions_stub(ctx);
 }
 
 thread_local! {
@@ -1106,6 +1108,182 @@ fn install_document_pip(ctx: &mut Context) {
     let _ = ctx.register_global_property(
         js_string!("documentPictureInPicture"),
         doc_pip,
+        Attribute::WRITABLE | Attribute::CONFIGURABLE,
+    );
+}
+
+// =================== CSS Houdini (Paint/Layout/Animation Worklets) ===================
+
+fn install_css_houdini(ctx: &mut Context) {
+    let realm = ctx.realm().clone();
+    let make_worklet = |ctx: &mut Context| -> JsObject {
+        let add_module = boa_engine::object::FunctionObjectBuilder::new(
+            &realm,
+            NativeFunction::from_fn_ptr(|_, _, ctx: &mut Context| {
+                // Real Worklets fetch + module-evaluate the URL in a
+                // separate context. We accept the call so pages
+                // don't crash on feature detection but actually
+                // executing the worklet's paint() is not wired.
+                Ok(JsPromise::resolve(JsValue::undefined(), ctx).into())
+            }),
+        )
+        .build();
+        ObjectInitializer::new(ctx)
+            .property(
+                js_string!("addModule"),
+                JsValue::from(add_module),
+                Attribute::READONLY,
+            )
+            .build()
+    };
+    let paint_worklet = make_worklet(ctx);
+    let layout_worklet = make_worklet(ctx);
+    let animation_worklet = make_worklet(ctx);
+    let register_property = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(|_, _, _: &mut Context| Ok(JsValue::undefined())),
+    )
+    .build();
+    let supports_fn = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        // Permissive: assume the page's property/value is supported.
+        // Refining this requires the value parser; this matches what
+        // most polyfill-feature-detection paths actually look at.
+        NativeFunction::from_fn_ptr(|_, _, _: &mut Context| Ok(JsValue::from(true))),
+    )
+    .build();
+    let escape_fn = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(css_escape),
+    )
+    .build();
+    let css = ObjectInitializer::new(ctx)
+        .property(
+            js_string!("paintWorklet"),
+            JsValue::from(paint_worklet),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("layoutWorklet"),
+            JsValue::from(layout_worklet),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("animationWorklet"),
+            JsValue::from(animation_worklet),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("registerProperty"),
+            JsValue::from(register_property),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("supports"),
+            JsValue::from(supports_fn),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("escape"),
+            JsValue::from(escape_fn),
+            Attribute::READONLY,
+        )
+        .build();
+    let _ = ctx.register_global_property(
+        js_string!("CSS"),
+        css,
+        Attribute::WRITABLE | Attribute::CONFIGURABLE,
+    );
+}
+
+fn css_escape(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    // Spec: prefixes / escapes characters that would otherwise be
+    // syntactically meaningful in a CSS identifier or string. Our
+    // toy escapes the small set most pages actually feed in:
+    // ASCII control + the characters in `\" '\\#.[]:>~+*$|^?`.
+    let Some(arg) = args.first() else {
+        return Ok(JsValue::from(js_string!("")));
+    };
+    let s = arg.to_string(ctx)?.to_std_string_escaped();
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_ascii_control() || c == ' ' {
+            out.push_str(&format!("\\{:x} ", c as u32));
+        } else if "\"'\\#.[]:>~+*$|^?,;@".contains(c) {
+            out.push('\\');
+            out.push(c);
+        } else {
+            out.push(c);
+        }
+    }
+    Ok(JsValue::from(js_string!(out)))
+}
+
+// =================== WebExtensions shim ===================
+
+fn install_webextensions_stub(ctx: &mut Context) {
+    // Just enough surface for pages that feature-detect
+    // `chrome.runtime.id` or `browser.runtime.getManifest`. We
+    // aren't actually an extension host — calls that try to
+    // install or message an extension reject.
+    let realm = ctx.realm().clone();
+    let get_manifest = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(|_, _, ctx: &mut Context| {
+            Ok(JsValue::from(ObjectInitializer::new(ctx).build()))
+        }),
+    )
+    .build();
+    let send_message = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(|_, _, ctx: &mut Context| {
+            let err: JsError = boa_engine::JsNativeError::error()
+                .with_message("Receiving end does not exist")
+                .into();
+            Ok(JsPromise::reject(err, ctx).into())
+        }),
+    )
+    .build();
+    let runtime = ObjectInitializer::new(ctx)
+        .property(js_string!("id"), JsValue::null(), Attribute::READONLY)
+        .property(
+            js_string!("getManifest"),
+            JsValue::from(get_manifest),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("sendMessage"),
+            JsValue::from(send_message),
+            Attribute::READONLY,
+        )
+        .property(
+            js_string!("lastError"),
+            JsValue::null(),
+            Attribute::WRITABLE,
+        )
+        .build();
+    let chrome_obj = ObjectInitializer::new(ctx)
+        .property(
+            js_string!("runtime"),
+            JsValue::from(runtime.clone()),
+            Attribute::READONLY,
+        )
+        .build();
+    let browser_obj = ObjectInitializer::new(ctx)
+        .property(
+            js_string!("runtime"),
+            JsValue::from(runtime),
+            Attribute::READONLY,
+        )
+        .build();
+    let _ = ctx.register_global_property(
+        js_string!("chrome"),
+        chrome_obj,
+        Attribute::WRITABLE | Attribute::CONFIGURABLE,
+    );
+    let _ = ctx.register_global_property(
+        js_string!("browser"),
+        browser_obj,
         Attribute::WRITABLE | Attribute::CONFIGURABLE,
     );
 }

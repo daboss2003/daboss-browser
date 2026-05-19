@@ -20,6 +20,29 @@ up the work without re-deriving context.
 
 ## Just shipped
 
+- [x] **CSS Paint Worklets actually executing** (this session)
+      — new `js::paint_worklet` module owns a per-document
+      `PAINT_WORKLETS` registry (`name -> class JsObject`) and a
+      per-element `PAINT_WORKLET_COMMANDS` table of recorded
+      `DrawCmd`s. `CSS.paintWorklet.addModule(url)` no longer
+      stubs out — it fetches the URL through the existing
+      `JS_FETCH_CLIENT` (data: URLs are decoded inline) and
+      evaluates the body in the document's Context, so any
+      `registerPaint(name, Class)` call populates the registry
+      live. `registerPaint` itself is now a real global. CSS
+      gains a `BackgroundImage::PaintWorklet { name }` variant;
+      the cascade recognises `background-image: paint(name)`. A
+      new `JsEngine::dispatch_paint_worklets()` runs before each
+      paint pass — it walks the box tree, finds every element
+      with a worklet background, instantiates the class via
+      `new`, and calls `paint(ctx, geom)` against a tiny recorder
+      canvas that captures `fillStyle = "..."` + `fillRect(...)`
+      calls into the per-node command table. Paint then replays
+      the commands with the element's rect as the origin. The
+      canvas shim parses hex / rgb() / rgba() / named-colour
+      fill styles. Limitations: only fillRect is supported (path
+      ops are TODO); we collapse to a single shared boa Context
+      instead of the spec's isolated Worklet context.
 - [x] `6d39ee5` **First-Party Sets + CHIPS partitioned cookies** — new
       `net::first_party_set` module with a curated `(member,
       primary)` table covering Google, Microsoft, GitHub, and
@@ -227,10 +250,6 @@ up the work without re-deriving context.
 
 ## Pending (each is its own session)
 
-- [ ] **CSS Houdini paint/layout/animation worklets actually
-  executing** — needs a separate boa Context per worklet,
-  custom-paint canvas API, glue to call `paint()` during
-  rendering.
 - [ ] **WebExtensions runtime (real)** — implement enough of
   `chrome.*` so MV3 extensions can load. Massive.
 

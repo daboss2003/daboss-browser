@@ -711,6 +711,10 @@ pub enum BackgroundImage {
         angle_deg: f32,
         stops: Vec<(f32, Color)>, // (position 0..1, color)
     },
+    /// `background-image: paint(name)` — CSS Paint Worklet. The
+    /// referenced worklet runs at paint time; its draw commands are
+    /// rasterised into the element's background.
+    PaintWorklet { name: String },
 }
 
 /// How `mask-image` is interpreted per-pixel. `MatchSource` is the

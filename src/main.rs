@@ -538,7 +538,7 @@ impl Browser {
                 Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()))
             })
             .clone();
-        let js_engine = js::JsEngine::with_security(
+        let mut js_engine = js::JsEngine::with_security(
             &mut dom,
             Some(self.client.clone()),
             Some(parsed.clone()),
@@ -635,6 +635,7 @@ impl Browser {
         paint::PAINT_CAPTURE_BINDINGS.with(|slot| {
             *slot.borrow_mut() = Some(js_engine.capture_bindings());
         });
+        js_engine.dispatch_paint_worklets(&mut dom, &style_tree, &box_tree);
         let painted = paint::paint(
             &dom,
             &style_tree,
@@ -988,6 +989,11 @@ impl Browser {
         paint::PAINT_FIXED_OVERLAYS.with(|slot| {
             *slot.borrow_mut() = Some(page.fixed_overlays.clone());
         });
+        // Run CSS Paint Worklets so any `background-image: paint(name)`
+        // backgrounds have draw commands waiting in the per-node
+        // thread-local table the painter consults.
+        page.js
+            .dispatch_paint_worklets(&mut page.dom, &page.styles, &box_tree);
         let painted = paint::paint(
             &page.dom,
             &page.styles,

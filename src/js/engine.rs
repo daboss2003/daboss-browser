@@ -823,6 +823,50 @@ impl JsEngine {
         self.uninstall_thread_locals(dom, dom_rc, listeners_rc);
     }
 
+    /// Run every registered CSS Paint Worklet against the elements
+    /// that reference it via `background-image: paint(name)`. Each
+    /// invocation records `DrawCmd`s keyed by the element's NodeId;
+    /// the painter replays them during its next pass. Safe to call
+    /// once per paint pass.
+    pub fn dispatch_paint_worklets(
+        &mut self,
+        dom: &mut Dom,
+        styles: &crate::css::StyleTree,
+        box_tree: &crate::layout::BoxTree,
+    ) {
+        use crate::css::BackgroundImage;
+        // Snapshot the elements that need worklet invocation up
+        // front. We collect into a Vec so we don't hold the
+        // box-tree borrow across the JS call below.
+        let mut work: Vec<(NodeId, String, f32, f32)> = Vec::new();
+        for (idx, slot) in box_tree.boxes.iter().enumerate() {
+            let Some(boxx) = slot else { continue };
+            let style = styles.get(NodeId::from_raw(idx as u32));
+            let Some(BackgroundImage::PaintWorklet { name }) = &style.background_image
+            else {
+                continue;
+            };
+            work.push((
+                NodeId::from_raw(idx as u32),
+                name.clone(),
+                boxx.rect.width,
+                boxx.rect.height,
+            ));
+        }
+        if work.is_empty() {
+            crate::js::paint_worklet::clear_commands();
+            return;
+        }
+        let (dom_rc, listeners_rc) = self.install_thread_locals(dom);
+        // Fresh draw-command table per pass — stale entries from
+        // before a relayout shouldn't survive.
+        crate::js::paint_worklet::clear_commands();
+        for (node, name, w, h) in work {
+            crate::js::paint_worklet::invoke_for(&mut self.ctx, node, &name, w, h);
+        }
+        self.uninstall_thread_locals(dom, dom_rc, listeners_rc);
+    }
+
     /// Dispatch with explicit per-event properties (MouseEvent coords,
     /// KeyboardEvent.key, etc.). Bubbling is controlled by `init.bubbles`.
     pub fn dispatch_event_with(

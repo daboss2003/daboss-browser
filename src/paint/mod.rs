@@ -871,7 +871,57 @@ impl Painter {
             Some(BackgroundImage::LinearGradient { angle_deg, stops }) => {
                 self.paint_linear_gradient(x, y, w, h, *angle_deg, stops, ctx);
             }
+            Some(BackgroundImage::PaintWorklet { .. }) => {
+                // Replay draw commands recorded during the engine's
+                // pre-paint worklet pass (keyed by element NodeId).
+                self.paint_worklet_replay(node, x, y, w, h, ctx);
+            }
             None => {}
+        }
+    }
+
+    fn paint_worklet_replay(
+        &mut self,
+        node: NodeId,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        ctx: PaintCtx,
+    ) {
+        let Some(cmds) = crate::js::paint_worklet::commands_for(node) else {
+            return;
+        };
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        for cmd in cmds {
+            match cmd {
+                crate::js::paint_worklet::DrawCmd::FillRect { dx, dy, dw, dh, color } => {
+                    let mut c = color;
+                    c.a = ((c.a as f32) * ctx.alpha).clamp(0.0, 255.0) as u8;
+                    if c.a == 0 {
+                        continue;
+                    }
+                    let rx = x + dx.max(0.0);
+                    let ry = y + dy.max(0.0);
+                    let rw = dw.min(w - dx.max(0.0));
+                    let rh = dh.min(h - dy.max(0.0));
+                    if rw <= 0.0 || rh <= 0.0 {
+                        continue;
+                    }
+                    let mut paint = Paint::default();
+                    paint.set_color(color_to_sk(c));
+                    if let Some(rect) = SkRect::from_xywh(rx, ry, rw, rh) {
+                        self.pixmap.fill_rect(
+                            rect,
+                            &paint,
+                            Transform::identity(),
+                            None,
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -1084,6 +1134,12 @@ impl Painter {
                     stops,
                     mask_ctx,
                 );
+            }
+            Some(BackgroundImage::PaintWorklet { .. }) => {
+                // Mask via paint worklet not yet supported — the
+                // surrounding pass falls back to a fully-transparent
+                // mask (i.e. the subtree is hidden), which is the
+                // safe default.
             }
             None => {}
         }
@@ -2038,6 +2094,61 @@ mod tests {
         let r = data[idx];
         // White (255) inverts to black (0). Allow for premultiply rounding.
         assert!(r < 20, "expected dark after invert, got r = {r}");
+    }
+
+    #[test]
+    fn paint_worklet_replays_fill_rect_commands_into_pixmap() {
+        use crate::dom::NodeId;
+        use crate::js::paint_worklet::{self, DrawCmd};
+        // Seed a draw command directly so the test stays isolated
+        // from boa — we exercise the painter's replay path only.
+        paint_worklet::clear_all();
+        // The target element is the .x div: it sits at body.margin=0
+        // so its rect.x == 0, rect.y == 0, width = 20, height = 20.
+        // We pre-populate commands keyed by its NodeId after a quick
+        // discovery render.
+        let html = "<style>body { margin: 0; } \
+                    .x { width: 20px; height: 20px; \
+                         background-image: paint(stripes); }</style>\
+                    <div class=x></div>";
+        let dom = crate::html::parse(html);
+        // Discover the .x div's NodeId.
+        let mut found: Option<NodeId> = None;
+        for i in 0..dom.node_count() {
+            let n = NodeId::from_raw(i as u32);
+            if let crate::dom::NodeKind::Element { tag, attrs } = &dom.node(n).kind {
+                if tag == "div"
+                    && attrs.iter().any(|(k, v)| k == "class" && v == "x")
+                {
+                    found = Some(n);
+                    break;
+                }
+            }
+        }
+        let node = found.expect("found .x div");
+        // Seed a single-rect command: red square covering the whole
+        // background.
+        paint_worklet::seed_commands_for(
+            node,
+            vec![DrawCmd::FillRect {
+                dx: 0.0,
+                dy: 0.0,
+                dw: 20.0,
+                dh: 20.0,
+                color: crate::css::Color::rgb(220, 30, 30),
+            }],
+        );
+        let pixmap = render(html, 30, 30);
+        let data = pixmap.data();
+        let idx = (5 * 30 + 5) * 4;
+        let r = data[idx];
+        let g = data[idx + 1];
+        let b = data[idx + 2];
+        assert!(
+            r > 180 && g < 70 && b < 70,
+            "expected red from worklet replay, got rgb=({r},{g},{b})"
+        );
+        paint_worklet::clear_all();
     }
 
     #[test]

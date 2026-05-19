@@ -1552,6 +1552,18 @@ fn background_image_from(v: &Value) -> Option<BackgroundImage> {
             angle_deg: *angle_deg,
             stops: stops.clone(),
         }),
+        Value::Function { name, args } if name == "paint" => {
+            // First positional arg is the worklet name (a CSS
+            // identifier). Anything else is silently ignored — the
+            // spec passes extra args through `inputArguments`, which
+            // we don't support yet.
+            args.iter().find_map(|a| match a {
+                Value::Keyword(k) if k != "," => Some(BackgroundImage::PaintWorklet {
+                    name: k.clone(),
+                }),
+                _ => None,
+            })
+        }
         Value::List(items) => items.iter().find_map(background_image_from),
         Value::Keyword(k) if k == "none" => None,
         _ => None,

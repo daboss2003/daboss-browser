@@ -60,6 +60,7 @@ pub(crate) mod media;
 pub(crate) mod mse;
 pub(crate) mod observers;
 pub(crate) mod offscreen;
+pub mod paint_worklet;
 pub(crate) mod opfs;
 pub(crate) mod performance;
 pub(crate) mod permissions;

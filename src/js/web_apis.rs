@@ -1116,14 +1116,31 @@ fn install_document_pip(ctx: &mut Context) {
 
 fn install_css_houdini(ctx: &mut Context) {
     let realm = ctx.realm().clone();
-    let make_worklet = |ctx: &mut Context| -> JsObject {
+    // Paint Worklet: addModule(url) actually fetches the script (or
+    // decodes a `data:` URL) and evaluates it in the current
+    // context so `registerPaint(...)` populates the live registry.
+    // The spec runs each worklet in its own isolated Context for
+    // security; we collapse to one context for the toy. The
+    // separate `registerPaint` global is installed by
+    // `install_paint_worklet_globals` below.
+    let paint_add_module = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(paint_worklet_add_module),
+    )
+    .build();
+    let paint_worklet = ObjectInitializer::new(ctx)
+        .property(
+            js_string!("addModule"),
+            JsValue::from(paint_add_module),
+            Attribute::READONLY,
+        )
+        .build();
+    // Layout / animation worklets remain unimplemented — keep
+    // `addModule` as a resolving no-op so feature detection passes.
+    let make_stub_worklet = |ctx: &mut Context| -> JsObject {
         let add_module = boa_engine::object::FunctionObjectBuilder::new(
             &realm,
             NativeFunction::from_fn_ptr(|_, _, ctx: &mut Context| {
-                // Real Worklets fetch + module-evaluate the URL in a
-                // separate context. We accept the call so pages
-                // don't crash on feature detection but actually
-                // executing the worklet's paint() is not wired.
                 Ok(JsPromise::resolve(JsValue::undefined(), ctx).into())
             }),
         )
@@ -1136,9 +1153,8 @@ fn install_css_houdini(ctx: &mut Context) {
             )
             .build()
     };
-    let paint_worklet = make_worklet(ctx);
-    let layout_worklet = make_worklet(ctx);
-    let animation_worklet = make_worklet(ctx);
+    let layout_worklet = make_stub_worklet(ctx);
+    let animation_worklet = make_stub_worklet(ctx);
     let register_property = boa_engine::object::FunctionObjectBuilder::new(
         &realm,
         NativeFunction::from_fn_ptr(|_, _, _: &mut Context| Ok(JsValue::undefined())),
@@ -1194,6 +1210,116 @@ fn install_css_houdini(ctx: &mut Context) {
         css,
         Attribute::WRITABLE | Attribute::CONFIGURABLE,
     );
+    // `registerPaint` is a free global per spec — it's not bound to
+    // a worklet object. Inside the (shared) Context it resolves to
+    // our native that captures the class into `PAINT_WORKLETS`.
+    let register_paint_fn = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(crate::js::paint_worklet::register_paint),
+    )
+    .build();
+    let _ = ctx.register_global_property(
+        js_string!("registerPaint"),
+        JsValue::from(register_paint_fn),
+        Attribute::WRITABLE | Attribute::CONFIGURABLE,
+    );
+}
+
+/// `CSS.paintWorklet.addModule(url)` — fetches the worklet source
+/// and evaluates it in the current context. The eval surfaces
+/// `registerPaint(...)` calls which populate the paint-worklet
+/// registry. Returns a resolved promise either way; if the fetch
+/// fails we still resolve (per spec the failure mode is to drop the
+/// module silently).
+fn paint_worklet_add_module(
+    _this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let url = args
+        .first()
+        .and_then(|v| v.as_string().map(|s| s.to_std_string_escaped()))
+        .unwrap_or_default();
+    // Resolve the URL against the document base + grab the body.
+    // `data:` URLs are handled inline so tests don't need a network
+    // round-trip.
+    if let Some(body) = fetch_worklet_body(&url) {
+        let _ = ctx.eval(boa_engine::Source::from_bytes(body.as_bytes()));
+    }
+    Ok(JsPromise::resolve(JsValue::undefined(), ctx).into())
+}
+
+fn fetch_worklet_body(url: &str) -> Option<String> {
+    if let Some(rest) = url.strip_prefix("data:") {
+        // `data:[<mime>[;base64]],<payload>`. We tolerate any mime,
+        // base64-decode if flagged, percent-decode otherwise.
+        let (header, payload) = rest.split_once(',')?;
+        let is_base64 = header
+            .split(';')
+            .any(|seg| seg.trim().eq_ignore_ascii_case("base64"));
+        if is_base64 {
+            let bytes = paint_worklet_base64_decode(payload)?;
+            return String::from_utf8(bytes).ok();
+        }
+        return Some(paint_worklet_percent_decode(payload));
+    }
+    // HTTP(S) fetch via the JS fetch client (already installed for
+    // sync fetch). Errors surface as None.
+    let base = super::engine::JS_BASE_URL.with(|s| s.borrow().clone())?;
+    let absolute = base.join(url).ok()?;
+    let client = super::engine::JS_FETCH_CLIENT.with(|s| s.borrow().clone())?;
+    let resp = client.get(absolute.as_str()).ok()?;
+    if resp.status >= 400 {
+        return None;
+    }
+    String::from_utf8(resp.body.clone()).ok()
+}
+
+fn paint_worklet_base64_decode(s: &str) -> Option<Vec<u8>> {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+    for &b in bytes {
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => break,
+            b' ' | b'\n' | b'\r' | b'\t' => continue,
+            _ => return None,
+        };
+        buf = (buf << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1u32 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+fn paint_worklet_percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    out.push(byte);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn css_escape(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {

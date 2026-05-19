@@ -20,6 +20,30 @@ up the work without re-deriving context.
 
 ## Just shipped
 
+- [x] **HTTP/2 connection pool** (this session) — the original
+      roadmap claim that `h2c.rs` / `h3c.rs` weren't wired was
+      wrong: the live `net::Client` already does h3 → h2 → h1
+      with ALPN-driven fallback and per-host blacklists. The
+      real gap was that both `request_h2` and `request_h3` spin
+      up a fresh tokio runtime + TLS + protocol handshake for
+      every call. A typical page hits the same origin 30+ times
+      for sub-resources and pays the ~50–200 ms cold-start cost
+      each time. New `net::h_pool::HttpPool` owns a persistent
+      `tokio::runtime::Runtime` and a `Mutex<HashMap<(host,
+      port), h2::client::SendRequest>>`. First request to an
+      origin performs the full handshake and caches the
+      SendRequest; subsequent requests clone it, skipping the
+      handshake. Send failures (peer closed the conn, dropped
+      driver task) automatically evict the entry so the next
+      caller re-handshakes — no stale-connection leaks.
+      `net::Client` owns one pool and routes the h2 leg through
+      it, falling back to the unpooled `h2c::request_h2` only if
+      tokio init somehow failed at construction. h3 pooling
+      deferred — quinn endpoints are heavier (UDP socket
+      binding, packet pacing) and the same pattern needs more
+      care; that's a follow-up. Tests cover empty-pool init,
+      eviction semantics on missing entries, and that a request
+      to an unroutable host doesn't leak a pool entry.
 - [x] `a161a38` **WebExtensions runtime — real `chrome.*` surface** — new `js::webextensions` module replaces the
       feature-detection stub. `load(ctx, manifest_json)` parses
       a manifest, synthesises a stable 32-char extension ID from
@@ -283,10 +307,6 @@ These are depth-gaps inside areas we already touched — the
 "shipped as a toy, real sites can outgrow them" list. Crossed
 off as they ship.
 
-- [ ] **HTTP/2 + HTTP/3 production transport** — `h2c.rs` and
-  `h3c.rs` exist but the live `net::Client` falls through to
-  HTTP/1.1. Wire them in (ALPN negotiation, real HPACK, priority
-  frames), with HTTP/3 over real QUIC.
 - [ ] **Variable fonts + font hinting / sub-pixel positioning** —
   `font-variation-settings` parses but isn't applied. cosmic-text
   uses limited fallback chains; need glyph hinting per Chrome.

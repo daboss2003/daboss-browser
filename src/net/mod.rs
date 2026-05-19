@@ -4,6 +4,7 @@ mod cookies;
 mod csp;
 mod dns;
 pub mod first_party_set;
+mod h_pool;
 mod error;
 mod h2c;
 mod h3c;
@@ -104,6 +105,10 @@ pub struct Client {
     /// Hosts known to prefer HTTP/1.1 (we tried h2 ALPN and the server
     /// negotiated http/1.1 or refused). Keyed by `(host_lower, port)`.
     h2_blacklist: RefCell<HashSet<(String, u16)>>,
+    /// Persistent tokio runtime + h2 connection cache. `None` if
+    /// tokio init failed at startup; in that case the h2 path falls
+    /// through to HTTP/1.1.
+    h_pool: Option<h_pool::HttpPool>,
     /// Hosts that refused our HTTP/3 attempt — or for which QUIC is
     /// blocked locally. Same shape / lifetime as `h2_blacklist`. We
     /// only try h3 once per host before falling back permanently for
@@ -139,6 +144,7 @@ impl Client {
             pool: RefCell::new(std::collections::HashMap::new()),
             h2_blacklist: RefCell::new(HashSet::new()),
             h3_blacklist: RefCell::new(HashSet::new()),
+            h_pool: h_pool::HttpPool::new(),
             block_third_party_cookies: true,
         }
     }
@@ -513,18 +519,38 @@ impl Client {
         let response = if let Some(r) = h3_response {
             r
         } else if use_tls && !self.h2_blacklist.borrow().contains(&h2_key) {
-            let h2_response = match h2c::request_h2(
-                &self.tls,
-                &host,
-                port,
-                &request.method,
-                &request.path,
-                &request.headers,
-                request.body.clone(),
-                self.connect_timeout,
-                self.read_timeout,
-                self.max_response_bytes,
-            ) {
+            // Prefer the persistent pool when available; it caches
+            // `SendRequest` handles across requests so we skip the
+            // TLS + h2 handshake on every sub-resource. If pool
+            // init failed at construction we fall through to the
+            // per-request runtime path.
+            let h2_outcome = match self.h_pool.as_ref() {
+                Some(pool) => pool.request_h2(
+                    &self.tls,
+                    &host,
+                    port,
+                    &request.method,
+                    &request.path,
+                    &request.headers,
+                    request.body.clone(),
+                    self.connect_timeout,
+                    self.read_timeout,
+                    self.max_response_bytes,
+                ),
+                None => h2c::request_h2(
+                    &self.tls,
+                    &host,
+                    port,
+                    &request.method,
+                    &request.path,
+                    &request.headers,
+                    request.body.clone(),
+                    self.connect_timeout,
+                    self.read_timeout,
+                    self.max_response_bytes,
+                ),
+            };
+            let h2_response = match h2_outcome {
                 h2c::H2Outcome::Ok(resp) => Some(resp),
                 h2c::H2Outcome::FallbackToH1 => {
                     self.h2_blacklist.borrow_mut().insert(h2_key.clone());

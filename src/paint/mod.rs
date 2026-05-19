@@ -103,6 +103,24 @@ pub struct CachedLayer {
     pub box_origin: (f32, f32),
     /// Padding added around the box for transformed-layer overflow.
     pub pad: u32,
+    /// Monotonic tick of the last paint that referenced this
+    /// entry. Drives LRU eviction when the cache is full.
+    pub last_used: u64,
+}
+
+/// Monotonic tick incremented every time the cache promotes an
+/// entry (insert or reuse). Used as `CachedLayer.last_used` for
+/// LRU eviction.
+fn next_cache_tick() -> u64 {
+    LAYER_CACHE_TICK.with(|t| {
+        let mut v = t.borrow_mut();
+        *v = v.wrapping_add(1);
+        *v
+    })
+}
+
+thread_local! {
+    static LAYER_CACHE_TICK: std::cell::RefCell<u64> = const { std::cell::RefCell::new(0) };
 }
 
 /// Cap on cached layers. Each entry holds a Pixmap (≈ 4 bytes per
@@ -325,7 +343,9 @@ impl Painter {
         let layer_h = (b.rect.height.ceil() as u32).max(1) + pad * 2;
         let hash = compute_layer_hash(dom, styles, tree, node);
 
-        // Fast path: previous frame's pixmap is still valid.
+        // Fast path: previous frame's pixmap is still valid. We
+        // clone bytes inside the borrow, then bump `last_used` on
+        // the entry so the LRU evicter favours stale ones.
         let cached_pixmap_opt: Option<Pixmap> = {
             let cache = cache_rc.borrow();
             cache.get(&node).and_then(|entry| {
@@ -333,9 +353,6 @@ impl Painter {
                     && entry.pixmap.width() == layer_w
                     && entry.pixmap.height() == layer_h
                 {
-                    // Clone the pixmap bytes so we can release the
-                    // borrow before composite (composite re-borrows
-                    // self.pixmap).
                     let mut p = Pixmap::new(entry.pixmap.width(), entry.pixmap.height())?;
                     p.data_mut().copy_from_slice(entry.pixmap.data());
                     Some(p)
@@ -345,6 +362,10 @@ impl Painter {
             })
         };
         if let Some(cached) = cached_pixmap_opt {
+            let tick = next_cache_tick();
+            if let Some(entry) = cache_rc.borrow_mut().get_mut(&node) {
+                entry.last_used = tick;
+            }
             self.dispatch_layer_composite(&cached, b.rect, pad, parent_ctx, style);
             return true;
         }
@@ -382,12 +403,15 @@ impl Painter {
         if let Some(mut store_copy) = Pixmap::new(painted.width(), painted.height()) {
             store_copy.data_mut().copy_from_slice(painted.data());
             let mut cache = cache_rc.borrow_mut();
-            // Bound the cache; drop a random entry when full. We
-            // don't track LRU order yet — frequent re-evictions
-            // would need that, but a steady-state animation only
-            // touches a handful of layers.
+            // Bound the cache; LRU-evict the least-recently-used
+            // entry. Steady-state animations touch a handful of
+            // layers; under-watered tabs lose stale ones first.
             if cache.len() >= LAYER_CACHE_CAP {
-                if let Some(victim) = cache.keys().next().copied() {
+                if let Some(victim) = cache
+                    .iter()
+                    .min_by_key(|(_, e)| e.last_used)
+                    .map(|(k, _)| *k)
+                {
                     cache.remove(&victim);
                 }
             }
@@ -398,6 +422,7 @@ impl Painter {
                     hash,
                     box_origin: (b.rect.x, b.rect.y),
                     pad,
+                    last_used: next_cache_tick(),
                 },
             );
         }

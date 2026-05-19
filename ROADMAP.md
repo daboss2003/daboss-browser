@@ -20,7 +20,7 @@ up the work without re-deriving context.
 
 ## Just shipped
 
-- [x] **HLS VOD playback via m3u8 driver** (this session) — new
+- [x] `a9a9044` **HLS VOD playback via m3u8 driver** — new
       `net::hls` module: parses master + media playlists per
       RFC 8216 (EXTM3U guard, EXT-X-STREAM-INF attribute lists
       with quoted-comma handling, EXTINF segment durations,

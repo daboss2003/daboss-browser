@@ -26,7 +26,7 @@ use cosmic_text::{
 use tiny_skia::Pixmap;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
@@ -208,6 +208,11 @@ struct Page {
     focus: Option<dom::NodeId>,
     /// Per-`<input>` typed value. Keyed by the input's NodeId.
     inputs: std::collections::HashMap<dom::NodeId, String>,
+    /// In-progress IME composition strings, per focused input. The
+    /// paint pipeline reads this to show the pre-edit text alongside
+    /// the committed input value; the OS hasn't accepted the
+    /// keystrokes yet (CJK candidate window etc.).
+    input_preedit: std::collections::HashMap<dom::NodeId, String>,
     /// Rendered iframe contents, keyed by the iframe's NodeId in this page.
     iframes: std::collections::HashMap<dom::NodeId, IframeContent>,
     /// Audio elements keyed by their `<audio>` element id, prefetched
@@ -659,6 +664,7 @@ impl Browser {
             hover: None,
             focus: None,
             inputs,
+            input_preedit: std::collections::HashMap::new(),
             iframes,
             audio: audio_map,
             video: video_map,
@@ -1219,8 +1225,22 @@ impl Browser {
         if !changed {
             return;
         }
+        // Toggle the OS IME based on whether the new focus is an
+        // editable input. Without this, winit never delivers
+        // `WindowEvent::Ime(...)` and CJK / dead-key composition is
+        // dropped on the floor.
+        let editable = node
+            .and_then(|n| self.page.as_ref().map(|p| (p, n)))
+            .map(|(p, n)| is_editable_input(&p.dom, n))
+            .unwrap_or(false);
+        if let Some(w) = &self.window {
+            w.set_ime_allowed(editable);
+        }
         if let Some(p) = self.page.as_mut() {
             p.focus = node;
+            // Stale preedit from a previous focus shouldn't visually
+            // linger.
+            p.input_preedit.clear();
         }
         self.recascade_and_paint();
     }
@@ -1520,6 +1540,94 @@ impl Browser {
             self.recascade_and_paint();
         }
         r
+    }
+
+    /// Translate a winit IME event into composition-event dispatch +
+    /// per-input preedit / committed text. Active only when an
+    /// editable input is focused; otherwise ignored.
+    fn handle_ime(&mut self, ime: Ime) {
+        let Some(focus_node) = self.page.as_ref().and_then(|p| p.focus) else {
+            return;
+        };
+        match ime {
+            Ime::Enabled | Ime::Disabled => {
+                // No-op visually; just make sure stale preedit is
+                // cleared when the IME pops off.
+                if let Some(page) = self.page.as_mut() {
+                    page.input_preedit.remove(&focus_node);
+                }
+            }
+            Ime::Preedit(text, _cursor_range) => {
+                let had_preedit = self
+                    .page
+                    .as_ref()
+                    .map(|p| p.input_preedit.contains_key(&focus_node))
+                    .unwrap_or(false);
+                let new_empty = text.is_empty();
+                // Fire compositionstart on the first non-empty preedit
+                // of a sequence; compositionend when it goes empty.
+                if !had_preedit && !new_empty {
+                    self.dispatch_composition_event("compositionstart", "");
+                }
+                if let Some(page) = self.page.as_mut() {
+                    if new_empty {
+                        page.input_preedit.remove(&focus_node);
+                    } else {
+                        page.input_preedit.insert(focus_node, text.clone());
+                    }
+                }
+                if !new_empty {
+                    self.dispatch_composition_event("compositionupdate", &text);
+                } else if had_preedit {
+                    self.dispatch_composition_event("compositionend", "");
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            Ime::Commit(text) => {
+                let had_preedit = self
+                    .page
+                    .as_ref()
+                    .map(|p| p.input_preedit.contains_key(&focus_node))
+                    .unwrap_or(false);
+                if !had_preedit {
+                    // Some IMEs commit without a preceding preedit
+                    // (e.g. dictation). Spec still wants the start /
+                    // end pair around the commit.
+                    self.dispatch_composition_event("compositionstart", "");
+                }
+                if let Some(page) = self.page.as_mut() {
+                    page.input_preedit.remove(&focus_node);
+                    if !text.is_empty() {
+                        page.inputs
+                            .entry(focus_node)
+                            .or_default()
+                            .push_str(&text);
+                    }
+                }
+                self.dispatch_composition_event("compositionend", &text);
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+        }
+    }
+
+    fn dispatch_composition_event(&mut self, event_type: &str, data: &str) {
+        let target = match self.page.as_ref().and_then(|p| p.focus) {
+            Some(n) => n,
+            None => return,
+        };
+        let Some(page) = self.page.as_mut() else { return };
+        let mut init = js::engine::EventInit::bubbling();
+        init.input_data = Some(data.to_string());
+        let r = page
+            .js
+            .dispatch_event_with(&mut page.dom, event_type, target, init);
+        if r.mutated {
+            self.recascade_and_paint();
+        }
     }
 
     fn handle_input_key(&mut self, logical_key: Key, text: Option<winit::keyboard::SmolStr>) {
@@ -2035,6 +2143,32 @@ fn collect_immediate_text(dom: &dom::Dom, node: dom::NodeId, out: &mut String) {
 
 /// First element child of `parent` (skipping text/comments). Used by
 /// lifecycle events to find the document's <html> root.
+/// Does this node accept text input? Used to decide whether to
+/// enable the OS IME — we don't want every focused link / button to
+/// pop up the candidate window.
+fn is_editable_input(dom: &dom::Dom, node: dom::NodeId) -> bool {
+    let dom::NodeKind::Element { tag, attrs } = &dom.node(node).kind else {
+        return false;
+    };
+    match tag.as_str() {
+        "textarea" => true,
+        "input" => {
+            let ty = attrs
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("type"))
+                .map(|(_, v)| v.to_ascii_lowercase())
+                .unwrap_or_else(|| "text".to_string());
+            matches!(
+                ty.as_str(),
+                "text" | "search" | "url" | "email" | "tel" | "password" | "number"
+            )
+        }
+        _ => attrs
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("contenteditable") && v != "false"),
+    }
+}
+
 fn first_element_child(dom: &dom::Dom, parent: dom::NodeId) -> Option<dom::NodeId> {
     dom.children(parent)
         .find(|c| matches!(dom.node(*c).kind, dom::NodeKind::Element { .. }))
@@ -2566,7 +2700,18 @@ fn paint_input_overlays_walk(
     if let dom::NodeKind::Element { tag, .. } = &page.dom.node(node).kind {
         if tag == "input" || tag == "textarea" {
             let value = page.inputs.get(&node).map(String::as_str).unwrap_or("");
+            let preedit = page.input_preedit.get(&node).map(String::as_str).unwrap_or("");
             let is_focused = page.focus == Some(node);
+            // While the IME is composing, render the preedit text
+            // concatenated to the committed value. Visually this is
+            // less elegant than the underlined-pre-edit treatment
+            // browsers use, but it's good enough to see CJK
+            // candidates landing.
+            let display: String = if preedit.is_empty() {
+                value.to_string()
+            } else {
+                format!("{value}{preedit}")
+            };
             if let Some(b) = page.box_tree.get(node) {
                 draw_input_text(
                     font_system,
@@ -2575,7 +2720,7 @@ fn paint_input_overlays_walk(
                     vw,
                     vh,
                     b.rect,
-                    value,
+                    &display,
                     is_focused,
                     scroll_y,
                     top_offset,
@@ -3204,6 +3349,7 @@ impl ApplicationHandler for Browser {
                     },
                 ..
             } => self.handle_key(logical_key, text),
+            WindowEvent::Ime(ime) => self.handle_ime(ime),
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
         }

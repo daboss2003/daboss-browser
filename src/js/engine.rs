@@ -110,6 +110,14 @@ thread_local! {
         const { RefCell::new(None) };
 
     pub(crate) static JS_BASE_URL: RefCell<Option<url::Url>> = const { RefCell::new(None) };
+    /// Top-level (outermost) document's URL. For top-frame contexts
+    /// this equals JS_BASE_URL; iframes inherit the embedder's
+    /// top-level URL so storage partitioning groups same-site frames
+    /// together but isolates third-party frames. The disk paths for
+    /// per-origin stores (localStorage, IDB, OPFS, cache, SW
+    /// registrations) key off `(top-level, inner)` pairs.
+    pub(crate) static JS_TOP_LEVEL_BASE_URL: RefCell<Option<url::Url>> =
+        const { RefCell::new(None) };
 
     /// Mutable current URL exposed to JS via `location.*` and mutated by
     /// `history.pushState` / `history.replaceState`. The browser shell
@@ -946,6 +954,13 @@ impl JsEngine {
             *slot.borrow_mut() = self.fetch_client.clone();
         });
         JS_BASE_URL.with(|slot| {
+            *slot.borrow_mut() = self.base_url.clone();
+        });
+        // For now the JsEngine is per-document and only ever runs in
+        // a top-frame context, so the top-level URL equals the inner
+        // URL. When iframe contexts come online, the embedder URL
+        // can be threaded in via a JsEngine constructor parameter.
+        JS_TOP_LEVEL_BASE_URL.with(|slot| {
             *slot.borrow_mut() = self.base_url.clone();
         });
         JS_LOCAL_STORAGE.with(|slot| {

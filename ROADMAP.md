@@ -20,6 +20,28 @@ up the work without re-deriving context.
 
 ## Just shipped
 
+- [x] **Storage partitioning by top-level origin** (this session)
+      — disk-backed per-origin stores now key off
+      `(top-level-host, inner-host)` pairs instead of the bare
+      inner host. New `JS_TOP_LEVEL_BASE_URL` thread-local in
+      `js::engine` (mirrors `JS_BASE_URL` for top-frame contexts;
+      a future iframe-aware shell would override it with the
+      embedder URL). New `opfs::partitioned_origin_host()` returns
+      a sanitised path component: just the inner host when
+      top == inner (so already-stored first-party data keeps
+      working without migration), or `<top>__<inner>` when the
+      two differ. Migrated callers: OPFS root, IndexedDB root,
+      localStorage dir, Service Worker caches root +
+      `ensure_caches_loaded` guard, SW registrations path +
+      `replay_persisted_registrations` guard. Push subscriptions
+      already reject (no real backing) so they're partitioned
+      vacuously. Cookies and WebAuthn intentionally NOT moved —
+      cookies need a partition_key on each Cookie entry (deferred
+      to the upcoming First-Party Sets / CHIPS slice); WebAuthn
+      keys off the relying-party ID per spec, which is not a
+      browser-context concept. Tests cover key collapse for
+      first-party, separator behaviour for cross-context, and
+      cross-top isolation of a shared third-party origin.
 - [x] `8e4d30a` **DevTools Sources panel with breakpoints** —
       the Sources panel is now interactive. `SourcesPanelState`
       tracks the selected source-map, selected file within the
@@ -183,12 +205,10 @@ up the work without re-deriving context.
 
 ## Pending (each is its own session)
 
-- [ ] **Storage partitioning by top-level origin** — every
-  per-origin store (cookies, localStorage, IDB, OPFS, cache,
-  SW registrations, push subs) currently keys on the inner
-  origin only. Re-key as `(top-level-origin, inner-origin)`.
 - [ ] **First-Party Sets / CHIPS** — parses but doesn't enforce.
-  Tied to storage partitioning.
+  Tied to storage partitioning. Cookie partitioning lives here:
+  extend `Cookie` with a `partition_key` field + match
+  accordingly.
 - [ ] **CSS Houdini paint/layout/animation worklets actually
   executing** — needs a separate boa Context per worklet,
   custom-paint canvas API, glue to call `paint()` during

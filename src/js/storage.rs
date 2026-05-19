@@ -117,7 +117,7 @@ fn which_for_this(this: &JsValue, ctx: &mut Context) -> Which {
 fn local_storage_dir() -> PathBuf {
     let mut p = super::opfs::data_dir_path();
     p.push("daboss-localstorage");
-    p.push(super::opfs::current_origin_host());
+    p.push(super::opfs::partitioned_origin_host());
     let _ = fs::create_dir_all(&p);
     p
 }

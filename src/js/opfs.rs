@@ -82,15 +82,9 @@ fn next_id() -> u32 {
 /// exists. Falls back through XDG / temp_dir if the platform's
 /// preferred location is unavailable.
 fn origin_root() -> PathBuf {
-    let host = super::engine::JS_BASE_URL.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .and_then(|u| u.host_str().map(|s| s.to_string()))
-    });
-    let host = sanitise_path_component(&host.unwrap_or_else(|| "default".to_string()));
     let mut base = data_dir_path();
     base.push("daboss-opfs");
-    base.push(host);
+    base.push(partitioned_origin_host());
     let _ = fs::create_dir_all(&base);
     base
 }
@@ -132,6 +126,10 @@ pub(crate) fn data_dir_path() -> PathBuf {
 
 /// Resolve the current page's origin host into a sanitised path
 /// component. Shared with other per-origin disk-backed stores.
+///
+/// Returns the unpartitioned bare-inner-origin string. New disk
+/// paths should call [`partitioned_origin_host`] instead so they
+/// participate in top-level-origin partitioning.
 pub(crate) fn current_origin_host() -> String {
     let host = super::engine::JS_BASE_URL.with(|slot| {
         slot.borrow()
@@ -139,6 +137,37 @@ pub(crate) fn current_origin_host() -> String {
             .and_then(|u| u.host_str().map(|s| s.to_string()))
     });
     sanitise_path_component(&host.unwrap_or_else(|| "default".to_string()))
+}
+
+/// Compute the storage partition key for the current document. The
+/// returned string is a sanitised path component suitable for use as
+/// a directory name; per-origin disk-backed stores (IDB, OPFS,
+/// localStorage, SW caches, SW registrations, push) push this onto
+/// their root path so two iframes from the same inner origin land
+/// in distinct directories when their embedders differ.
+///
+/// Format: `<top-host>__<inner-host>`. When the two coincide (the
+/// common single-frame top-level case) we use just the inner host
+/// — matching the pre-partition disk layout so already-stored data
+/// keeps working without a migration step.
+pub(crate) fn partitioned_origin_host() -> String {
+    let inner_host = super::engine::JS_BASE_URL.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|u| u.host_str().map(|s| s.to_string()))
+    });
+    let top_host = super::engine::JS_TOP_LEVEL_BASE_URL.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|u| u.host_str().map(|s| s.to_string()))
+    });
+    let inner = inner_host.unwrap_or_else(|| "default".to_string());
+    let top = top_host.unwrap_or_else(|| inner.clone());
+    if top == inner {
+        sanitise_path_component(&inner)
+    } else {
+        sanitise_path_component(&format!("{top}__{inner}"))
+    }
 }
 
 /// Strip path traversal characters so an origin like `..` or
@@ -1131,4 +1160,74 @@ fn read_bytes(val: &JsValue, ctx: &mut Context) -> Vec<u8> {
         return out;
     }
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_urls<F: FnOnce()>(top: Option<&str>, inner: Option<&str>, f: F) {
+        let top_url = top.and_then(|s| url::Url::parse(s).ok());
+        let inner_url = inner.and_then(|s| url::Url::parse(s).ok());
+        super::super::engine::JS_TOP_LEVEL_BASE_URL.with(|s| *s.borrow_mut() = top_url);
+        super::super::engine::JS_BASE_URL.with(|s| *s.borrow_mut() = inner_url);
+        f();
+        super::super::engine::JS_TOP_LEVEL_BASE_URL.with(|s| s.borrow_mut().take());
+        super::super::engine::JS_BASE_URL.with(|s| s.borrow_mut().take());
+    }
+
+    #[test]
+    fn partition_key_collapses_when_top_equals_inner() {
+        // First-party single frame: top-level == inner-frame. The
+        // resulting key is just the inner host so already-stored
+        // pre-partition data keeps resolving.
+        with_urls(
+            Some("https://example.com/"),
+            Some("https://example.com/page"),
+            || {
+                assert_eq!(partitioned_origin_host(), "example.com");
+            },
+        );
+    }
+
+    #[test]
+    fn partition_key_combines_top_and_inner_when_different() {
+        // Third-party iframe: an inner origin loaded inside a
+        // different top-level page lands in a distinct directory so
+        // it can't read or write the first-party origin's data.
+        with_urls(
+            Some("https://example.com/"),
+            Some("https://tracker.example.net/widget"),
+            || {
+                let host = partitioned_origin_host();
+                assert!(
+                    host.contains("example.com") && host.contains("tracker.example.net"),
+                    "partition host {host:?} should include both"
+                );
+                assert!(
+                    host.contains("__"),
+                    "partition host {host:?} should use double-underscore separator"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn partition_key_isolates_same_inner_across_different_tops() {
+        // The same inner origin embedded under two distinct
+        // top-level origins must yield two distinct partitions —
+        // that's the whole point of partitioning.
+        let (mut a, mut b) = (String::new(), String::new());
+        with_urls(
+            Some("https://news.example/"),
+            Some("https://ads.example/widget"),
+            || a = partitioned_origin_host(),
+        );
+        with_urls(
+            Some("https://blog.example/"),
+            Some("https://ads.example/widget"),
+            || b = partitioned_origin_host(),
+        );
+        assert_ne!(a, b, "{a} should not equal {b}");
+    }
 }

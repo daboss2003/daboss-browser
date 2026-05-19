@@ -714,7 +714,7 @@ fn cache_entry_to_response_object(
 // ============ disk persistence ============
 
 fn ensure_caches_loaded() {
-    let origin = crate::js::opfs::current_origin_host();
+    let origin = crate::js::opfs::partitioned_origin_host();
     let already = CACHES_LOADED_ORIGIN.with(|s| s.borrow().as_deref() == Some(&origin));
     if already {
         return;
@@ -755,7 +755,7 @@ fn ensure_caches_loaded() {
 fn caches_origin_root() -> PathBuf {
     let mut p = crate::js::opfs::data_dir_path();
     p.push("daboss-sw-caches");
-    p.push(crate::js::opfs::current_origin_host());
+    p.push(crate::js::opfs::partitioned_origin_host());
     let _ = fs::create_dir_all(&p);
     p
 }
@@ -1100,7 +1100,7 @@ fn sw_get_registrations(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResu
 fn reg_origin_path() -> PathBuf {
     let mut p = crate::js::opfs::data_dir_path();
     p.push("daboss-sw");
-    p.push(crate::js::opfs::current_origin_host());
+    p.push(crate::js::opfs::partitioned_origin_host());
     let _ = fs::create_dir_all(&p);
     p.push("registrations.bin");
     p
@@ -1156,7 +1156,7 @@ fn read_registrations(path: &std::path::Path) -> Option<Vec<(String, String, Str
 }
 
 fn replay_persisted_registrations(ctx: &mut Context) {
-    let origin = crate::js::opfs::current_origin_host();
+    let origin = crate::js::opfs::partitioned_origin_host();
     let already = REGS_LOADED_ORIGIN.with(|s| s.borrow().as_deref() == Some(&origin));
     if already {
         return;

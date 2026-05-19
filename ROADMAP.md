@@ -20,6 +20,29 @@ up the work without re-deriving context.
 
 ## Just shipped
 
+- [x] **Per-tile damage tracking** (this session) — every
+      will-change layer pixmap is conceptually diced into 256×256
+      tiles. `CachedLayer` gains `tile_input_hashes` (one per
+      tile), `tile_cols`, and `tile_rows`. A new
+      `compute_per_tile_input_hashes` walks the subtree and folds
+      each node ONLY into the tiles its box rect overlaps, so a
+      narrow text mutation only touches the hash of the tile it
+      sits in. Paint flow grows a third path between the existing
+      fast-path (whole-subtree hash matches) and slow-path (full
+      re-render): on subtree-hash mismatch we recompute per-tile
+      hashes; if every tile matches its cached value we reuse the
+      cached pixmap (a subtree-hash false-positive — e.g. a
+      hidden attr flip with no on-screen change). If only SOME
+      tiles dirtied, we paint each dirty tile in isolation —
+      redirecting the painter into a tile-sized offscreen with a
+      ctx that puts the layer's content at the tile's origin —
+      and copy the freshly painted bytes back into a canvas that
+      starts as a clone of the cached pixmap. Clean tiles keep
+      their cached bytes, no re-rasterisation. Tests verify (a) a
+      wide layer reports >=2 tile columns, (b) mutating a node on
+      the right side leaves the leftmost tile's input hash
+      unchanged, and (c) idempotent paints bump `last_used`
+      without inserting duplicates.
 - [x] `674b409` **Source maps + DevTools Sources panel** —
       new `source_map` module: scrape
       `//# sourceMappingURL=` / legacy `//@` from a script tail,
@@ -118,9 +141,6 @@ up the work without re-deriving context.
 
 ## Pending (each is its own session)
 
-- [ ] **Per-tile damage tracking** — split each layer's pixmap
-  into 256×256 tiles, hash per tile. Only re-render the dirty
-  tiles. Needs subtree → tile invalidation mapping.
 - [ ] **Compositor thread / GPU rasterization** — run paint on a
   dedicated thread; raster glyphs / paths on the GPU via wgpu
   compute. This is the biggest architectural lift left.

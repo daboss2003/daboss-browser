@@ -106,7 +106,23 @@ pub struct CachedLayer {
     /// Monotonic tick of the last paint that referenced this
     /// entry. Drives LRU eviction when the cache is full.
     pub last_used: u64,
+    /// Per-tile content hashes used for partial-layer damage
+    /// tracking. Length = tile_cols × tile_rows in row-major order;
+    /// each value is a hash of just the DOM subtree nodes whose box
+    /// rect intersects that tile. When the layer's whole-subtree
+    /// hash differs but a tile's per-tile hash matches the cached
+    /// value, that tile's bytes are reused unmodified — only dirty
+    /// tiles re-paint.
+    pub tile_input_hashes: Vec<u64>,
+    pub tile_cols: u32,
+    pub tile_rows: u32,
 }
+
+/// Layer pixmaps are diced into square tiles of this edge length for
+/// per-tile damage tracking. 256 is the Chrome/Firefox compositor
+/// tile size — small enough that one mutated paragraph dirties a
+/// single tile, large enough to amortise the per-tile bookkeeping.
+pub const TILE_SIZE: u32 = 256;
 
 /// Monotonic tick incremented every time the cache promotes an
 /// entry (insert or reuse). Used as `CachedLayer.last_used` for
@@ -357,6 +373,16 @@ impl Painter {
         let layer_h = (b.rect.height.ceil() as u32).max(1) + pad * 2;
         let hash = compute_layer_hash(dom, styles, tree, node);
 
+        // Tile grid for damage tracking. The whole-layer hash is
+        // pessimistic — it folds every node in the subtree — so it
+        // mis-misses (subtree-hash mismatch but pixels identical) and
+        // mis-hits (rare; collision-only). The per-tile hashes are
+        // narrower (each tile only folds its own contributing nodes)
+        // so we can localise the dirty region.
+        let tile_cols = (layer_w + TILE_SIZE - 1) / TILE_SIZE;
+        let tile_rows = (layer_h + TILE_SIZE - 1) / TILE_SIZE;
+        let layer_origin = (b.rect.x - pad as f32, b.rect.y - pad as f32);
+
         // Fast path: previous frame's pixmap is still valid. We
         // clone bytes inside the borrow, then bump `last_used` on
         // the entry so the LRU evicter favours stale ones.
@@ -381,6 +407,104 @@ impl Painter {
                 entry.last_used = tick;
             }
             self.dispatch_layer_composite(&cached, b.rect, pad, parent_ctx, style);
+            return true;
+        }
+
+        // Subtree hash mismatched. Try per-tile damage tracking: if
+        // some tiles' input hashes match the cached entry's tile
+        // hashes, those tiles' bytes can be reused from the cached
+        // pixmap and we only repaint the dirty tiles.
+        let new_tile_hashes = compute_per_tile_input_hashes(
+            dom,
+            styles,
+            tree,
+            node,
+            layer_origin,
+            tile_cols,
+            tile_rows,
+        );
+        let cached_for_partial: Option<(Pixmap, Vec<u64>)> = {
+            let cache = cache_rc.borrow();
+            cache.get(&node).and_then(|entry| {
+                if entry.pixmap.width() == layer_w
+                    && entry.pixmap.height() == layer_h
+                    && entry.tile_input_hashes.len() == new_tile_hashes.len()
+                    && entry.tile_cols == tile_cols
+                    && entry.tile_rows == tile_rows
+                {
+                    let mut p = Pixmap::new(layer_w, layer_h)?;
+                    p.data_mut().copy_from_slice(entry.pixmap.data());
+                    Some((p, entry.tile_input_hashes.clone()))
+                } else {
+                    None
+                }
+            })
+        };
+
+        if let Some((mut canvas, old_tile_hashes)) = cached_for_partial {
+            // Identify dirty tiles. If empty: subtree hash changed
+            // (maybe a hidden attr was flipped) but no on-screen
+            // pixel actually moves — composite the cached pixmap.
+            let dirty_tiles: Vec<u32> = new_tile_hashes
+                .iter()
+                .zip(old_tile_hashes.iter())
+                .enumerate()
+                .filter_map(|(i, (n, o))| if n != o { Some(i as u32) } else { None })
+                .collect();
+
+            if dirty_tiles.is_empty() {
+                let tick = next_cache_tick();
+                if let Some(entry) = cache_rc.borrow_mut().get_mut(&node) {
+                    entry.hash = hash;
+                    entry.tile_input_hashes = new_tile_hashes;
+                    entry.last_used = tick;
+                }
+                self.dispatch_layer_composite(&canvas, b.rect, pad, parent_ctx, style);
+                return true;
+            }
+
+            // Paint each dirty tile in isolation by redirecting paint
+            // into a tile-sized pixmap, then copy that tile's pixels
+            // back into the layer canvas. Clean tiles keep their
+            // cached bytes — no re-rasterisation.
+            let neutralise_alpha = 1.0 / style.opacity.max(1e-3);
+            let (sx, sy) = style.transform_translate.unwrap_or((0.0, 0.0));
+            for tile_index in &dirty_tiles {
+                let col = tile_index % tile_cols;
+                let row = tile_index / tile_cols;
+                let tile_x = col * TILE_SIZE;
+                let tile_y = row * TILE_SIZE;
+                let tile_w = (layer_w - tile_x).min(TILE_SIZE);
+                let tile_h = (layer_h - tile_y).min(TILE_SIZE);
+                let Some(tile_pix) = Pixmap::new(tile_w, tile_h) else {
+                    continue;
+                };
+                let saved = std::mem::replace(&mut self.pixmap, tile_pix);
+                // Paint context positions the layer's root at
+                // (-tile_x + pad, -tile_y + pad) in the tile pixmap.
+                let inner_ctx = PaintCtx {
+                    alpha: parent_ctx.alpha * neutralise_alpha,
+                    tx: -b.rect.x + pad as f32 - tile_x as f32 - sx,
+                    ty: -b.rect.y + pad as f32 - tile_y as f32 - sy,
+                };
+                self.paint_subtree_inner(dom, styles, tree, images, node, inner_ctx);
+                let tile_pix = std::mem::replace(&mut self.pixmap, saved);
+                copy_pixmap_region(&tile_pix, &mut canvas, tile_x, tile_y);
+            }
+
+            // Store the partially-rerendered pixmap + new tile
+            // hashes; reuse the existing entry so LRU sees it as hot.
+            let tick = next_cache_tick();
+            if let Some(mut store_copy) = Pixmap::new(layer_w, layer_h) {
+                store_copy.data_mut().copy_from_slice(canvas.data());
+                if let Some(entry) = cache_rc.borrow_mut().get_mut(&node) {
+                    entry.pixmap = store_copy;
+                    entry.hash = hash;
+                    entry.tile_input_hashes = new_tile_hashes;
+                    entry.last_used = tick;
+                }
+            }
+            self.dispatch_layer_composite(&canvas, b.rect, pad, parent_ctx, style);
             return true;
         }
 
@@ -437,6 +561,9 @@ impl Painter {
                     box_origin: (b.rect.x, b.rect.y),
                     pad,
                     last_used: next_cache_tick(),
+                    tile_input_hashes: new_tile_hashes,
+                    tile_cols,
+                    tile_rows,
                 },
             );
         }
@@ -1590,11 +1717,155 @@ fn is_layer_root(style: &ComputedStyle) -> bool {
 /// The root node's own `transform` + `opacity` are EXCLUDED — those
 /// re-apply at composite time, so a CSS animation that only
 /// mutates them must still hit the cache.
+/// Copy `src` into `dest` at the integer offset `(dest_x, dest_y)`,
+/// clipped to `dest`'s bounds. Both pixmaps are row-major premultiplied
+/// RGBA at 4 bytes per pixel.
+fn copy_pixmap_region(src: &Pixmap, dest: &mut Pixmap, dest_x: u32, dest_y: u32) {
+    let dw = dest.width();
+    let dh = dest.height();
+    let sw = src.width();
+    let sh = src.height();
+    if dest_x >= dw || dest_y >= dh {
+        return;
+    }
+    let copy_w = sw.min(dw - dest_x);
+    let copy_h = sh.min(dh - dest_y);
+    if copy_w == 0 || copy_h == 0 {
+        return;
+    }
+    let src_data = src.data();
+    let dest_stride = (dw * 4) as usize;
+    let src_stride = (sw * 4) as usize;
+    let row_bytes = (copy_w * 4) as usize;
+    let dest_data = dest.data_mut();
+    for row in 0..copy_h {
+        let dest_row_start =
+            ((dest_y + row) as usize) * dest_stride + (dest_x as usize) * 4;
+        let src_row_start = (row as usize) * src_stride;
+        dest_data[dest_row_start..dest_row_start + row_bytes]
+            .copy_from_slice(&src_data[src_row_start..src_row_start + row_bytes]);
+    }
+}
+
 fn compute_layer_hash(dom: &Dom, styles: &StyleTree, tree: &BoxTree, root: NodeId) -> u64 {
     use std::hash::Hasher;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     hash_subtree(&mut hasher, dom, styles, tree, root, true);
     hasher.finish()
+}
+
+/// Compute one hash per tile by walking the layer subtree and folding
+/// each node into ONLY the tiles its box rect overlaps.
+/// `layer_origin` is the layer pixmap's screen-space origin (i.e.
+/// `box_rect.{x,y} - pad`); subtracting it converts screen coords to
+/// layer-local coords.
+fn compute_per_tile_input_hashes(
+    dom: &Dom,
+    styles: &StyleTree,
+    tree: &BoxTree,
+    root: NodeId,
+    layer_origin: (f32, f32),
+    tile_cols: u32,
+    tile_rows: u32,
+) -> Vec<u64> {
+    use std::hash::Hasher;
+    let count = (tile_cols * tile_rows) as usize;
+    let mut hashers: Vec<std::collections::hash_map::DefaultHasher> =
+        (0..count).map(|_| std::collections::hash_map::DefaultHasher::new()).collect();
+    fold_subtree_per_tile(
+        &mut hashers,
+        dom,
+        styles,
+        tree,
+        root,
+        layer_origin,
+        tile_cols,
+        tile_rows,
+        true,
+    );
+    hashers.into_iter().map(|h| h.finish()).collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fold_subtree_per_tile(
+    hashers: &mut [std::collections::hash_map::DefaultHasher],
+    dom: &Dom,
+    styles: &StyleTree,
+    tree: &BoxTree,
+    node: NodeId,
+    layer_origin: (f32, f32),
+    tile_cols: u32,
+    tile_rows: u32,
+    is_root: bool,
+) {
+    use std::hash::Hash;
+    let style = styles.get(node);
+    if let Some(b) = tree.get(node) {
+        // Convert box rect into layer-local coords.
+        let lx0 = (b.rect.x - layer_origin.0).max(0.0);
+        let ly0 = (b.rect.y - layer_origin.1).max(0.0);
+        let lx1 = lx0 + b.rect.width.max(0.0);
+        let ly1 = ly0 + b.rect.height.max(0.0);
+        // Range of tile indices this box overlaps (closed interval).
+        let col_lo = (lx0 as u32) / TILE_SIZE;
+        let col_hi = ((lx1.max(lx0 + 0.5) - 0.5) as u32) / TILE_SIZE;
+        let row_lo = (ly0 as u32) / TILE_SIZE;
+        let row_hi = ((ly1.max(ly0 + 0.5) - 0.5) as u32) / TILE_SIZE;
+        let col_lo = col_lo.min(tile_cols.saturating_sub(1));
+        let col_hi = col_hi.min(tile_cols.saturating_sub(1));
+        let row_lo = row_lo.min(tile_rows.saturating_sub(1));
+        let row_hi = row_hi.min(tile_rows.saturating_sub(1));
+        for row in row_lo..=row_hi {
+            for col in col_lo..=col_hi {
+                let idx = (row * tile_cols + col) as usize;
+                if let Some(h) = hashers.get_mut(idx) {
+                    // Same fields the whole-subtree hash folds in.
+                    node.hash(h);
+                    let bg = style.background_color;
+                    (bg.r, bg.g, bg.b, bg.a).hash(h);
+                    let fg = style.color;
+                    (fg.r, fg.g, fg.b, fg.a).hash(h);
+                    (style.font_size.to_bits()).hash(h);
+                    if !is_root {
+                        (style.opacity.to_bits()).hash(h);
+                    }
+                    (
+                        (b.rect.x as i32),
+                        (b.rect.y as i32),
+                        (b.rect.width as i32),
+                        (b.rect.height as i32),
+                    )
+                        .hash(h);
+                    match &dom.node(node).kind {
+                        crate::dom::NodeKind::Element { tag, attrs } => {
+                            tag.hash(h);
+                            for (k, v) in attrs {
+                                k.hash(h);
+                                v.hash(h);
+                            }
+                        }
+                        crate::dom::NodeKind::Text(s) => {
+                            s.hash(h);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    for c in dom.children(node) {
+        fold_subtree_per_tile(
+            hashers,
+            dom,
+            styles,
+            tree,
+            c,
+            layer_origin,
+            tile_cols,
+            tile_rows,
+            false,
+        );
+    }
 }
 
 fn hash_subtree(
@@ -1877,6 +2148,125 @@ mod tests {
         assert_eq!(
             after_second, after_first,
             "second paint should reuse the existing entry, not duplicate"
+        );
+    }
+
+    #[test]
+    fn tile_input_hashes_split_per_tile_in_layer() {
+        // A layer wide enough to span two tile columns must report
+        // tile_cols >= 2 in its cache entry, so the per-tile machinery
+        // is actually engaging.
+        let cache: std::rc::Rc<std::cell::RefCell<LayerCache>> =
+            std::rc::Rc::new(std::cell::RefCell::new(LayerCache::new()));
+        PAINT_LAYER_CACHE.with(|s| *s.borrow_mut() = Some(cache.clone()));
+        let html = "<style>body{margin:0} \
+                    .l{width:600px;height:200px;background:#0aa; \
+                       will-change: transform;}</style>\
+                    <div class=l></div>";
+        let _ = render(html, 700, 300);
+        let snap = cache.borrow().values().next().map(|e| {
+            (
+                e.tile_cols,
+                e.tile_rows,
+                e.tile_input_hashes.len(),
+            )
+        });
+        PAINT_LAYER_CACHE.with(|s| s.borrow_mut().take());
+        let (cols, rows, hashes) = snap.expect("layer cached");
+        // padded layer is 600+16 wide, 200+16 tall — 3 tile cols, 1
+        // tile row at TILE_SIZE = 256.
+        assert!(cols >= 2, "expected tile_cols >= 2, got {cols}");
+        assert_eq!(rows, 1);
+        assert_eq!(hashes as u32, cols * rows);
+    }
+
+    #[test]
+    fn mutating_one_node_only_dirties_tiles_it_overlaps() {
+        // Two paints of a wide layer; between them we change a
+        // single right-edge child's text. The tile that contains
+        // the child's box must change; the leftmost tile must
+        // stay byte-identical in its input hash.
+        let cache: std::rc::Rc<std::cell::RefCell<LayerCache>> =
+            std::rc::Rc::new(std::cell::RefCell::new(LayerCache::new()));
+        PAINT_LAYER_CACHE.with(|s| *s.borrow_mut() = Some(cache.clone()));
+
+        // Layer wide enough to need >= 3 tiles. The .left and
+        // .right divs are positioned at the layer's two extremes so
+        // they land in different tiles.
+        let html_a = "<style>body{margin:0}\
+                      .l{width:800px;height:80px;background:#fee;\
+                         will-change:transform;position:relative}\
+                      .left{position:absolute;left:0;top:0;width:60px;\
+                            height:60px;background:#080}\
+                      .right{position:absolute;left:700px;top:0;\
+                             width:60px;height:60px;background:#008}\
+                      </style>\
+                      <div class=l>\
+                        <div class=left></div>\
+                        <div class=right>A</div>\
+                      </div>";
+        let _ = render(html_a, 900, 120);
+        let first_hashes = cache
+            .borrow()
+            .values()
+            .next()
+            .map(|e| e.tile_input_hashes.clone())
+            .expect("layer cached");
+
+        // Same page but with the right node's text mutated. The
+        // left node is untouched.
+        let html_b = html_a.replace(">A<", ">B<");
+        let _ = render(&html_b, 900, 120);
+        let second_hashes = cache
+            .borrow()
+            .values()
+            .next()
+            .map(|e| e.tile_input_hashes.clone())
+            .expect("layer cached");
+        PAINT_LAYER_CACHE.with(|s| s.borrow_mut().take());
+
+        assert_eq!(first_hashes.len(), second_hashes.len());
+        // First tile covers x in [0, 256) — contains .left. Must be
+        // unchanged.
+        assert_eq!(
+            first_hashes[0], second_hashes[0],
+            "leftmost tile should be untouched by a right-side mutation"
+        );
+        // Some tile in the middle/right MUST differ (the .right
+        // child sits past 700px = inside the third tile).
+        assert!(
+            first_hashes
+                .iter()
+                .zip(second_hashes.iter())
+                .any(|(a, b)| a != b),
+            "expected at least one tile to dirty"
+        );
+    }
+
+    #[test]
+    fn layer_with_unchanged_pixels_reuses_cache_via_tile_hashes() {
+        // Same layer twice — second paint should observe
+        // identical tile hashes so the cache hit path reuses the
+        // pixmap. We verify by comparing `last_used` ticks: the
+        // second paint must bump the existing entry's tick rather
+        // than insert a fresh one.
+        let cache: std::rc::Rc<std::cell::RefCell<LayerCache>> =
+            std::rc::Rc::new(std::cell::RefCell::new(LayerCache::new()));
+        PAINT_LAYER_CACHE.with(|s| *s.borrow_mut() = Some(cache.clone()));
+        let html = "<style>body{margin:0} \
+                    .l{width:400px;height:300px;background:lime; \
+                       will-change: transform;}</style>\
+                    <div class=l></div>";
+        let _ = render(html, 500, 400);
+        let first_tick = cache.borrow().values().next().map(|e| e.last_used);
+        let _ = render(html, 500, 400);
+        let second_tick = cache.borrow().values().next().map(|e| e.last_used);
+        let len_after = cache.borrow().len();
+        PAINT_LAYER_CACHE.with(|s| s.borrow_mut().take());
+        assert_eq!(len_after, 1, "expected single entry");
+        assert!(
+            second_tick > first_tick,
+            "second paint should bump last_used (got {first_tick:?} → {second_tick:?})"
         );
     }
 

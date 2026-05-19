@@ -20,7 +20,7 @@ up the work without re-deriving context.
 
 ## Just shipped
 
-- [x] **Source maps + DevTools Sources panel** (this session) —
+- [x] `674b409` **Source maps + DevTools Sources panel** —
       new `source_map` module: scrape
       `//# sourceMappingURL=` / legacy `//@` from a script tail,
       parse the JSON v3 format (custom recursive-descent parser to

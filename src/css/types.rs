@@ -841,6 +841,15 @@ pub struct ComputedStyle {
     /// payload. Passed verbatim; cosmic-text picks up the standard
     /// OpenType features it knows about.
     pub font_feature_settings: Option<String>,
+    /// `font-variation-settings` — parsed `(tag, value)` axes such
+    /// as `[("wght", 700.0), ("wdth", 75.0)]`. Known axes (wght,
+    /// wdth, slnt, ital) fold into the cosmic-text `Attrs` at
+    /// shape time; unknown axes survive in the field for any
+    /// downstream consumer that wants them.
+    pub font_variation_settings: Vec<(String, f32)>,
+    /// `font-stretch` as the OS/2 width class (1=UltraCondensed,
+    /// 5=Normal, 9=UltraExpanded). Default 5.
+    pub font_stretch: u16,
     /// `hyphens` — `none` / `manual` / `auto`. Without a
     /// hyphenation dictionary `auto` falls back to `manual` (i.e.
     /// only break at U+00AD soft-hyphen).
@@ -1013,6 +1022,8 @@ impl ComputedStyle {
             scroll_snap_type: None,
             scroll_snap_align: None,
             font_feature_settings: None,
+            font_variation_settings: Vec::new(),
+            font_stretch: 5,
             hyphens: None,
             container_type: None,
             container_name: None,

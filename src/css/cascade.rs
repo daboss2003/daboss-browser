@@ -901,6 +901,18 @@ fn apply_declaration(
                 style.font_family = families;
             }
         }
+        "font-stretch" => {
+            if let Some(bucket) = font_stretch_from(value) {
+                style.font_stretch = bucket;
+            }
+        }
+        "font-variation-settings" => {
+            // The grammar is a comma-separated list of `<string>
+            // <number>` pairs, where the string is a 4-char OT axis
+            // tag. Unknown / malformed entries are silently dropped
+            // so a bad rule doesn't break the rest of the page.
+            style.font_variation_settings = font_variation_settings_from(value);
+        }
         "text-align" => {
             if let Value::Keyword(k) = value {
                 style.text_align = match k.as_str() {
@@ -2493,6 +2505,91 @@ fn font_family_from(v: &Value) -> Vec<String> {
     }
 }
 
+/// Map `font-stretch` to the 1..=9 OS/2 width-class bucket
+/// cosmic-text consumes via `Stretch`. Percentages follow the spec
+/// table (50% = UltraCondensed, 100% = Normal, 200% = UltraExpanded).
+fn font_stretch_from(v: &Value) -> Option<u16> {
+    match v {
+        Value::Keyword(k) => Some(match k.as_str() {
+            "ultra-condensed" => 1,
+            "extra-condensed" => 2,
+            "condensed" => 3,
+            "semi-condensed" => 4,
+            "normal" => 5,
+            "semi-expanded" => 6,
+            "expanded" => 7,
+            "extra-expanded" => 8,
+            "ultra-expanded" => 9,
+            _ => return None,
+        }),
+        Value::Percentage(p) => Some(percent_to_stretch_bucket(*p)),
+        _ => None,
+    }
+}
+
+fn percent_to_stretch_bucket(p: f32) -> u16 {
+    // Spec ranges from MDN: <=62.5% UltraCondensed, then in 12.5%
+    // steps. We snap to the nearest bucket. Out-of-range values
+    // clamp to the endpoint buckets.
+    if p <= 56.25 {
+        1
+    } else if p <= 68.75 {
+        2
+    } else if p <= 81.25 {
+        3
+    } else if p <= 93.75 {
+        4
+    } else if p < 106.25 {
+        5
+    } else if p < 118.75 {
+        6
+    } else if p < 137.5 {
+        7
+    } else if p < 175.0 {
+        8
+    } else {
+        9
+    }
+}
+
+/// Parse `font-variation-settings` into `(tag, value)` pairs. The
+/// grammar is a comma-separated list of `<string> <number>` pairs;
+/// our value list flattens commas so we walk in stride-2 chunks
+/// and skip any element that doesn't look like `string number`.
+fn font_variation_settings_from(v: &Value) -> Vec<(String, f32)> {
+    let mut out = Vec::new();
+    let items: Vec<&Value> = match v {
+        Value::Keyword(k) if k == "normal" => return Vec::new(),
+        Value::List(v) => v.iter().collect(),
+        single => vec![single],
+    };
+    let mut i = 0;
+    while i < items.len() {
+        let tag = match items[i] {
+            Value::String(s) => Some(s.clone()),
+            Value::Keyword(k) if k.len() == 4 => Some(k.clone()),
+            _ => None,
+        };
+        // Optional comma separator after the value — discard.
+        if matches!(items[i], Value::Keyword(k) if k == ",") {
+            i += 1;
+            continue;
+        }
+        let val = items.get(i + 1).and_then(|v| match v {
+            Value::Number(n) => Some(*n),
+            Value::Percentage(p) => Some(*p),
+            _ => None,
+        });
+        if let (Some(tag), Some(val)) = (tag, val) {
+            out.push((tag, val));
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 fn font_size_from(v: &Value, em_base: f32) -> Option<f32> {
     match v {
         Value::Length(n, u) => Some(length_n_unit_to_px(*n, *u, em_base, em_base)),
@@ -2651,6 +2748,56 @@ mod tests {
         let dom = html::parse("<p>hi</p>");
         let sheet = parser::parse("p { color: red; }");
         assert_eq!(style_for(&dom, &sheet, "p").color, Color::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn font_stretch_keyword_maps_to_os2_bucket() {
+        let dom = html::parse("<p>hi</p>");
+        let sheet = parser::parse("p { font-stretch: condensed; }");
+        let s = style_for(&dom, &sheet, "p");
+        assert_eq!(s.font_stretch, 3);
+        let sheet = parser::parse("p { font-stretch: ultra-expanded; }");
+        let s = style_for(&dom, &sheet, "p");
+        assert_eq!(s.font_stretch, 9);
+        let sheet = parser::parse("p { font-stretch: 50%; }");
+        let s = style_for(&dom, &sheet, "p");
+        assert_eq!(s.font_stretch, 1);
+        let sheet = parser::parse("p { font-stretch: 100%; }");
+        let s = style_for(&dom, &sheet, "p");
+        assert_eq!(s.font_stretch, 5);
+        let sheet = parser::parse("p { font-stretch: 200%; }");
+        let s = style_for(&dom, &sheet, "p");
+        assert_eq!(s.font_stretch, 9);
+    }
+
+    #[test]
+    fn font_variation_settings_parses_into_axis_list() {
+        let dom = html::parse("<p>hi</p>");
+        let sheet = parser::parse(
+            "p { font-variation-settings: \"wght\" 700, \"wdth\" 75; }",
+        );
+        let s = style_for(&dom, &sheet, "p");
+        // Should contain both axes regardless of internal order.
+        let wght = s
+            .font_variation_settings
+            .iter()
+            .find(|(t, _)| t == "wght")
+            .map(|(_, v)| *v);
+        let wdth = s
+            .font_variation_settings
+            .iter()
+            .find(|(t, _)| t == "wdth")
+            .map(|(_, v)| *v);
+        assert_eq!(wght, Some(700.0));
+        assert_eq!(wdth, Some(75.0));
+    }
+
+    #[test]
+    fn font_variation_settings_normal_clears_axes() {
+        let dom = html::parse("<p>hi</p>");
+        let sheet = parser::parse("p { font-variation-settings: normal; }");
+        let s = style_for(&dom, &sheet, "p");
+        assert!(s.font_variation_settings.is_empty());
     }
 
     #[test]

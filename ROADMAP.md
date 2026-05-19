@@ -20,6 +20,23 @@ up the work without re-deriving context.
 
 ## Just shipped
 
+- [x] **Variable font axes wired into shape Attrs** (this
+      session) — `ComputedStyle` gains a parsed
+      `font_variation_settings: Vec<(String, f32)>` (was a raw
+      string before) and `font_stretch: u16` (the OS/2 width
+      class). The cascade picks up `font-stretch` keywords
+      (`condensed`, `ultra-expanded`, …) and percentage form
+      (50%, 100%, 200%) plus `font-variation-settings`
+      (`"wght" 700, "wdth" 75`). `attrs_from_style` in
+      `layout::text` now folds the known OT axes into
+      cosmic-text's `Attrs`: `wght → weight`,
+      `wdth → stretch (1..=9 bucket)`,
+      `ital | slnt → style`. Unknown axes survive on
+      `ComputedStyle` for any downstream consumer. Tests cover
+      keyword + percentage mapping, axis-list parsing, the
+      `normal` reset, and that variation axes override the
+      top-level font-weight / font-stretch / font-style
+      properties when both are set.
 - [x] `55dbf19` **HTTP/2 connection pool** — the original
       roadmap claim that `h2c.rs` / `h3c.rs` weren't wired was
       wrong: the live `net::Client` already does h3 → h2 → h1
@@ -307,9 +324,10 @@ These are depth-gaps inside areas we already touched — the
 "shipped as a toy, real sites can outgrow them" list. Crossed
 off as they ship.
 
-- [ ] **Variable fonts + font hinting / sub-pixel positioning** —
-  `font-variation-settings` parses but isn't applied. cosmic-text
-  uses limited fallback chains; need glyph hinting per Chrome.
+- [ ] **Font hinting + extended fallback chains** — sub-pixel
+  positioning matching Chrome; multi-language fallback per
+  Unicode block; emoji presentation selectors. Variation axes
+  fold into Attrs as of this session — see "Just shipped".
 - [ ] **MSE / DASH / HLS adaptive streaming + hardware decode** —
   ffmpeg decode works but MSE.appendBuffer doesn't truly stitch
   segments; no manifest parser; no codec h/w accel.

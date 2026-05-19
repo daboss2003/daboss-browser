@@ -11,7 +11,9 @@
 
 use std::ops::Range;
 
-use cosmic_text::{Align, Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Style, Weight, Wrap};
+use cosmic_text::{
+    Align, Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Stretch, Style, Weight, Wrap,
+};
 
 use crate::css::{ComputedStyle, FontStyle, Overflow, StyleTree, TextAlign, TextOverflow};
 use crate::dom::NodeId;
@@ -275,13 +277,71 @@ impl TextLayout {
 }
 
 fn attrs_from_style(style: &ComputedStyle) -> Attrs<'_> {
+    // Fold the parsed `font-variation-settings` axes into the
+    // CSS font-weight / font-stretch / font-style baselines.
+    // Known axes (wght, wdth, slnt, ital) override the
+    // corresponding top-level property; unknown axes are ignored
+    // here but kept on `ComputedStyle` for downstream consumers.
+    let mut weight = style.font_weight;
+    let mut stretch_bucket = style.font_stretch;
+    let mut italic = matches!(style.font_style, FontStyle::Italic);
+    for (tag, value) in &style.font_variation_settings {
+        match tag.as_str() {
+            "wght" => weight = (*value as i32).clamp(1, 1000) as u16,
+            "wdth" => stretch_bucket = percent_to_stretch_bucket(*value),
+            "slnt" => italic = *value != 0.0,
+            "ital" => italic = *value >= 0.5,
+            _ => {}
+        }
+    }
     Attrs::new()
         .family(family_from_style(style))
-        .weight(Weight(style.font_weight))
-        .style(match style.font_style {
-            FontStyle::Italic => Style::Italic,
-            FontStyle::Normal => Style::Normal,
-        })
+        .weight(Weight(weight))
+        .stretch(stretch_bucket_to_stretch(stretch_bucket))
+        .style(if italic { Style::Italic } else { Style::Normal })
+}
+
+/// Map an OS/2 width-class bucket (1..=9) onto cosmic-text's
+/// `Stretch` enum. Out-of-range values clamp to Normal so
+/// shaping never panics on a bogus author value.
+fn stretch_bucket_to_stretch(bucket: u16) -> Stretch {
+    match bucket {
+        1 => Stretch::UltraCondensed,
+        2 => Stretch::ExtraCondensed,
+        3 => Stretch::Condensed,
+        4 => Stretch::SemiCondensed,
+        5 => Stretch::Normal,
+        6 => Stretch::SemiExpanded,
+        7 => Stretch::Expanded,
+        8 => Stretch::ExtraExpanded,
+        9 => Stretch::UltraExpanded,
+        _ => Stretch::Normal,
+    }
+}
+
+/// Same percentage table as the cascade uses for `font-stretch`,
+/// duplicated here so the text path can fold `wdth` axis values
+/// (in percent units) without a back-trip through cascade code.
+fn percent_to_stretch_bucket(p: f32) -> u16 {
+    if p <= 56.25 {
+        1
+    } else if p <= 68.75 {
+        2
+    } else if p <= 81.25 {
+        3
+    } else if p <= 93.75 {
+        4
+    } else if p < 106.25 {
+        5
+    } else if p < 118.75 {
+        6
+    } else if p < 137.5 {
+        7
+    } else if p < 175.0 {
+        8
+    } else {
+        9
+    }
 }
 
 /// Map the first CSS `font-family` value to cosmic-text's `Family`.
@@ -409,5 +469,31 @@ mod tests {
     fn collapse_empty_and_whitespace_only() {
         assert_eq!(collapse_whitespace(""), "");
         assert_eq!(collapse_whitespace("   "), " "); // becomes the inter-sibling space
+    }
+
+    #[test]
+    fn variation_axes_fold_into_attrs() {
+        let mut style = ComputedStyle::initial();
+        style.font_weight = 400;
+        style.font_stretch = 5;
+        // The `wght` axis must dominate the top-level font-weight.
+        style.font_variation_settings = vec![
+            ("wght".to_string(), 800.0),
+            ("wdth".to_string(), 50.0),
+            ("ital".to_string(), 1.0),
+        ];
+        let attrs = attrs_from_style(&style);
+        assert_eq!(attrs.weight, Weight(800));
+        // 50% wdth maps to UltraCondensed (bucket 1).
+        assert_eq!(attrs.stretch, Stretch::UltraCondensed);
+        assert_eq!(attrs.style, Style::Italic);
+    }
+
+    #[test]
+    fn font_stretch_propagates_when_no_variation_overrides() {
+        let mut style = ComputedStyle::initial();
+        style.font_stretch = 8; // ExtraExpanded
+        let attrs = attrs_from_style(&style);
+        assert_eq!(attrs.stretch, Stretch::ExtraExpanded);
     }
 }

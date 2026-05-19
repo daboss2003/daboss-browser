@@ -66,6 +66,7 @@ pub(crate) mod permissions;
 pub(crate) mod rtc;
 pub(crate) mod selection;
 pub(crate) mod shadow_dom;
+pub(crate) mod shared_worker;
 pub(crate) mod storage;
 pub(crate) mod view_transitions;
 pub(crate) mod visibility;

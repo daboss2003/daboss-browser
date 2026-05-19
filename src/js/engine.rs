@@ -234,6 +234,9 @@ pub struct JsEngine {
     idb: super::idb::IdbState,
     /// Live workers — each entry owns a thread + boa Context.
     workers: super::worker::WorkerRegistry,
+    /// Live SharedWorkers — keyed by (url, name) so multiple
+    /// `new SharedWorker(...)` reuse the same OS thread.
+    shared_workers: super::shared_worker::SharedWorkerRegistry,
     /// Per-canvas WebGL contexts. Routes alongside `canvas_surfaces`
     /// (which carries the 2D bitmap WebGL also writes into).
     webgl_contexts: super::webgl::WebGlContexts,
@@ -410,6 +413,7 @@ impl JsEngine {
         super::websocket::install(&mut ctx);
         super::idb::install(&mut ctx);
         super::worker::install(&mut ctx);
+        super::shared_worker::install(&mut ctx);
         super::media::install(&mut ctx);
         super::audio_ctx::install(&mut ctx);
         super::sw::install(&mut ctx);
@@ -478,6 +482,8 @@ impl JsEngine {
         let es_registry: super::sse::EsRegistry = Rc::new(RefCell::new(Vec::new()));
         let idb: super::idb::IdbState = Rc::new(RefCell::new(()));
         let workers: super::worker::WorkerRegistry = Rc::new(RefCell::new(Vec::new()));
+        let shared_workers: super::shared_worker::SharedWorkerRegistry =
+            Rc::new(RefCell::new(std::collections::HashMap::new()));
         let webgl_contexts: super::webgl::WebGlContexts =
             Rc::new(RefCell::new(std::collections::HashMap::new()));
         let caches: super::sw::Caches =
@@ -510,6 +516,7 @@ impl JsEngine {
             es_registry,
             idb,
             workers,
+            shared_workers,
             webgl_contexts,
             caches,
             captures,
@@ -696,6 +703,7 @@ impl JsEngine {
         super::view_transitions::advance(16.0);
         super::view_transitions::drain_finished(&mut self.ctx);
         super::worker::drain_worker_messages(&mut self.ctx);
+        super::shared_worker::drain_shared_worker_messages(&mut self.ctx);
         self.ctx.run_jobs();
 
         let post_count = dom_rc.borrow().node_count();
@@ -752,6 +760,7 @@ impl JsEngine {
         super::view_transitions::advance(16.0);
         super::view_transitions::drain_finished(&mut self.ctx);
         super::worker::drain_worker_messages(&mut self.ctx);
+        super::shared_worker::drain_shared_worker_messages(&mut self.ctx);
         self.ctx.run_jobs();
         self.uninstall_thread_locals(dom, rc, listeners_rc);
     }
@@ -866,6 +875,7 @@ impl JsEngine {
         super::view_transitions::advance(16.0);
         super::view_transitions::drain_finished(&mut self.ctx);
         super::worker::drain_worker_messages(&mut self.ctx);
+        super::shared_worker::drain_shared_worker_messages(&mut self.ctx);
         self.ctx.run_jobs();
 
         let flags = EVENT_FLAGS.with(|f| *f.borrow());
@@ -961,6 +971,9 @@ impl JsEngine {
         super::worker::JS_WORKERS.with(|slot| {
             *slot.borrow_mut() = Some(self.workers.clone());
         });
+        super::shared_worker::JS_SHARED_WORKERS.with(|slot| {
+            *slot.borrow_mut() = Some(self.shared_workers.clone());
+        });
         super::webgl::JS_WEBGL.with(|slot| {
             *slot.borrow_mut() = Some(self.webgl_contexts.clone());
         });
@@ -1019,6 +1032,9 @@ impl JsEngine {
             slot.borrow_mut().take();
         });
         super::worker::JS_WORKERS.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        super::shared_worker::JS_SHARED_WORKERS.with(|slot| {
             slot.borrow_mut().take();
         });
         super::webgl::JS_WEBGL.with(|slot| {

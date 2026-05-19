@@ -197,7 +197,11 @@ impl Client {
     /// behaviour is correct.
     pub fn get_with(&self, url: &str, context: RequestContext) -> Result<Response> {
         let url = Url::parse(url).map_err(|e| Error::InvalidUrl(e.to_string()))?;
-        self.do_request(url, Method::Get, 0, &context)
+        let log_url = url.to_string();
+        let start = std::time::Instant::now();
+        let r = self.do_request(url, Method::Get, 0, &context);
+        log_network_request("GET", &log_url, start, &r);
+        r
     }
 
     /// `post` with a security context.
@@ -209,7 +213,9 @@ impl Client {
         context: RequestContext,
     ) -> Result<Response> {
         let url = Url::parse(url).map_err(|e| Error::InvalidUrl(e.to_string()))?;
-        self.do_request(
+        let log_url = url.to_string();
+        let start = std::time::Instant::now();
+        let r = self.do_request(
             url,
             Method::Post {
                 body,
@@ -217,7 +223,9 @@ impl Client {
             },
             0,
             &context,
-        )
+        );
+        log_network_request("POST", &log_url, start, &r);
+        r
     }
 
     fn open_connection(
@@ -625,6 +633,28 @@ enum Method {
         body: Vec<u8>,
         content_type: String,
     },
+}
+
+/// Forward a finished request to the devtools network panel.
+/// Failures still log so the user can see the error path.
+fn log_network_request(
+    method: &str,
+    url: &str,
+    start: std::time::Instant,
+    result: &Result<Response>,
+) {
+    let duration_ms = start.elapsed().as_millis() as u32;
+    let (status, body_size) = match result {
+        Ok(r) => (r.status, r.body_size()),
+        Err(_) => (0, 0),
+    };
+    crate::devtools::push_network(crate::devtools::NetworkEntry {
+        method: method.to_string(),
+        url: url.to_string(),
+        status,
+        body_size,
+        duration_ms,
+    });
 }
 
 fn build_path(url: &Url) -> String {

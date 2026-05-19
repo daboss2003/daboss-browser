@@ -77,11 +77,78 @@ pub fn push_console(level: ConsoleLevel, text: String) {
     });
 }
 
+/// Which panel is currently visible inside the devtools overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Panel {
+    Console,
+    Dom,
+    Network,
+    Picker,
+}
+
+impl Panel {
+    pub fn label(self) -> &'static str {
+        match self {
+            Panel::Console => "Console",
+            Panel::Dom => "Elements",
+            Panel::Network => "Network",
+            Panel::Picker => "Picker",
+        }
+    }
+
+    /// Cycle through the panels in order — Tab pages through.
+    pub fn next(self) -> Self {
+        match self {
+            Panel::Console => Panel::Dom,
+            Panel::Dom => Panel::Network,
+            Panel::Network => Panel::Picker,
+            Panel::Picker => Panel::Console,
+        }
+    }
+}
+
+/// One captured network request. The browser shell pushes into the
+/// shared buffer from `net::Client::do_request`; the network panel
+/// reads it.
+#[derive(Debug, Clone)]
+pub struct NetworkEntry {
+    pub method: String,
+    pub url: String,
+    pub status: u16,
+    pub body_size: u64,
+    pub duration_ms: u32,
+}
+
+/// Bounded network log shared with the network client.
+pub const NETWORK_CAPACITY: usize = 200;
+pub type NetworkLog = Rc<RefCell<VecDeque<NetworkEntry>>>;
+
+thread_local! {
+    /// Network capture shared with `net::Client`. The browser shell
+    /// installs the buffer at startup; the network code pushes
+    /// every successful or failed request.
+    pub static NETWORK_LOG: RefCell<Option<NetworkLog>> = const { RefCell::new(None) };
+}
+
+pub fn push_network(entry: NetworkEntry) {
+    NETWORK_LOG.with(|slot| {
+        if let Some(log) = slot.borrow().as_ref() {
+            let mut q = log.borrow_mut();
+            while q.len() >= NETWORK_CAPACITY {
+                q.pop_front();
+            }
+            q.push_back(entry);
+        }
+    });
+}
+
 /// Devtools panel state attached to the Browser.
 pub struct DevTools {
     /// `true` when the overlay is visible.
     pub open: bool,
-    /// User input in the prompt line.
+    /// Active panel.
+    pub panel: Panel,
+    /// User input in the console prompt line.
     pub input: String,
     /// Scrollback view position — index of the topmost visible
     /// console line. Recompute on resize / new lines.
@@ -92,6 +159,13 @@ pub struct DevTools {
     /// Past evaluation inputs. Up-arrow walks back through them.
     pub history: Vec<String>,
     pub history_cursor: Option<usize>,
+    /// Captured network requests, shared with `net::Client` via
+    /// [`NETWORK_LOG`].
+    pub network: NetworkLog,
+    /// When the Picker panel is active, the most recent hovered
+    /// element index (live, follows the cursor). Read by the
+    /// painter to overlay an outline.
+    pub picker_target: Option<u32>,
 }
 
 impl Default for DevTools {
@@ -104,16 +178,24 @@ impl DevTools {
     pub fn new() -> Self {
         Self {
             open: false,
+            panel: Panel::Console,
             input: String::new(),
             scroll: 0,
             buffer: Rc::new(RefCell::new(VecDeque::with_capacity(CONSOLE_CAPACITY))),
             history: Vec::new(),
             history_cursor: None,
+            network: Rc::new(RefCell::new(VecDeque::with_capacity(NETWORK_CAPACITY))),
+            picker_target: None,
         }
     }
 
     pub fn toggle(&mut self) {
         self.open = !self.open;
+    }
+
+    /// Cycle to the next panel.
+    pub fn cycle_panel(&mut self) {
+        self.panel = self.panel.next();
     }
 
     /// Submit the currently-typed line. Returns the source string for

@@ -414,13 +414,15 @@ impl Browser {
         }
     }
 
-    /// Install the shared console capture buffer so `console.log`
-    /// shims push captured lines into the devtools scrollback. The
-    /// thread-local survives across navigations; the buffer is
-    /// owned by [`DevTools`].
+    /// Install the shared console + network capture buffers so the
+    /// JS console shims and the network client push into the
+    /// devtools' scrollback / network log respectively.
     fn install_devtools_console_capture(&self) {
         devtools::JS_CONSOLE_BUFFER.with(|slot| {
             *slot.borrow_mut() = Some(self.devtools.buffer.clone());
+        });
+        devtools::NETWORK_LOG.with(|slot| {
+            *slot.borrow_mut() = Some(self.devtools.network.clone());
         });
     }
 
@@ -1747,25 +1749,40 @@ impl Browser {
             Key::Named(NamedKey::Escape) => {
                 self.devtools.open = false;
             }
+            Key::Named(NamedKey::Tab) => {
+                self.devtools.cycle_panel();
+            }
             Key::Named(NamedKey::Enter) => {
-                if let Some(src) = self.devtools.submit() {
-                    self.eval_in_devtools(&src);
+                // Enter only submits in the Console panel; the other
+                // panels are read-only.
+                if matches!(self.devtools.panel, devtools::Panel::Console) {
+                    if let Some(src) = self.devtools.submit() {
+                        self.eval_in_devtools(&src);
+                    }
                 }
             }
             Key::Named(NamedKey::Backspace) => {
-                self.devtools.input.pop();
+                if matches!(self.devtools.panel, devtools::Panel::Console) {
+                    self.devtools.input.pop();
+                }
             }
             Key::Named(NamedKey::ArrowUp) => {
-                self.devtools.history_prev();
+                if matches!(self.devtools.panel, devtools::Panel::Console) {
+                    self.devtools.history_prev();
+                }
             }
             Key::Named(NamedKey::ArrowDown) => {
-                self.devtools.history_next();
+                if matches!(self.devtools.panel, devtools::Panel::Console) {
+                    self.devtools.history_next();
+                }
             }
             _ => {
-                if let Some(s) = text {
-                    let s: &str = s.as_ref();
-                    if !s.is_empty() && !s.chars().any(|c| c.is_control()) {
-                        self.devtools.input.push_str(s);
+                if matches!(self.devtools.panel, devtools::Panel::Console) {
+                    if let Some(s) = text {
+                        let s: &str = s.as_ref();
+                        if !s.is_empty() && !s.chars().any(|c| c.is_control()) {
+                            self.devtools.input.push_str(s);
+                        }
                     }
                 }
             }
@@ -1954,6 +1971,7 @@ impl Browser {
                 vw as u32,
                 vh as u32,
                 &self.devtools,
+                self.page.as_ref(),
             );
         }
 
@@ -3049,6 +3067,7 @@ fn paint_devtools_panel(
     width: u32,
     height: u32,
     dt: &devtools::DevTools,
+    page: Option<&Page>,
 ) {
     // Anchor the panel along the bottom third of the window.
     let panel_h = (height / 3).max(140).min(height);
@@ -3085,9 +3104,28 @@ fn paint_devtools_panel(
     let mut hb = Buffer::new(font_system, header_metrics);
     hb.set_size(font_system, Some(width as f32 - 16.0), None);
     hb.set_wrap(font_system, Wrap::None);
+    let tabs = [
+        devtools::Panel::Console,
+        devtools::Panel::Dom,
+        devtools::Panel::Network,
+        devtools::Panel::Picker,
+    ];
+    let header_text = format!(
+        "{} | F12 close, Tab cycle panel",
+        tabs.iter()
+            .map(|p| {
+                if *p == dt.panel {
+                    format!("[{}]", p.label())
+                } else {
+                    format!(" {} ", p.label())
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    );
     hb.set_text(
         font_system,
-        "Console — F12 to close, \u{2191}/\u{2193} for history",
+        &header_text,
         Attrs::new().family(Family::SansSerif),
         Shaping::Advanced,
     );
@@ -3130,15 +3168,74 @@ fn paint_devtools_panel(
         }
     }
 
-    // Scrollback: most recent lines fill the area between the
-    // header and the prompt. Each line gets a coloured tag prefix.
-    let prompt_h: u32 = 24;
+    // Body region (between header and the bottom prompt strip).
+    let prompt_h: u32 = if matches!(dt.panel, devtools::Panel::Console) {
+        24
+    } else {
+        0
+    };
     let scroll_top = panel_top + header_h;
     let scroll_bottom = height.saturating_sub(prompt_h);
     if scroll_bottom <= scroll_top + 12 {
         return;
     }
     let line_h: i32 = 16;
+    let metrics_body = Metrics::new(13.0, 16.0);
+
+    // Non-console panels render their own body and then we return —
+    // the prompt strip is console-only.
+    match dt.panel {
+        devtools::Panel::Dom => {
+            paint_dom_panel(
+                font_system,
+                swash_cache,
+                buffer,
+                width,
+                height,
+                scroll_top,
+                scroll_bottom,
+                line_h,
+                metrics_body,
+                page,
+            );
+            return;
+        }
+        devtools::Panel::Network => {
+            paint_network_panel(
+                font_system,
+                swash_cache,
+                buffer,
+                width,
+                height,
+                scroll_top,
+                scroll_bottom,
+                line_h,
+                metrics_body,
+                dt,
+            );
+            return;
+        }
+        devtools::Panel::Picker => {
+            paint_picker_panel(
+                font_system,
+                swash_cache,
+                buffer,
+                width,
+                height,
+                scroll_top,
+                scroll_bottom,
+                line_h,
+                metrics_body,
+                page,
+            );
+            return;
+        }
+        devtools::Panel::Console => {}
+    }
+
+    // Console scrollback: most recent lines fill the area between
+    // the header and the prompt. Each line gets a coloured tag
+    // prefix.
     let lines = dt.buffer.borrow();
     let visible: Vec<&devtools::ConsoleLine> = lines.iter().rev().collect();
     let max_lines = ((scroll_bottom - scroll_top) as i32 / line_h).max(1) as usize;
@@ -3282,6 +3379,304 @@ fn paint_devtools_panel(
             );
         }
     }
+}
+
+/// Render a list of `(color, text)` lines into the scrollback
+/// region. Top-aligned so the structure is readable; we don't try
+/// to scroll yet.
+#[allow(clippy::too_many_arguments)]
+fn paint_panel_lines(
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    buffer: &mut [u32],
+    width: u32,
+    height: u32,
+    scroll_top: u32,
+    scroll_bottom: u32,
+    line_h: i32,
+    metrics: Metrics,
+    lines: &[(CtColor, String)],
+) {
+    let max_lines = ((scroll_bottom - scroll_top) as i32 / line_h).max(1) as usize;
+    let mut y = scroll_top as i32 + 4;
+    for (color, text) in lines.iter().take(max_lines) {
+        let mut lb = Buffer::new(font_system, metrics);
+        lb.set_size(font_system, Some(width as f32 - 16.0), None);
+        lb.set_wrap(font_system, Wrap::None);
+        lb.set_text(
+            font_system,
+            text,
+            Attrs::new().family(Family::Monospace),
+            Shaping::Advanced,
+        );
+        lb.shape_until_scroll(font_system, false);
+        for run in lb.layout_runs() {
+            for glyph in run.glyphs.iter() {
+                let physical = glyph.physical((10.0, (y + 12) as f32), 1.0);
+                let gx = physical.x;
+                let gy = physical.y;
+                let pmap_w = width as i32;
+                swash_cache.with_pixels(
+                    font_system,
+                    physical.cache_key,
+                    *color,
+                    |x_off, y_off, color| {
+                        let px = gx + x_off;
+                        let py = gy + y_off;
+                        if px < 0 || py < 0 || px >= pmap_w || py as u32 >= height {
+                            return;
+                        }
+                        if (py as u32) < scroll_top {
+                            return;
+                        }
+                        let idx = py as usize * pmap_w as usize + px as usize;
+                        let src_a = color.a();
+                        if src_a == 0 {
+                            return;
+                        }
+                        let inv_a = 255u32 - src_a as u32;
+                        let dst = buffer[idx];
+                        let dr = (dst >> 16) & 0xFF;
+                        let dg = (dst >> 8) & 0xFF;
+                        let db = dst & 0xFF;
+                        let sr = color.r() as u32 * src_a as u32 / 255;
+                        let sg = color.g() as u32 * src_a as u32 / 255;
+                        let sb = color.b() as u32 * src_a as u32 / 255;
+                        let nr = sr + dr * inv_a / 255;
+                        let ng = sg + dg * inv_a / 255;
+                        let nb = sb + db * inv_a / 255;
+                        buffer[idx] = (nr << 16) | (ng << 8) | nb;
+                    },
+                );
+            }
+        }
+        y += line_h;
+        if y as u32 >= scroll_bottom {
+            break;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_dom_panel(
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    buffer: &mut [u32],
+    width: u32,
+    height: u32,
+    scroll_top: u32,
+    scroll_bottom: u32,
+    line_h: i32,
+    metrics: Metrics,
+    page: Option<&Page>,
+) {
+    let lines: Vec<(CtColor, String)> = match page {
+        None => vec![(CtColor::rgb(180, 180, 200), "(no page loaded)".to_string())],
+        Some(p) => {
+            let mut out: Vec<(CtColor, String)> = Vec::new();
+            dump_dom_lines(&p.dom, p.dom.document(), 0, &mut out, 200);
+            out
+        }
+    };
+    paint_panel_lines(
+        font_system,
+        swash_cache,
+        buffer,
+        width,
+        height,
+        scroll_top,
+        scroll_bottom,
+        line_h,
+        metrics,
+        &lines,
+    );
+}
+
+/// Walk the DOM emitting one indented line per element / text /
+/// comment. Caps at `max_lines` so a huge page can't blow up the
+/// renderer.
+fn dump_dom_lines(
+    dom: &dom::Dom,
+    node: dom::NodeId,
+    depth: usize,
+    out: &mut Vec<(CtColor, String)>,
+    max_lines: usize,
+) {
+    if out.len() >= max_lines {
+        return;
+    }
+    let indent = "  ".repeat(depth);
+    match &dom.node(node).kind {
+        dom::NodeKind::Element { tag, attrs } => {
+            let mut tag_text = format!("{indent}<{tag}");
+            for (k, v) in attrs.iter().take(3) {
+                tag_text.push_str(&format!(" {k}=\"{}\"", truncate_chars(v, 24)));
+            }
+            if attrs.len() > 3 {
+                tag_text.push_str(" …");
+            }
+            tag_text.push('>');
+            out.push((CtColor::rgb(140, 200, 255), tag_text));
+        }
+        dom::NodeKind::Text(s) => {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                out.push((
+                    CtColor::rgb(220, 220, 220),
+                    format!("{indent}\u{201C}{}\u{201D}", truncate_chars(trimmed, 80)),
+                ));
+            }
+        }
+        dom::NodeKind::Comment(c) => {
+            out.push((
+                CtColor::rgb(120, 120, 130),
+                format!("{indent}<!-- {} -->", truncate_chars(c, 60)),
+            ));
+        }
+        dom::NodeKind::Doctype(d) => {
+            out.push((
+                CtColor::rgb(180, 180, 200),
+                format!("{indent}<!DOCTYPE {d}>"),
+            ));
+        }
+        _ => {}
+    }
+    for child in dom.children(node).collect::<Vec<_>>() {
+        if out.len() >= max_lines {
+            return;
+        }
+        dump_dom_lines(dom, child, depth + 1, out, max_lines);
+    }
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut t: String = s.chars().take(max_chars).collect();
+    t.push('…');
+    t
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_network_panel(
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    buffer: &mut [u32],
+    width: u32,
+    height: u32,
+    scroll_top: u32,
+    scroll_bottom: u32,
+    line_h: i32,
+    metrics: Metrics,
+    dt: &devtools::DevTools,
+) {
+    let log = dt.network.borrow();
+    let mut lines: Vec<(CtColor, String)> = Vec::new();
+    if log.is_empty() {
+        lines.push((
+            CtColor::rgb(180, 180, 200),
+            "(no requests captured)".to_string(),
+        ));
+    } else {
+        // Most recent first.
+        for entry in log.iter().rev().take(200) {
+            let color = match entry.status {
+                0 => CtColor::rgb(255, 100, 100),
+                200..=299 => CtColor::rgb(140, 230, 140),
+                300..=399 => CtColor::rgb(140, 200, 255),
+                400..=499 => CtColor::rgb(255, 200, 100),
+                _ => CtColor::rgb(255, 100, 100),
+            };
+            let size = if entry.body_size >= 1024 * 1024 {
+                format!("{:.1}M", entry.body_size as f64 / 1_048_576.0)
+            } else if entry.body_size >= 1024 {
+                format!("{:.1}K", entry.body_size as f64 / 1024.0)
+            } else {
+                format!("{}B", entry.body_size)
+            };
+            lines.push((
+                color,
+                format!(
+                    "{m:>4} {s:>3} {url}  ({size}, {dur}ms)",
+                    m = entry.method,
+                    s = entry.status,
+                    url = truncate_chars(&entry.url, 80),
+                    size = size,
+                    dur = entry.duration_ms,
+                ),
+            ));
+        }
+    }
+    paint_panel_lines(
+        font_system,
+        swash_cache,
+        buffer,
+        width,
+        height,
+        scroll_top,
+        scroll_bottom,
+        line_h,
+        metrics,
+        &lines,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_picker_panel(
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    buffer: &mut [u32],
+    width: u32,
+    height: u32,
+    scroll_top: u32,
+    scroll_bottom: u32,
+    line_h: i32,
+    metrics: Metrics,
+    page: Option<&Page>,
+) {
+    let mut lines: Vec<(CtColor, String)> = Vec::new();
+    lines.push((
+        CtColor::rgb(180, 180, 200),
+        "Hover over the page to inspect the element under the cursor.".to_string(),
+    ));
+    if let Some(p) = page {
+        if let Some(node) = p.hover {
+            if let dom::NodeKind::Element { tag, attrs } = &p.dom.node(node).kind {
+                lines.push((
+                    CtColor::rgb(140, 230, 140),
+                    format!("<{tag}>"),
+                ));
+                for (k, v) in attrs {
+                    lines.push((
+                        CtColor::rgb(220, 220, 220),
+                        format!("  {k} = \"{}\"", truncate_chars(v, 80)),
+                    ));
+                }
+                if let Some(b) = p.box_tree.get(node) {
+                    lines.push((
+                        CtColor::rgb(140, 200, 255),
+                        format!(
+                            "  box: x={:.0} y={:.0} w={:.0} h={:.0}",
+                            b.rect.x, b.rect.y, b.rect.width, b.rect.height
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    paint_panel_lines(
+        font_system,
+        swash_cache,
+        buffer,
+        width,
+        height,
+        scroll_top,
+        scroll_bottom,
+        line_h,
+        metrics,
+        &lines,
+    );
 }
 
 fn paint_chrome(

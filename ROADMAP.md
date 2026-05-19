@@ -20,24 +20,18 @@ up the work without re-deriving context.
 
 ## Just shipped
 
-- [x] **CSS subgrid (columns)** (this session) — `ComputedStyle`
-      gains `subgrid_columns` / `subgrid_rows` flags. Cascade parses
-      `grid-template-{columns,rows}: subgrid` into the flag and
-      clears the track list. Layout uses a thread-local
-      `SUBGRID_PARENT` that the parent grid populates with the
-      column-width slice + col-gap for each item before recursing.
-      A subgrid child consumes the slice as its own
-      `column_widths` instead of resolving its template, so items
-      align to the parent's column grid lines. Two follow-up fixes
-      fell out: `grid-column: span N` (shorthand with no slash) now
-      parses as a single `Span` value rather than splitting into
-      two lines, and auto-placement reads `Span` from either
-      `column_start` or `column_end`. Tests cover both subgrid
-      inheriting parent widths and falling back when no parent
-      grid is present. Row subgrid still sets the flag but cannot
-      inherit row heights (parent row heights aren't sized until
-      after items lay out); rows behave like auto, which matches
-      the dominant practical use of subgrid.
+- [x] `24e8829` **CSS subgrid (columns)** — `ComputedStyle` gains
+      `subgrid_columns` / `subgrid_rows` flags. Cascade parses
+      `grid-template-{columns,rows}: subgrid` into the flag. Layout
+      uses a thread-local `SUBGRID_PARENT` that the parent grid
+      populates with the column-width slice + col-gap for each
+      item before recursing. A subgrid child consumes the slice as
+      its own `column_widths`. Two follow-up fixes fell out: the
+      shorthand `grid-column: span N` (no `/`) now parses as a
+      single `Span` value, and auto-placement reads `Span` from
+      either `column_start` or `column_end`. Row subgrid sets the
+      flag but rows can't inherit cheaply (parent row heights
+      aren't known until after children lay out); behaves as auto.
 - [x] **Real bidi text shaping** (this session) — cosmic-text
       already runs the Unicode bidi algorithm per line during
       shape, so mixed Arabic/Hebrew/Latin runs were already

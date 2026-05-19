@@ -2024,16 +2024,17 @@ fn js_fetch(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
 
     // Service Worker fetch interception: if any SW has registered a
     // `fetch` handler, give it first dibs. If it calls
-    // `event.respondWith(...)` we synthesise a Response from its body
-    // and short-circuit the network round-trip.
-    if let Some(body_str) =
+    // `event.respondWith(...)` we synthesise a Response from its
+    // status / headers / body and short-circuit the network
+    // round-trip.
+    if let Some(cache_entry) =
         super::sw::try_intercept_fetch(ctx, target_url.as_str(), &method)
     {
         let resp = net::Response {
-            status: 200,
-            reason: "OK".to_string(),
-            body: body_str.into_bytes(),
-            headers: Vec::new(),
+            status: cache_entry.status,
+            reason: cache_entry.reason,
+            body: cache_entry.body,
+            headers: cache_entry.headers,
             body_path: None,
         };
         return Ok(JsPromise::resolve(

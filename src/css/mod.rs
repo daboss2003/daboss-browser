@@ -38,7 +38,25 @@ pub fn discover_stylesheets(dom: &Dom) -> Vec<StylesheetRef> {
 }
 
 fn collect(dom: &Dom, node: NodeId, out: &mut Vec<StylesheetRef>) {
+    collect_scoped(dom, node, None, out);
+}
+
+/// Same as `collect` but tracks the current shadow-root scope.
+/// When the walker enters a `__shadow_root__` element, every
+/// `<style>` it emits below it gets tagged with the host shadow
+/// root's NodeId so the cascade can scope-gate it.
+fn collect_scoped(
+    dom: &Dom,
+    node: NodeId,
+    scope: Option<NodeId>,
+    out: &mut Vec<StylesheetRef>,
+) {
+    let mut child_scope = scope;
     if let NodeKind::Element { tag, attrs } = &dom.node(node).kind {
+        if tag == "__shadow_root__" {
+            // Descend with this node as the active shadow scope.
+            child_scope = Some(node);
+        }
         match tag.as_str() {
             "style" => {
                 let mut text = String::new();
@@ -47,9 +65,14 @@ fn collect(dom: &Dom, node: NodeId, out: &mut Vec<StylesheetRef>) {
                         text.push_str(t);
                     }
                 }
-                out.push(StylesheetRef::Embedded(parse(&text)));
+                let mut sheet = parse(&text);
+                sheet.scope = scope;
+                out.push(StylesheetRef::Embedded(sheet));
             }
-            "link" => {
+            "link" if scope.is_none() => {
+                // Shadow-internal `<link rel="stylesheet">` would need
+                // a similar scope tag; for the toy we only support
+                // shadow-internal `<style>` blocks (most actual usage).
                 let rel = attrs.iter().find(|(k, _)| k == "rel").map(|(_, v)| v.as_str());
                 let is_stylesheet = rel
                     .map(|r| r.split_ascii_whitespace().any(|w| w.eq_ignore_ascii_case("stylesheet")))
@@ -74,7 +97,7 @@ fn collect(dom: &Dom, node: NodeId, out: &mut Vec<StylesheetRef>) {
     }
     let kids: Vec<NodeId> = dom.children(node).collect();
     for k in kids {
-        collect(dom, k, out);
+        collect_scoped(dom, k, child_scope, out);
     }
 }
 
@@ -117,6 +140,10 @@ pub fn style_dom_with_viewport(
 fn flatten_for_viewport(sheet: &Stylesheet, vp: &Viewport) -> Stylesheet {
     let mut flat = Stylesheet {
         rules: sheet.rules.clone(),
+        // Carry forward the scope + UA flag so cascade-time
+        // gating still works after media-block flattening.
+        scope: sheet.scope,
+        is_ua: sheet.is_ua,
         ..Stylesheet::default()
     };
     for mb in &sheet.media_blocks {
@@ -160,7 +187,9 @@ fn condition_matches(c: &MediaCondition, vp: &Viewport) -> bool {
 }
 
 fn ua_stylesheet() -> Stylesheet {
-    parse(UA_STYLESHEET)
+    let mut s = parse(UA_STYLESHEET);
+    s.is_ua = true;
+    s
 }
 
 const UA_STYLESHEET: &str = r#"

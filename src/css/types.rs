@@ -196,6 +196,15 @@ pub struct Stylesheet {
     /// `@keyframes` rules. Stored verbatim; animation playback is a
     /// later phase but we keep them out of "silently dropped" territory.
     pub keyframes: Vec<KeyframesAnim>,
+    /// Shadow-DOM scope. `None` means a page-level (or UA)
+    /// stylesheet; `Some(host)` means the rules were emitted from a
+    /// `<style>` inside the shadow root attached to `host`, and
+    /// should only match descendants of that shadow root.
+    pub scope: Option<crate::dom::NodeId>,
+    /// `true` for the User Agent stylesheet. UA rules bypass the
+    /// shadow-scope filter so default block/inline/etc. still
+    /// apply inside shadow trees.
+    pub is_ua: bool,
 }
 
 #[derive(Debug, Clone)]

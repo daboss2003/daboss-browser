@@ -473,6 +473,56 @@ impl StyleTree {
     }
 }
 
+/// Synthetic tag used by `element.attachShadow()` to inject a
+/// child that owns the shadow DOM subtree. Kept in sync with
+/// `js::shadow_dom::SHADOW_TAG`.
+const SHADOW_ROOT_TAG: &str = "__shadow_root__";
+
+/// Walk `node`'s ancestor chain and return the nearest shadow root
+/// (the `__shadow_root__` synthetic element). Returns `None` when
+/// `node` is part of the regular light tree.
+fn shadow_root_of(dom: &Dom, node: NodeId) -> Option<NodeId> {
+    let mut cursor = dom.node(node).parent;
+    while let Some(p) = cursor {
+        if let NodeKind::Element { tag, .. } = &dom.node(p).kind {
+            if tag == SHADOW_ROOT_TAG {
+                return Some(p);
+            }
+        }
+        cursor = dom.node(p).parent;
+    }
+    // The node could *itself* be the shadow root.
+    if let NodeKind::Element { tag, .. } = &dom.node(node).kind {
+        if tag == SHADOW_ROOT_TAG {
+            return Some(node);
+        }
+    }
+    None
+}
+
+/// Decide whether a stylesheet's rules are allowed to match
+/// against `node`, given the shadow-root context.
+///
+/// * UA rules always match.
+/// * Page-level rules (scope=None) match only when `node` is
+///   NOT inside any shadow tree.
+/// * Shadow-scoped rules (scope=Some(N)) match only when `node`
+///   is inside the shadow tree rooted at N.
+fn sheet_scope_allows(
+    sheet: &Stylesheet,
+    _dom: &Dom,
+    _node: NodeId,
+    node_shadow_root: Option<NodeId>,
+) -> bool {
+    if sheet.is_ua {
+        return true;
+    }
+    match sheet.scope {
+        None => node_shadow_root.is_none(),
+        Some(scope_root) => node_shadow_root == Some(scope_root),
+    }
+}
+
 fn highest_node_id(dom: &Dom) -> NodeId {
     let mut max = dom.document();
     walk_max(dom, dom.document(), &mut max);
@@ -535,9 +585,14 @@ fn compute_pseudo_style(
     let mut style = ComputedStyle::inherit_from(element_style);
     style.content = None; // reset; rules will set it
 
+    let node_shadow_root = shadow_root_of(dom, node);
     let mut matched: Vec<(Specificity, usize, &Rule)> = Vec::new();
     let mut order = 0usize;
     for sheet in sheets {
+        if !sheet_scope_allows(sheet, dom, node, node_shadow_root) {
+            order += sheet.rules.len();
+            continue;
+        }
         for rule in &sheet.rules {
             order += 1;
             for sel in &rule.selectors {
@@ -599,10 +654,18 @@ fn compute_one(
         _ => return style,
     };
 
-    // Collect matches with specificity + source order.
+    // Collect matches with specificity + source order. Shadow DOM
+    // scoping: a stylesheet's `scope` field decides whether its
+    // rules can match `node`. UA rules ignore scope (they're the
+    // default block/inline/etc.).
+    let node_shadow_root = shadow_root_of(dom, node);
     let mut matched: Vec<(Specificity, usize, &Rule)> = Vec::new();
     let mut order = 0usize;
     for sheet in sheets {
+        if !sheet_scope_allows(sheet, dom, node, node_shadow_root) {
+            order += sheet.rules.len();
+            continue;
+        }
         for rule in &sheet.rules {
             order += 1;
             for sel in &rule.selectors {
@@ -2654,5 +2717,105 @@ mod tests {
         let sheet = parser::parse("p { --gap: 4px; padding: calc(var(--gap) * 2); }");
         let s = style_for(&dom, &sheet, "p");
         assert!((s.padding.top - 8.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn page_css_does_not_cross_into_shadow_tree() {
+        // The outer <p> is in the light DOM and should pick up the
+        // page rule. The inner <p> sits inside a __shadow_root__
+        // and must NOT pick it up (scope isolation).
+        //
+        // We build the DOM directly rather than going through
+        // html::parse — the HTML parser would treat
+        // `<__shadow_root__>` as an unknown tag and serialize
+        // through any tagsoup normalisation. attachShadow() emits
+        // the synthetic root by name; mirror that here.
+        let mut dom = crate::dom::Dom::default();
+        let doc = dom.document();
+        let outer_p = dom.create_element("p".to_string(), Vec::new());
+        dom.append_child(doc, outer_p);
+        let host = dom.create_element("div".to_string(), Vec::new());
+        dom.append_child(doc, host);
+        let shadow = dom.create_element("__shadow_root__".to_string(), Vec::new());
+        dom.append_child(host, shadow);
+        let inner_p = dom.create_element("p".to_string(), Vec::new());
+        dom.append_child(shadow, inner_p);
+
+        let page = parser::parse("p { color: red; }");
+        let tree = StyleTree::compute(&dom, &[&page]);
+        assert_eq!(tree.get(outer_p).color, Color::rgb(255, 0, 0));
+        assert_ne!(
+            tree.get(inner_p).color,
+            Color::rgb(255, 0, 0),
+            "inner inside shadow must not inherit page CSS"
+        );
+    }
+
+    #[test]
+    fn shadow_internal_style_only_matches_shadow_descendants() {
+        // Shadow-internal <style> turns its descendants blue;
+        // light-tree siblings of the same tag stay default.
+        let mut dom = crate::dom::Dom::default();
+        let doc = dom.document();
+        let outer_span = dom.create_element("span".to_string(), Vec::new());
+        dom.append_child(doc, outer_span);
+        let host = dom.create_element("div".to_string(), Vec::new());
+        dom.append_child(doc, host);
+        let shadow = dom.create_element("__shadow_root__".to_string(), Vec::new());
+        dom.append_child(host, shadow);
+        let style_el = dom.create_element("style".to_string(), Vec::new());
+        dom.append_child(shadow, style_el);
+        let style_text = dom.create_text("span{color:rgb(0,0,255);}".to_string());
+        dom.append_child(style_el, style_text);
+        let inner_span = dom.create_element("span".to_string(), Vec::new());
+        dom.append_child(shadow, inner_span);
+
+        let refs = crate::css::discover_stylesheets(&dom);
+        let sheets: Vec<crate::css::Stylesheet> = refs
+            .into_iter()
+            .filter_map(|r| match r {
+                crate::css::StylesheetRef::Embedded(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        let tree = crate::css::style_dom(&dom, &sheets);
+        assert_ne!(
+            tree.get(outer_span).color,
+            Color::rgb(0, 0, 255),
+            "shadow-internal style must not affect light tree"
+        );
+        assert_eq!(
+            tree.get(inner_span).color,
+            Color::rgb(0, 0, 255),
+            "shadow-internal style should affect its own subtree"
+        );
+    }
+
+    fn find_two(
+        dom: &crate::dom::Dom,
+        tree: &StyleTree,
+        tag: &str,
+    ) -> (ComputedStyle, ComputedStyle) {
+        let mut hits = Vec::new();
+        walk_all(dom, dom.document(), tag, tree, &mut hits);
+        assert!(hits.len() >= 2, "expected at least 2 matches for <{tag}>");
+        (hits[0].clone(), hits[1].clone())
+    }
+
+    fn walk_all(
+        dom: &crate::dom::Dom,
+        id: NodeId,
+        tag: &str,
+        tree: &StyleTree,
+        out: &mut Vec<ComputedStyle>,
+    ) {
+        if let NodeKind::Element { tag: t, .. } = &dom.node(id).kind {
+            if t == tag {
+                out.push(tree.get(id).clone());
+            }
+        }
+        for c in dom.children(id).collect::<Vec<_>>() {
+            walk_all(dom, c, tag, tree, out);
+        }
     }
 }

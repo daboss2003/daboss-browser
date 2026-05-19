@@ -20,8 +20,7 @@ up the work without re-deriving context.
 
 ## Just shipped
 
-- [x] **Storage partitioning by top-level origin** (this session)
-      — disk-backed per-origin stores now key off
+- [x] `5bddcd7` **Storage partitioning by top-level origin** — disk-backed per-origin stores now key off
       `(top-level-host, inner-host)` pairs instead of the bare
       inner host. New `JS_TOP_LEVEL_BASE_URL` thread-local in
       `js::engine` (mirrors `JS_BASE_URL` for top-frame contexts;

@@ -134,6 +134,10 @@ thread_local! {
         RefCell<Option<Rc<RefCell<std::collections::HashMap<NodeId, [f32; 4]>>>>> =
         const { RefCell::new(None) };
 
+    /// Scroll request emitted by `element.scrollIntoView()` and
+    /// drained by the browser shell on the next tick.
+    pub(crate) static JS_SCROLL_TO_DOC_Y: RefCell<Option<f32>> = const { RefCell::new(None) };
+
     /// Per-element computed-style snapshot, populated by the browser
     /// after each cascade. Backs `window.getComputedStyle()`.
     pub(crate) static JS_COMPUTED_STYLES: RefCell<
@@ -1304,6 +1308,24 @@ fn install_animation_frame_globals(ctx: &mut Context) {
     .ok();
     ctx.register_global_callable(
         js_string!("cancelAnimationFrame"),
+        1,
+        NativeFunction::from_fn_ptr(cancel_animation_frame),
+    )
+    .ok();
+    // `requestIdleCallback` — a common gate for non-urgent work.
+    // Real browsers fire it when the main thread has idle time
+    // before the next frame deadline. Our toy runs the callback at
+    // the next rAF tick, which is close enough for feature
+    // detection + lazy work that doesn't depend on actual idle
+    // measurement.
+    ctx.register_global_callable(
+        js_string!("requestIdleCallback"),
+        1,
+        NativeFunction::from_fn_ptr(request_animation_frame),
+    )
+    .ok();
+    ctx.register_global_callable(
+        js_string!("cancelIdleCallback"),
         1,
         NativeFunction::from_fn_ptr(cancel_animation_frame),
     )

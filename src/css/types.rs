@@ -781,6 +781,11 @@ pub struct ComputedStyle {
     /// CSS animation that only mutates those properties skips the
     /// subtree repaint cost.
     pub will_change: Option<String>,
+    /// `aspect-ratio: <w> / <h>`. When set, layout derives the
+    /// other dimension from a known one (e.g. width from height
+    /// for an `<img>` whose intrinsic ratio we want to override).
+    /// Stored as `width / height`. `None` means "auto".
+    pub aspect_ratio: Option<f32>,
     /// `transition: <prop> <duration> [<timing>] [<delay>]` entries.
     /// When a tracked property changes between cascades, the browser
     /// shell starts a running animation that interpolates the old →
@@ -910,6 +915,7 @@ impl ComputedStyle {
             container_type: None,
             container_name: None,
             will_change: None,
+            aspect_ratio: None,
             transitions: Vec::new(),
             animations: Vec::new(),
             box_shadow: None,

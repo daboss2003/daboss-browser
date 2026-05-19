@@ -32,6 +32,8 @@ pub fn install(ctx: &mut Context) {
         NativeFunction::from_fn_ptr(url_constructor),
     )
     .ok();
+    // Attach static helpers URL.canParse + URL.parse (modern adds).
+    attach_url_statics(ctx);
     ctx.register_global_callable(
         js_string!("URLSearchParams"),
         1,
@@ -61,6 +63,55 @@ pub fn install(ctx: &mut Context) {
 // ============================ URL ============================
 
 const URL_STATE_KEY: &str = "__url_state";
+
+fn attach_url_statics(ctx: &mut Context) {
+    let realm = ctx.realm().clone();
+    let can_parse = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(url_can_parse),
+    )
+    .build();
+    let parse_fn = boa_engine::object::FunctionObjectBuilder::new(
+        &realm,
+        NativeFunction::from_fn_ptr(url_parse_static),
+    )
+    .build();
+    let global = ctx.global_object();
+    if let Ok(url_val) = global.get(js_string!("URL"), ctx) {
+        if let Some(url_obj) = url_val.as_object() {
+            let _ = url_obj.set(js_string!("canParse"), JsValue::from(can_parse), false, ctx);
+            let _ = url_obj.set(js_string!("parse"), JsValue::from(parse_fn), false, ctx);
+        }
+    }
+}
+
+fn url_can_parse(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(u) = args.first() else {
+        return Ok(JsValue::from(false));
+    };
+    let raw = u.to_string(ctx)?.to_std_string_escaped();
+    let base = args.get(1).and_then(|v| {
+        v.to_string(ctx)
+            .ok()
+            .map(|s| s.to_std_string_escaped())
+            .filter(|s| !s.is_empty())
+    });
+    let parsed = match base {
+        Some(b) => url::Url::parse(&b).and_then(|u| u.join(&raw)),
+        None => url::Url::parse(&raw),
+    };
+    Ok(JsValue::from(parsed.is_ok()))
+}
+
+fn url_parse_static(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    // Spec: URL.parse returns a URL or null. We re-route through
+    // the constructor and swallow errors so callers see `null`
+    // instead of an exception.
+    match url_constructor(&JsValue::undefined(), args, ctx) {
+        Ok(v) if !v.is_null() && !v.is_undefined() => Ok(v),
+        _ => Ok(JsValue::null()),
+    }
+}
 
 thread_local! {
     static URL_REGISTRY: RefCell<HashMap<u64, Rc<RefCell<url::Url>>>> =

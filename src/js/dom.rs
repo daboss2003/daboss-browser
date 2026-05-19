@@ -342,6 +342,11 @@ pub(crate) fn make_element_handle(ctx: &mut Context, id: NodeId) -> JsObject {
         0,
     );
     init.function(
+        NativeFunction::from_fn_ptr(element_scroll_into_view),
+        js_string!("scrollIntoView"),
+        0,
+    );
+    init.function(
         NativeFunction::from_fn_ptr(super::shadow_dom::element_attach_shadow),
         js_string!("attachShadow"),
         1,
@@ -1994,6 +1999,32 @@ fn data_attr_to_camel(s: &str) -> String {
 }
 
 // ---------- helpers ----------
+
+/// `element.scrollIntoView(options?)` — queues a scroll request so
+/// the browser shell lands the element at the top of the viewport
+/// on the next tick. The cached bounding rect carries the element's
+/// y in viewport-relative coordinates, so we add the current
+/// scroll offset to produce a document-y the shell can scroll to.
+fn element_scroll_into_view(
+    this: &JsValue,
+    _args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let Some(id) = read_self_node_id(this, ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    let rect = super::engine::JS_BOUNDING_RECTS.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|rc| rc.borrow().get(&id).copied())
+    });
+    let [_x, y, _w, _h] = rect.unwrap_or([0.0, 0.0, 0.0, 0.0]);
+    // The shell drains this request next tick and adjusts scroll_y.
+    super::engine::JS_SCROLL_TO_DOC_Y.with(|slot| {
+        *slot.borrow_mut() = Some(y.max(0.0));
+    });
+    Ok(JsValue::undefined())
+}
 
 fn element_get_bounding_client_rect(
     this: &JsValue,

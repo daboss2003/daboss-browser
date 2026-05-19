@@ -4192,6 +4192,21 @@ impl ApplicationHandler for Browser {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.pump_js_timers();
         self.pump_js_animation_frames();
+        // Drain any pending `element.scrollIntoView()` requests
+        // from page scripts and clamp into the scrollable range.
+        let scroll_target =
+            js::engine::JS_SCROLL_TO_DOC_Y.with(|s| s.borrow_mut().take());
+        if let Some(y) = scroll_target {
+            if let Some(page) = &self.page {
+                let max_scroll = (page.pixmap.height() as f32
+                    - self.page_viewport_height() as f32)
+                    .max(0.0);
+                self.scroll_y = y.clamp(0.0, max_scroll);
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+        }
         let next = self
             .page
             .as_ref()

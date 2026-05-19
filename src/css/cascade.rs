@@ -1234,6 +1234,34 @@ fn apply_declaration(
                 _ => None,
             };
         }
+        "aspect-ratio" => {
+            style.aspect_ratio = match value {
+                Value::Keyword(k) if k == "auto" => None,
+                Value::Number(n) if *n > 0.0 => Some(*n),
+                Value::List(parts) if parts.len() == 2 => {
+                    let w = parts
+                        .first()
+                        .and_then(|v| match v {
+                            Value::Number(n) => Some(*n),
+                            _ => None,
+                        })
+                        .unwrap_or(1.0);
+                    let h = parts
+                        .get(1)
+                        .and_then(|v| match v {
+                            Value::Number(n) => Some(*n),
+                            _ => None,
+                        })
+                        .unwrap_or(1.0);
+                    if h > 0.0 {
+                        Some(w / h)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+        }
         "will-change" => {
             style.will_change = match value {
                 Value::Keyword(k) if k == "auto" => None,

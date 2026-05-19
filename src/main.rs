@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod audio;
+mod devtools;
 mod capture;
 mod css;
 mod dom;
@@ -373,6 +374,11 @@ struct Browser {
     /// preserved). Capped at `BFCACHE_CAP` entries — evicted oldest
     /// first.
     bfcache: Vec<(url::Url, Page, f32)>,
+
+    /// Devtools overlay state. Toggled with F12 / Cmd+Opt+I; when
+    /// `open`, keyboard input goes to the console prompt and the
+    /// panel renders along the bottom of the window.
+    devtools: devtools::DevTools,
 }
 
 impl Browser {
@@ -404,7 +410,18 @@ impl Browser {
             active_tab: 0,
             find: None,
             bfcache: Vec::new(),
+            devtools: devtools::DevTools::new(),
         }
+    }
+
+    /// Install the shared console capture buffer so `console.log`
+    /// shims push captured lines into the devtools scrollback. The
+    /// thread-local survives across navigations; the buffer is
+    /// owned by [`DevTools`].
+    fn install_devtools_console_capture(&self) {
+        devtools::JS_CONSOLE_BUFFER.with(|slot| {
+            *slot.borrow_mut() = Some(self.devtools.buffer.clone());
+        });
     }
 
     /// Height (px) available to the page after subtracting the chrome.
@@ -1448,6 +1465,32 @@ impl Browser {
             }
         }
 
+        // F12 toggles the devtools overlay regardless of other
+        // input states. Cmd+Opt+I matches Chrome / Safari muscle
+        // memory.
+        if matches!(logical_key.as_ref(), Key::Named(NamedKey::F12)) {
+            self.devtools.toggle();
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+            return;
+        }
+        if self.modifiers.super_key() && self.modifiers.alt_key() {
+            if matches!(logical_key.as_ref(), Key::Character("i") | Key::Character("I")) {
+                self.devtools.toggle();
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+                return;
+            }
+        }
+
+        // Devtools, when open, consumes keyboard input.
+        if self.devtools.open {
+            self.handle_devtools_key(logical_key, text);
+            return;
+        }
+
         if self.find.is_some() {
             self.handle_find_key(logical_key, text);
             return;
@@ -1699,6 +1742,57 @@ impl Browser {
         }
     }
 
+    fn handle_devtools_key(&mut self, logical_key: Key, text: Option<winit::keyboard::SmolStr>) {
+        match logical_key.as_ref() {
+            Key::Named(NamedKey::Escape) => {
+                self.devtools.open = false;
+            }
+            Key::Named(NamedKey::Enter) => {
+                if let Some(src) = self.devtools.submit() {
+                    self.eval_in_devtools(&src);
+                }
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.devtools.input.pop();
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                self.devtools.history_prev();
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                self.devtools.history_next();
+            }
+            _ => {
+                if let Some(s) = text {
+                    let s: &str = s.as_ref();
+                    if !s.is_empty() && !s.chars().any(|c| c.is_control()) {
+                        self.devtools.input.push_str(s);
+                    }
+                }
+            }
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Evaluate a snippet against the current page's JS engine and
+    /// stash the result into the devtools scrollback.
+    fn eval_in_devtools(&mut self, src: &str) {
+        let result = match self.page.as_mut() {
+            Some(page) => page.js.eval_for_devtools(src),
+            None => Err("no page loaded".to_string()),
+        };
+        match result {
+            Ok(s) => self.devtools.push_result(s),
+            Err(e) => {
+                self.devtools.buffer.borrow_mut().push_back(devtools::ConsoleLine {
+                    level: devtools::ConsoleLevel::Error,
+                    text: e,
+                });
+            }
+        }
+    }
+
     fn handle_chrome_key(&mut self, logical_key: Key, text: Option<winit::keyboard::SmolStr>) {
         match logical_key.as_ref() {
             Key::Named(NamedKey::Enter) => {
@@ -1848,6 +1942,20 @@ impl Browser {
         // textures so the present path can composite them on top
         // of the scrolled view via textured quads. See the
         // present_with_overlays call below.
+
+        // Devtools panel: draws on top of everything else, anchored
+        // along the bottom of the window. Painted directly into the
+        // softbuffer u32 surface like the chrome strips.
+        if self.devtools.open {
+            paint_devtools_panel(
+                &mut self.chrome_font_system,
+                &mut self.chrome_swash,
+                buffer,
+                vw as u32,
+                vh as u32,
+                &self.devtools,
+            );
+        }
 
         // Input overlays — typed values painted on top of the page pixmap.
         if let Some(page) = &self.page {
@@ -2934,6 +3042,248 @@ fn draw_input_text(
 /// Background is a light gray strip with a darker bottom border; text uses
 /// cosmic-text shaping + swash glyph rendering, alpha-blended onto the
 /// surface pixel by pixel.
+fn paint_devtools_panel(
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    buffer: &mut [u32],
+    width: u32,
+    height: u32,
+    dt: &devtools::DevTools,
+) {
+    // Anchor the panel along the bottom third of the window.
+    let panel_h = (height / 3).max(140).min(height);
+    let panel_top = height.saturating_sub(panel_h);
+    let bg = 0x00_1E_1E_1E;
+    let prompt_bg = 0x00_2A_2A_2A;
+    let border = 0x00_3A_3A_3A;
+    // Background fill.
+    for y in panel_top..height {
+        let row = (y * width) as usize;
+        for x in 0..width {
+            buffer[row + x as usize] = bg;
+        }
+    }
+    // 1px top border.
+    if panel_top > 0 {
+        let row = (panel_top * width) as usize;
+        for x in 0..width {
+            buffer[row + x as usize] = border;
+        }
+    }
+
+    // Header strip with hint text.
+    let header_h: u32 = 22;
+    let header_color = 0x00_28_28_28;
+    let header_text_color = CtColor::rgb(180, 180, 200);
+    for y in panel_top..(panel_top + header_h).min(height) {
+        let row = (y * width) as usize;
+        for x in 0..width {
+            buffer[row + x as usize] = header_color;
+        }
+    }
+    let header_metrics = Metrics::new(12.0, 14.0);
+    let mut hb = Buffer::new(font_system, header_metrics);
+    hb.set_size(font_system, Some(width as f32 - 16.0), None);
+    hb.set_wrap(font_system, Wrap::None);
+    hb.set_text(
+        font_system,
+        "Console — F12 to close, \u{2191}/\u{2193} for history",
+        Attrs::new().family(Family::SansSerif),
+        Shaping::Advanced,
+    );
+    hb.shape_until_scroll(font_system, false);
+    for run in hb.layout_runs() {
+        for glyph in run.glyphs.iter() {
+            let physical = glyph.physical((8.0, panel_top as f32 + run.line_y + 14.0), 1.0);
+            let gx = physical.x;
+            let gy = physical.y;
+            let pmap_w = width as i32;
+            swash_cache.with_pixels(
+                font_system,
+                physical.cache_key,
+                header_text_color,
+                |x_off, y_off, color| {
+                    let px = gx + x_off;
+                    let py = gy + y_off;
+                    if px < 0 || py < 0 || px >= pmap_w || py as u32 >= height {
+                        return;
+                    }
+                    let idx = py as usize * pmap_w as usize + px as usize;
+                    let src_a = color.a();
+                    if src_a == 0 {
+                        return;
+                    }
+                    let inv_a = 255u32 - src_a as u32;
+                    let dst = buffer[idx];
+                    let dr = (dst >> 16) & 0xFF;
+                    let dg = (dst >> 8) & 0xFF;
+                    let db = dst & 0xFF;
+                    let sr = color.r() as u32 * src_a as u32 / 255;
+                    let sg = color.g() as u32 * src_a as u32 / 255;
+                    let sb = color.b() as u32 * src_a as u32 / 255;
+                    let nr = sr + dr * inv_a / 255;
+                    let ng = sg + dg * inv_a / 255;
+                    let nb = sb + db * inv_a / 255;
+                    buffer[idx] = (nr << 16) | (ng << 8) | nb;
+                },
+            );
+        }
+    }
+
+    // Scrollback: most recent lines fill the area between the
+    // header and the prompt. Each line gets a coloured tag prefix.
+    let prompt_h: u32 = 24;
+    let scroll_top = panel_top + header_h;
+    let scroll_bottom = height.saturating_sub(prompt_h);
+    if scroll_bottom <= scroll_top + 12 {
+        return;
+    }
+    let line_h: i32 = 16;
+    let lines = dt.buffer.borrow();
+    let visible: Vec<&devtools::ConsoleLine> = lines.iter().rev().collect();
+    let max_lines = ((scroll_bottom - scroll_top) as i32 / line_h).max(1) as usize;
+    let to_show: Vec<&devtools::ConsoleLine> = visible.into_iter().take(max_lines).collect();
+    // Render bottom-up so the newest line lands closest to the
+    // prompt — same ordering as Chrome's console.
+    let metrics = Metrics::new(13.0, 16.0);
+    let mut y = scroll_bottom as i32 - line_h;
+    for line in to_show {
+        let (tag_color, body_color) = match line.level {
+            devtools::ConsoleLevel::Error => (CtColor::rgb(255, 100, 100), CtColor::rgb(255, 200, 200)),
+            devtools::ConsoleLevel::Warn => (CtColor::rgb(255, 200, 80), CtColor::rgb(240, 220, 180)),
+            devtools::ConsoleLevel::Info => (CtColor::rgb(140, 200, 255), CtColor::rgb(220, 230, 240)),
+            devtools::ConsoleLevel::Debug => (CtColor::rgb(180, 180, 200), CtColor::rgb(200, 200, 210)),
+            devtools::ConsoleLevel::Prompt => (CtColor::rgb(140, 230, 140), CtColor::rgb(220, 240, 220)),
+            devtools::ConsoleLevel::Result => (CtColor::rgb(140, 200, 255), CtColor::rgb(220, 220, 240)),
+            devtools::ConsoleLevel::Log => (CtColor::rgb(180, 180, 200), CtColor::rgb(220, 220, 220)),
+        };
+        let prefix = match line.level {
+            devtools::ConsoleLevel::Prompt => "> ",
+            devtools::ConsoleLevel::Result => "<- ",
+            _ => "",
+        };
+        let composed = format!("{prefix}{}", line.text);
+        let mut lb = Buffer::new(font_system, metrics);
+        lb.set_size(font_system, Some(width as f32 - 16.0), None);
+        lb.set_wrap(font_system, Wrap::None);
+        lb.set_text(
+            font_system,
+            &composed,
+            Attrs::new().family(Family::Monospace),
+            Shaping::Advanced,
+        );
+        lb.shape_until_scroll(font_system, false);
+        for run in lb.layout_runs() {
+            for glyph in run.glyphs.iter() {
+                let physical = glyph.physical((10.0, (y + 12) as f32), 1.0);
+                let gx = physical.x;
+                let gy = physical.y;
+                let pmap_w = width as i32;
+                let color = if prefix.is_empty() {
+                    body_color
+                } else if (glyph.start as usize) < prefix.len() {
+                    tag_color
+                } else {
+                    body_color
+                };
+                swash_cache.with_pixels(
+                    font_system,
+                    physical.cache_key,
+                    color,
+                    |x_off, y_off, color| {
+                        let px = gx + x_off;
+                        let py = gy + y_off;
+                        if px < 0 || py < 0 || px >= pmap_w || py as u32 >= height {
+                            return;
+                        }
+                        if (py as u32) < scroll_top {
+                            return;
+                        }
+                        let idx = py as usize * pmap_w as usize + px as usize;
+                        let src_a = color.a();
+                        if src_a == 0 {
+                            return;
+                        }
+                        let inv_a = 255u32 - src_a as u32;
+                        let dst = buffer[idx];
+                        let dr = (dst >> 16) & 0xFF;
+                        let dg = (dst >> 8) & 0xFF;
+                        let db = dst & 0xFF;
+                        let sr = color.r() as u32 * src_a as u32 / 255;
+                        let sg = color.g() as u32 * src_a as u32 / 255;
+                        let sb = color.b() as u32 * src_a as u32 / 255;
+                        let nr = sr + dr * inv_a / 255;
+                        let ng = sg + dg * inv_a / 255;
+                        let nb = sb + db * inv_a / 255;
+                        buffer[idx] = (nr << 16) | (ng << 8) | nb;
+                    },
+                );
+            }
+        }
+        y -= line_h;
+        if y < scroll_top as i32 {
+            break;
+        }
+    }
+
+    // Prompt strip.
+    for y in scroll_bottom..height {
+        let row = (y * width) as usize;
+        for x in 0..width {
+            buffer[row + x as usize] = prompt_bg;
+        }
+    }
+    let prompt_text = format!("> {}_", dt.input);
+    let mut pb = Buffer::new(font_system, metrics);
+    pb.set_size(font_system, Some(width as f32 - 16.0), None);
+    pb.set_wrap(font_system, Wrap::None);
+    pb.set_text(
+        font_system,
+        &prompt_text,
+        Attrs::new().family(Family::Monospace),
+        Shaping::Advanced,
+    );
+    pb.shape_until_scroll(font_system, false);
+    let prompt_color = CtColor::rgb(220, 240, 220);
+    for run in pb.layout_runs() {
+        for glyph in run.glyphs.iter() {
+            let physical = glyph.physical((10.0, scroll_bottom as f32 + 16.0), 1.0);
+            let gx = physical.x;
+            let gy = physical.y;
+            let pmap_w = width as i32;
+            swash_cache.with_pixels(
+                font_system,
+                physical.cache_key,
+                prompt_color,
+                |x_off, y_off, color| {
+                    let px = gx + x_off;
+                    let py = gy + y_off;
+                    if px < 0 || py < 0 || px >= pmap_w || py as u32 >= height {
+                        return;
+                    }
+                    let idx = py as usize * pmap_w as usize + px as usize;
+                    let src_a = color.a();
+                    if src_a == 0 {
+                        return;
+                    }
+                    let inv_a = 255u32 - src_a as u32;
+                    let dst = buffer[idx];
+                    let dr = (dst >> 16) & 0xFF;
+                    let dg = (dst >> 8) & 0xFF;
+                    let db = dst & 0xFF;
+                    let sr = color.r() as u32 * src_a as u32 / 255;
+                    let sg = color.g() as u32 * src_a as u32 / 255;
+                    let sb = color.b() as u32 * src_a as u32 / 255;
+                    let nr = sr + dr * inv_a / 255;
+                    let ng = sg + dg * inv_a / 255;
+                    let nb = sb + db * inv_a / 255;
+                    buffer[idx] = (nr << 16) | (ng << 8) | nb;
+                },
+            );
+        }
+    }
+}
+
 fn paint_chrome(
     font_system: &mut FontSystem,
     swash_cache: &mut SwashCache,
@@ -3371,6 +3721,9 @@ impl ApplicationHandler for Browser {
         self.viewport_size = (size.width.max(1), size.height.max(1));
         self.window = Some(window);
         self.surface = Some(surface);
+        // Pipe console.* output from page scripts into the
+        // devtools scrollback for the lifetime of the process.
+        self.install_devtools_console_capture();
 
         if let Some(url) = self.pending_url.take() {
             self.navigate(&url, true);

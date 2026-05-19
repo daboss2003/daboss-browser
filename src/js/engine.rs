@@ -777,6 +777,17 @@ impl JsEngine {
         self.dispatch_event_with(dom, event_type, target, EventInit::bubbling())
     }
 
+    /// Evaluate a snippet from the devtools console against the
+    /// live page context, returning the displayed string or an
+    /// error message. The result mirrors how Chrome's devtools
+    /// shows `undefined` / numbers / strings / `[Object …]`.
+    pub fn eval_for_devtools(&mut self, src: &str) -> Result<String, String> {
+        match self.ctx.eval(boa_engine::Source::from_bytes(src.as_bytes())) {
+            Ok(v) => Ok(v.display().to_string()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     /// Drive IntersectionObserver / ResizeObserver against the
     /// current layout. Call once per layout pass; callbacks fire
     /// for any threshold crossing or size change.

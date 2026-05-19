@@ -144,7 +144,9 @@ pub fn run_inline_scripts(dom: &mut Dom) -> JsEngine {
 }
 
 pub(crate) fn install_console(ctx: &mut Context) {
-    fn print_args(level: &str, args: &[JsValue]) {
+    use crate::devtools::{push_console, ConsoleLevel};
+
+    fn render_args(args: &[JsValue]) -> String {
         let mut buf = String::new();
         for (i, a) in args.iter().enumerate() {
             if i > 0 {
@@ -152,26 +154,31 @@ pub(crate) fn install_console(ctx: &mut Context) {
             }
             buf.push_str(&a.display().to_string());
         }
-        eprintln!("[js {level}] {buf}");
+        buf
+    }
+    fn emit(level: ConsoleLevel, args: &[JsValue]) {
+        let text = render_args(args);
+        eprintln!("[js {}] {text}", level.label());
+        push_console(level, text);
     }
     fn log(_: &JsValue, args: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
-        print_args("log", args);
+        emit(ConsoleLevel::Log, args);
         Ok(JsValue::undefined())
     }
     fn warn(_: &JsValue, args: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
-        print_args("warn", args);
+        emit(ConsoleLevel::Warn, args);
         Ok(JsValue::undefined())
     }
     fn error(_: &JsValue, args: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
-        print_args("error", args);
+        emit(ConsoleLevel::Error, args);
         Ok(JsValue::undefined())
     }
     fn debug(_: &JsValue, args: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
-        print_args("debug", args);
+        emit(ConsoleLevel::Debug, args);
         Ok(JsValue::undefined())
     }
     fn info(_: &JsValue, args: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
-        print_args("info", args);
+        emit(ConsoleLevel::Info, args);
         Ok(JsValue::undefined())
     }
     let console = ObjectInitializer::new(ctx)

@@ -713,6 +713,18 @@ pub enum BackgroundImage {
     },
 }
 
+/// How `mask-image` is interpreted per-pixel. `MatchSource` is the
+/// CSS default: alpha for `mask-image: url(...)` SVG sources,
+/// luminance for raster bitmaps. The toy collapses match-source to
+/// alpha (matches the most common author usage — alpha-channel
+/// PNG masks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaskMode {
+    Alpha,
+    Luminance,
+    MatchSource,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct BoxShadow {
     pub offset_x: f32,
@@ -778,6 +790,13 @@ pub struct ComputedStyle {
     /// `background-image` value: an image URL to fetch, or a
     /// `linear-gradient(...)` to render. Not inherited.
     pub background_image: Option<BackgroundImage>,
+    /// `mask-image: url(...)` or `mask-image: linear-gradient(...)`.
+    /// Applied per-pixel at paint time: the element subtree is
+    /// composited to an offscreen pixmap, the mask is drawn at the
+    /// element's box size, and `mask_mode` selects whether the
+    /// mask's alpha or luminance multiplies into the subtree alpha.
+    pub mask_image: Option<BackgroundImage>,
+    pub mask_mode: MaskMode,
     /// Single uniform corner radius in pixels (no per-corner support).
     /// Not inherited.
     pub border_radius: f32,
@@ -977,6 +996,8 @@ impl ComputedStyle {
             content: None,
             text_decoration: TextDecoration::None,
             background_image: None,
+            mask_image: None,
+            mask_mode: MaskMode::MatchSource,
             border_radius: 0.0,
             opacity: 1.0,
             filter: Vec::new(),

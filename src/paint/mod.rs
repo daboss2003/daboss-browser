@@ -293,6 +293,20 @@ impl Painter {
             }
         }
 
+        // `mask-image` paints the subtree into an offscreen pixmap,
+        // renders the mask into a same-size pixmap, then multiplies the
+        // mask's alpha (or luminance) into the subtree alpha before
+        // compositing. Wraps filter so filter applies first and mask
+        // cuts the filtered output.
+        if style.mask_image.is_some() {
+            if let Some(b) = tree.get(node) {
+                self.paint_subtree_with_mask(
+                    dom, styles, tree, images, node, parent_ctx, b.rect,
+                );
+                return;
+            }
+        }
+
         // If the element has a visual filter (anything beyond opacity,
         // which is already folded into the alpha stack), paint the
         // subtree into an offscreen pixmap, apply the filter pixel-by-
@@ -857,6 +871,147 @@ impl Painter {
             self.pixmap
                 .fill_rect(rect, &paint, Transform::identity(), None);
         }
+    }
+
+    /// Paint a masked subtree.
+    ///
+    /// Renders the element's subtree into an offscreen pixmap (so any
+    /// nested filter/transform passes still work). Then renders the
+    /// mask image — bitmap or linear gradient — into a parallel
+    /// pixmap of the same size at the element's box rect. Finally
+    /// walks both pixmaps per-pixel and multiplies the mask alpha (or
+    /// luminance, depending on `mask-mode`) into the subtree alpha,
+    /// preserving premultiplied RGB. The result is composited back at
+    /// the element's screen position.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_subtree_with_mask(
+        &mut self,
+        dom: &Dom,
+        styles: &StyleTree,
+        tree: &BoxTree,
+        images: &ImageCache,
+        node: NodeId,
+        parent_ctx: PaintCtx,
+        box_rect: Rect,
+    ) {
+        let style = styles.get(node);
+        let ctx = parent_ctx.with(style);
+        let off_w = box_rect.width.ceil().max(1.0) as u32;
+        let off_h = box_rect.height.ceil().max(1.0) as u32;
+
+        // 1. Paint subtree into offscreen.
+        let Some(subtree) = Pixmap::new(off_w, off_h) else {
+            self.paint_subtree_inner(dom, styles, tree, images, node, parent_ctx);
+            return;
+        };
+        let saved = std::mem::replace(&mut self.pixmap, subtree);
+        let inner_ctx = PaintCtx {
+            alpha: parent_ctx.alpha,
+            tx: -box_rect.x,
+            ty: -box_rect.y,
+        };
+        // Note: avoid re-entering `paint_subtree` (which would try the
+        // mask path again and recurse forever). Going straight to the
+        // inner walk also matches how filter passes work — both wrap
+        // the same subtree paint and order their effect on top.
+        self.paint_subtree_inner(dom, styles, tree, images, node, inner_ctx);
+        let mut subtree = std::mem::replace(&mut self.pixmap, saved);
+
+        // 2. Paint the mask source into a fresh pixmap.
+        let Some(mask_pixmap) = Pixmap::new(off_w, off_h) else {
+            // Mask source allocation failed — fall back to compositing
+            // the unmasked subtree pixmap. Cheaper than aborting.
+            let transform = Transform::from_translate(
+                (box_rect.x + ctx.tx).round(),
+                (box_rect.y + ctx.ty).round(),
+            );
+            let mut paint = PixmapPaint::default();
+            paint.opacity = ctx.alpha;
+            self.pixmap
+                .draw_pixmap(0, 0, subtree.as_ref(), &paint, transform, None);
+            return;
+        };
+        let saved = std::mem::replace(&mut self.pixmap, mask_pixmap);
+        let mask_ctx = PaintCtx {
+            alpha: 1.0,
+            tx: 0.0,
+            ty: 0.0,
+        };
+        match style.mask_image.as_ref() {
+            Some(BackgroundImage::Url(_)) => {
+                if let Some(info) = images.get(&(node, ImageSlot::Mask)) {
+                    self.paint_image(
+                        Rect { x: 0.0, y: 0.0, width: off_w as f32, height: off_h as f32 },
+                        info,
+                        mask_ctx,
+                    );
+                }
+            }
+            Some(BackgroundImage::LinearGradient { angle_deg, stops }) => {
+                self.paint_linear_gradient(
+                    0.0,
+                    0.0,
+                    off_w as f32,
+                    off_h as f32,
+                    *angle_deg,
+                    stops,
+                    mask_ctx,
+                );
+            }
+            None => {}
+        }
+        let mask_pixmap = std::mem::replace(&mut self.pixmap, saved);
+
+        // 3. Multiply mask into subtree.
+        let use_luminance = match style.mask_mode {
+            crate::css::MaskMode::Luminance => true,
+            crate::css::MaskMode::Alpha => false,
+            // `match-source`: spec says alpha for SVG, luminance for
+            // raster bitmaps. We don't track source type here; alpha
+            // is the dominant author intent (alpha PNG sprites etc.)
+            // so collapse to alpha.
+            crate::css::MaskMode::MatchSource => false,
+        };
+        let mask_data = mask_pixmap.data();
+        let sub_data = subtree.data_mut();
+        debug_assert_eq!(mask_data.len(), sub_data.len());
+        let mut i = 0;
+        while i + 3 < sub_data.len() {
+            let mr = mask_data[i] as u32;
+            let mg = mask_data[i + 1] as u32;
+            let mb = mask_data[i + 2] as u32;
+            let ma = mask_data[i + 3] as u32;
+            // Pixmap data is premultiplied. For alpha mode we want the
+            // mask's coverage, which IS the alpha channel directly.
+            // For luminance, compute Rec.601 luminance of the
+            // straight (un-premultiplied) RGB, which approximates how
+            // CSS spec defines `luminance` mask mode. We don't bother
+            // un-premultiplying — premultiplied RGB times the standard
+            // weights is a close-enough approximation for the toy.
+            let factor = if use_luminance {
+                // 0.299 R + 0.587 G + 0.114 B → fixed-point /256.
+                ((mr * 77 + mg * 150 + mb * 29) >> 8).min(255)
+            } else {
+                ma
+            };
+            // Multiply subtree RGBA by factor/255. Pixmap stores
+            // premultiplied RGBA so all four channels scale together.
+            for ch in 0..4 {
+                let v = sub_data[i + ch] as u32;
+                sub_data[i + ch] = ((v * factor) / 255) as u8;
+            }
+            i += 4;
+        }
+
+        // 4. Composite masked subtree back at the element's position.
+        let transform = Transform::from_translate(
+            (box_rect.x + ctx.tx).round(),
+            (box_rect.y + ctx.ty).round(),
+        );
+        let mut paint = PixmapPaint::default();
+        paint.opacity = ctx.alpha;
+        self.pixmap
+            .draw_pixmap(0, 0, subtree.as_ref(), &paint, transform, None);
     }
 
     /// Paint a filtered subtree by redirecting its drawing into an
@@ -1612,6 +1767,63 @@ mod tests {
         let r = data[idx];
         // White (255) inverts to black (0). Allow for premultiply rounding.
         assert!(r < 20, "expected dark after invert, got r = {r}");
+    }
+
+    #[test]
+    fn mask_mode_luminance_uses_brightness_not_alpha() {
+        // With mask-mode: luminance, the mask's grayscale brightness
+        // drives coverage rather than its alpha channel. A solid
+        // white mask (luminance ≈ 255, alpha = 255) keeps the
+        // element opaque; a solid black mask (luminance ≈ 0, alpha
+        // = 255) erases it. Use white here and confirm red survives.
+        let pixmap = render(
+            "<style>body { margin: 0; background: white; } \
+             .x { background: rgb(255,0,0); height: 20px; \
+                  mask-image: linear-gradient(white, white); \
+                  mask-mode: luminance; }</style>\
+             <div class=x></div>",
+            10,
+            20,
+        );
+        let data = pixmap.data();
+        let idx = (10 * 10 + 5) * 4;
+        let r = data[idx];
+        assert!(r > 200, "luminance white mask should keep red, got r = {r}");
+    }
+
+    #[test]
+    fn mask_image_alpha_gradient_fades_to_background() {
+        // Mask is a vertical gradient: black (alpha=255) at the top,
+        // transparent (alpha=0) at the bottom. The element is solid
+        // red. Top pixels should stay red; bottom pixels should
+        // reveal the white page background.
+        let pixmap = render(
+            "<style>body { margin: 0; background: white; } \
+             .x { background: rgb(255,0,0); height: 40px; \
+                  mask-image: linear-gradient(black, transparent); }</style>\
+             <div class=x></div>",
+            10,
+            40,
+        );
+        let data = pixmap.data();
+        // Sample top row (mask alpha ≈ 255 → red preserved).
+        let top = (1 * 10 + 5) * 4;
+        let r_top = data[top];
+        let g_top = data[top + 1];
+        // Sample bottom row (mask alpha ≈ 0 → element invisible →
+        // white page shows through).
+        let bot = (38 * 10 + 5) * 4;
+        let r_bot = data[bot];
+        let g_bot = data[bot + 1];
+        let b_bot = data[bot + 2];
+        assert!(
+            r_top > 180 && g_top < 60,
+            "top should be ~red, got rgb=({r_top},{g_top},_)"
+        );
+        assert!(
+            r_bot > 230 && g_bot > 230 && b_bot > 230,
+            "bottom should be ~white (page bg), got rgb=({r_bot},{g_bot},{b_bot})"
+        );
     }
 
     #[test]

@@ -1322,6 +1322,18 @@ fn apply_declaration(
         "background-image" => {
             style.background_image = background_image_from(value);
         }
+        "mask-image" | "-webkit-mask-image" => {
+            style.mask_image = background_image_from(value);
+        }
+        "mask-mode" => {
+            if let Value::Keyword(k) = value {
+                style.mask_mode = match k.as_str() {
+                    "alpha" => crate::css::MaskMode::Alpha,
+                    "luminance" => crate::css::MaskMode::Luminance,
+                    _ => crate::css::MaskMode::MatchSource,
+                };
+            }
+        }
         "border-radius" => {
             if let Some(px) = length_to_px(value, style.font_size, parent) {
                 style.border_radius = px.max(0.0);

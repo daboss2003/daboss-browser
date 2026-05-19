@@ -34,6 +34,9 @@ pub enum ImageSlot {
     /// The element has a `background-image: url(...)` that resolved to this
     /// bitmap.
     Background,
+    /// The element has a `mask-image: url(...)` that resolved to this
+    /// bitmap.
+    Mask,
 }
 
 pub type ImageKey = (NodeId, ImageSlot);

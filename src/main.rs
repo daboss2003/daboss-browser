@@ -4986,6 +4986,14 @@ fn walk_bg_images(
                 }
             }
         }
+        if let Some(css::BackgroundImage::Url(src)) = &style.mask_image {
+            if !src.is_empty() {
+                *count += 1;
+                if let Some(info) = fetch_and_decode(client, base_url, src) {
+                    cache.insert((node, layout::ImageSlot::Mask), info);
+                }
+            }
+        }
     }
     let kids: Vec<dom::NodeId> = dom_ref.children(node).collect();
     for c in kids {

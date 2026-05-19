@@ -20,6 +20,22 @@ up the work without re-deriving context.
 
 ## Just shipped
 
+- [x] **CSS masking** (this session) — `ComputedStyle` gains
+      `mask_image: Option<BackgroundImage>` (reuses the existing
+      `Url` / `LinearGradient` enum) + `mask_mode: MaskMode`
+      (Alpha / Luminance / MatchSource). Cascade parses
+      `mask-image` (also `-webkit-mask-image`) and `mask-mode`.
+      `ImageCache` gains `ImageSlot::Mask`; the bg-image walker
+      now also fetches `mask-image: url(...)` sources. Paint adds
+      a new `paint_subtree_with_mask` pass slotted in before
+      filter: render the subtree into an offscreen pixmap (so
+      nested filter/transform still work), render the mask source
+      into a parallel pixmap at the element's box size, then walk
+      both per-pixel and multiply the mask alpha (or Rec.601
+      luminance for `mask-mode: luminance`) into the subtree's
+      premultiplied RGBA before compositing. `match-source`
+      collapses to alpha, which matches the dominant author use
+      of alpha-PNG sprite masks. Tests cover both modes.
 - [x] `1142c8d` **CSS anchor positioning** — `ComputedStyle`
       gains `anchor_name`, `position_anchor`, and per-side
       `anchor_top/right/bottom/left: Option<AnchorRef>`. Cascade
@@ -83,8 +99,6 @@ up the work without re-deriving context.
 
 ## Pending (each is its own session)
 
-- [ ] **CSS masking** — `mask-image` / `mask-mode`. Paint-side
-  per-pixel multiply against the mask alpha.
 - [ ] **Source maps** — fetch `//# sourceMappingURL=` for each
   script/stylesheet, parse VLQ mappings, hook into devtools so
   the Sources panel shows the original file.

@@ -11,8 +11,8 @@ pub use types::{
     AlignContent, AlignItems, AnchorRef, AnchorSide, AnimationRule, BackgroundImage, BorderStyle,
     BoxShadow, BoxSides, BoxSizing, Color, ComputedStyle, Dimension, Direction, Display,
     FilterFunction, FlexDirection, FlexWrap, FontStyle, GridAutoFlow, GridLine, GridPlacement,
-    GridTrack, JustifyContent, MediaCondition, MediaQuery, Overflow, Position, Selector,
-    Stylesheet, TableLayout, TextAlign, TextDecoration, TextOverflow, TimingFunction,
+    GridTrack, JustifyContent, MaskMode, MediaCondition, MediaQuery, Overflow, Position,
+    Selector, Stylesheet, TableLayout, TextAlign, TextDecoration, TextOverflow, TimingFunction,
     Transform2D, TransitionRule, Viewport, WhiteSpace,
 };
 

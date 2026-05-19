@@ -20,6 +20,26 @@ up the work without re-deriving context.
 
 ## Just shipped
 
+- [x] **Compositor thread + GPU rasterisation** (this session,
+      first cut) — new `gpu_raster` module. `GpuRasterizer` owns a
+      headless wgpu Device + Queue + a render pipeline that
+      consumes a list of `GpuRect { x, y, w, h, color: [f32; 4] }`
+      and produces a `tiny_skia::Pixmap`. Two triangles per rect,
+      premultiplied alpha blending, render target is a Rgba8Unorm
+      texture, copy-texture-to-buffer + sync map for readback.
+      Hand-packed little-endian vertex serialisation keeps the
+      crate inside `#![forbid(unsafe_code)]`. `CompositorThread`
+      wraps the rasteriser on a named OS thread; callers send
+      `RasterRequest` over an mpsc channel and block on a reply
+      channel — the GPU work happens entirely off the UI thread.
+      Tests cover a single red rect, two colour-banded rects, and
+      a threaded request via `CompositorThread::spawn`. Not yet
+      wired into the production paint path — that's the next
+      slice (route per-tile damage rasterisation through the
+      worker so dirty tiles render off-thread). Glyph
+      rasterisation also still goes through cosmic-text + swash
+      CPU; GPU glyphing would need an atlas pipeline that's its
+      own session.
 - [x] `dbc9ef6` **Per-tile damage tracking** — every
       will-change layer pixmap is conceptually diced into 256×256
       tiles. `CachedLayer` gains `tile_input_hashes` (one per
@@ -141,9 +161,6 @@ up the work without re-deriving context.
 
 ## Pending (each is its own session)
 
-- [ ] **Compositor thread / GPU rasterization** — run paint on a
-  dedicated thread; raster glyphs / paths on the GPU via wgpu
-  compute. This is the biggest architectural lift left.
 - [ ] **DevTools Sources panel with breakpoints** — needs boa
   instrumentation hooks so we can pause on breakpoint lines +
   step. Probably start with read-only source view + console-eval

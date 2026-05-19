@@ -279,8 +279,71 @@ up the work without re-deriving context.
 
 ## Pending (each is its own session)
 
-(nothing pending — every tier-2/3 item is shipped. Future work
-should land via separate proposals.)
+These are depth-gaps inside areas we already touched — the
+"shipped as a toy, real sites can outgrow them" list. Crossed
+off as they ship.
+
+- [ ] **HTTP/2 + HTTP/3 production transport** — `h2c.rs` and
+  `h3c.rs` exist but the live `net::Client` falls through to
+  HTTP/1.1. Wire them in (ALPN negotiation, real HPACK, priority
+  frames), with HTTP/3 over real QUIC.
+- [ ] **Variable fonts + font hinting / sub-pixel positioning** —
+  `font-variation-settings` parses but isn't applied. cosmic-text
+  uses limited fallback chains; need glyph hinting per Chrome.
+- [ ] **MSE / DASH / HLS adaptive streaming + hardware decode** —
+  ffmpeg decode works but MSE.appendBuffer doesn't truly stitch
+  segments; no manifest parser; no codec h/w accel.
+- [ ] **Real AudioWorklet realtime graph** — current AudioContext
+  is stubbed at the source-node level; an actual realtime graph
+  with sample-accurate scheduling is missing.
+- [ ] **Real WebGPU (`navigator.gpu`)** — wgpu is plumbed for
+  WebGL2; expose the WebGPU surface (device, queue, pipelines,
+  buffers, textures, render passes) from JS.
+- [ ] **GPU rasterization on the production paint path** —
+  `gpu_raster` + `CompositorThread` exist and pass tests but
+  paint still runs through tiny-skia on the main thread. Route
+  the per-tile damage pipeline through the worker.
+- [ ] **GPU glyph atlas** — text still rasterises on CPU via
+  swash. Stage glyphs to a GPU atlas + render text quads.
+- [ ] **CSS edge cases** — float/grid interaction, vertical
+  writing modes, full `position: sticky` containing-block
+  semantics, CSS Containment (`size`, `style`, `paint`,
+  `layout`), CSS Regions, multicolumn layout, full `<table>`
+  rowspan/colspan auto-sizing.
+- [ ] **Isolated worklet / worker / extension contexts** —
+  paint worklets, dedicated workers, shared workers, service
+  workers, and extension background scripts all collapse to one
+  boa Context. Real spec runs each in its own realm.
+- [ ] **Source-map-aware breakpoints for transpiled bundles** —
+  hit injection works for inline scripts where
+  `sources_content[0] == script body`. Map original-source
+  line → generated-source line via the parsed `mappings` table.
+- [ ] **DevTools depth** — Performance / Memory / Lighthouse /
+  Coverage tabs; network throttling; proper console object
+  inspector (expandable trees, getters not invoked).
+- [ ] **CSP / Trusted Types completeness** — `strict-dynamic`,
+  nonce propagation through dynamically-created scripts, hash
+  source enforcement, frame-ancestors.
+- [ ] **PDF viewer** — render PDFs inline (probably via a
+  bundled pdf.js or a Rust-side PDF renderer).
+- [ ] **Password manager + autofill** — credential store +
+  autofill profile + `<input autocomplete>` integration.
+- [ ] **Profiles + sync** — multiple user profiles; sync engine
+  for bookmarks / history / passwords across devices.
+- [ ] **Print preview + `@media print`** — paginated layout for
+  print, headers/footers, print preview pane.
+- [ ] **Native file pickers + native messaging** — OS file dialog
+  for `<input type=file>` and `showOpenFilePicker`; native-host
+  messaging for extension ↔ desktop apps.
+- [ ] **Extension store + install/update + isolated SW background
+  scripts** — fetch & install signed `.crx` bundles; auto-update;
+  run extension service workers in their own realm.
+- [ ] **Mobile gestures** — pinch-zoom, viewport meta proper
+  handling, address-bar collapse on scroll, virtual-keyboard
+  avoidance, touch gesture recognisers.
+- [ ] **Crash recovery / tab process restart** — needs the
+  multi-process item from Tier 1; a partial in-process version
+  could snapshot tab state and replay on JS-engine OOM/abort.
 
 ## Completed
 

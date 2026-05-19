@@ -163,6 +163,20 @@ pub(crate) fn partitioned_origin_host() -> String {
     });
     let inner = inner_host.unwrap_or_else(|| "default".to_string());
     let top = top_host.unwrap_or_else(|| inner.clone());
+    // First-Party Sets: when top and inner belong to the same FPS,
+    // collapse the partition onto the set's primary host so all
+    // members share storage. This is the "set as one party" rule
+    // — github.io storage joins github.com when embedded under any
+    // github.* property.
+    if crate::net::first_party_set::same_party(&top, &inner) {
+        // Prefer the primary's canonical host when there is one so
+        // the storage path is stable regardless of which member
+        // navigated first.
+        let primary = crate::net::first_party_set::primary_for(&top)
+            .or_else(|| crate::net::first_party_set::primary_for(&inner))
+            .unwrap_or(&top);
+        return sanitise_path_component(primary);
+    }
     if top == inner {
         sanitise_path_component(&inner)
     } else {
@@ -1210,6 +1224,27 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn fps_members_share_storage_partition() {
+        // Two members of the same First-Party Set under sibling
+        // top-levels (also same set) collapse onto the set's
+        // primary host. Storage joins instead of splits.
+        let (mut a, mut b) = (String::new(), String::new());
+        with_urls(
+            Some("https://daboss-test-a.example/"),
+            Some("https://daboss-test-b.example/widget"),
+            || a = partitioned_origin_host(),
+        );
+        with_urls(
+            Some("https://daboss-test-b.example/"),
+            Some("https://daboss-test-a.example/widget"),
+            || b = partitioned_origin_host(),
+        );
+        assert_eq!(a, b, "FPS members should share a partition; got {a} vs {b}");
+        // Both should be the set's primary host.
+        assert!(a.contains("daboss-test-a.example"));
     }
 
     #[test]

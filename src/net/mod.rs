@@ -3,6 +3,7 @@ mod cache;
 mod cookies;
 mod csp;
 mod dns;
+pub mod first_party_set;
 mod error;
 mod h2c;
 mod h3c;

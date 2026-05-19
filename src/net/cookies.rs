@@ -34,7 +34,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 const JAR_MAGIC: &[u8; 4] = b"DBCJ";
-const JAR_VERSION: u8 = 2;
+const JAR_VERSION: u8 = 3;
 
 /// RFC 6265bis §5.2 SameSite. Default per modern browser (Chrome 80+
 /// / Firefox 96+) is `Lax` when the attribute isn't present.
@@ -69,6 +69,13 @@ pub struct Cookie {
     pub secure: bool,
     pub http_only: bool,
     pub same_site: SameSite,
+    /// CHIPS partition key — when set, this cookie only matches
+    /// requests whose top-level host (or its FPS primary) equals
+    /// this value. `None` for unpartitioned (legacy) cookies, which
+    /// match regardless of top-level context. The host stored here
+    /// is the top-level origin's host at the time the cookie was
+    /// received via `Set-Cookie: ...; Partitioned`.
+    pub partition_key: Option<String>,
 }
 
 #[derive(Default, Debug)]
@@ -153,6 +160,22 @@ impl CookieJar {
         is_top_level_nav: bool,
         is_safe_method: bool,
     ) -> Option<String> {
+        self.header_for_with_top(url, initiator, None, is_top_level_nav, is_safe_method)
+    }
+
+    /// CHIPS-aware variant of [`header_for`]. `top_level_url` is the
+    /// outermost document — its host (collapsed through First-Party
+    /// Sets) drives whether `Partitioned` cookies match the request.
+    /// When `None`, partitioned cookies are excluded (i.e. the caller
+    /// is implicitly third-party from a partitioning standpoint).
+    pub fn header_for_with_top(
+        &self,
+        url: &Url,
+        initiator: Option<&Url>,
+        top_level_url: Option<&Url>,
+        is_top_level_nav: bool,
+        is_safe_method: bool,
+    ) -> Option<String> {
         let host = url.host_str()?;
         let path = if url.path().is_empty() { "/" } else { url.path() };
         let is_https = url.scheme() == "https";
@@ -160,6 +183,13 @@ impl CookieJar {
             None => true,
             Some(init) => same_site_urls(url, init),
         };
+        let top_key: Option<String> = top_level_url
+            .and_then(|u| u.host_str())
+            .map(|h| {
+                crate::net::first_party_set::primary_for(h)
+                    .unwrap_or(h)
+                    .to_string()
+            });
 
         let mut hits: Vec<(usize, &Cookie)> = Vec::new();
         for c in &self.cookies {
@@ -171,6 +201,17 @@ impl CookieJar {
             }
             if !path_matches(path, &c.path) {
                 continue;
+            }
+            // CHIPS scoping: partitioned cookies only flow when the
+            // request's top-level matches the cookie's recorded
+            // partition. An absent partition key means "legacy
+            // unpartitioned" — those flow everywhere they otherwise
+            // would.
+            if let Some(cookie_key) = c.partition_key.as_deref() {
+                match top_key.as_deref() {
+                    Some(req_key) if req_key.eq_ignore_ascii_case(cookie_key) => {}
+                    _ => continue,
+                }
             }
             if !same_site_request {
                 match c.same_site {
@@ -233,6 +274,18 @@ impl CookieJar {
 /// Parse a single `Set-Cookie` header value into a [`Cookie`]. Returns
 /// `None` if the line doesn't have a `name=value` pair.
 pub fn parse_set_cookie(line: &str, url: &Url) -> Option<Cookie> {
+    parse_set_cookie_with_top(line, url, None)
+}
+
+/// Same as [`parse_set_cookie`] but also stamps a CHIPS partition
+/// key if the Set-Cookie line carries the `Partitioned` attribute.
+/// `top_level_url` is the URL of the page that owns the response
+/// — its host (or FPS primary) becomes the partition.
+pub fn parse_set_cookie_with_top(
+    line: &str,
+    url: &Url,
+    top_level_url: Option<&Url>,
+) -> Option<Cookie> {
     let mut parts = line.split(';');
     let first = parts.next()?.trim();
     let (name, value) = split_kv(first)?;
@@ -252,7 +305,9 @@ pub fn parse_set_cookie(line: &str, url: &Url) -> Option<Cookie> {
         secure: false,
         http_only: false,
         same_site: SameSite::Lax,
+        partition_key: None,
     };
+    let mut saw_partitioned = false;
 
     for attr in parts {
         let attr = attr.trim();
@@ -306,6 +361,8 @@ pub fn parse_set_cookie(line: &str, url: &Url) -> Option<Cookie> {
                 cookie.secure = true;
             } else if low == "httponly" {
                 cookie.http_only = true;
+            } else if low == "partitioned" {
+                saw_partitioned = true;
             }
         }
     }
@@ -313,6 +370,25 @@ pub fn parse_set_cookie(line: &str, url: &Url) -> Option<Cookie> {
     // that violate the rule are rejected at storage time.
     if cookie.same_site == SameSite::None_ && !cookie.secure {
         return None;
+    }
+    // CHIPS: Partitioned cookies are bound to the top-level
+    // origin's host. Without a top-level URL we can't compute one,
+    // so the attribute is ignored (cookie becomes unpartitioned).
+    // The spec also requires SameSite=None + Secure for
+    // partitioned cookies — enforce that to avoid unscoped
+    // first-party leaks.
+    if saw_partitioned {
+        if cookie.same_site != SameSite::None_ || !cookie.secure {
+            return None;
+        }
+        if let Some(top) = top_level_url.and_then(|u| u.host_str()) {
+            // Collapse to FPS primary when applicable so all members
+            // of a set share the partition.
+            let key = crate::net::first_party_set::primary_for(top)
+                .unwrap_or(top)
+                .to_string();
+            cookie.partition_key = Some(key);
+        }
     }
     Some(cookie)
 }
@@ -526,6 +602,13 @@ fn encode_jar(cookies: &[&Cookie]) -> Vec<u8> {
             SameSite::Lax => 1,
             SameSite::None_ => 2,
         });
+        // Partition key (CHIPS). Empty length-prefixed string =
+        // unpartitioned cookie. Stored alongside the other fields
+        // so a v3 jar carries everything needed to round-trip.
+        write_lp(
+            &mut out,
+            c.partition_key.as_deref().unwrap_or("").as_bytes(),
+        );
     }
     out
 }
@@ -564,6 +647,12 @@ fn decode_jar(buf: &[u8]) -> Option<Vec<Cookie>> {
         } else {
             unix_ms_to_instant(ms)
         };
+        let partition_bytes = read_lp(buf, &mut p)?;
+        let partition_key = if partition_bytes.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8(partition_bytes).ok()?)
+        };
         out.push(Cookie {
             name: String::from_utf8(name).ok()?,
             value: String::from_utf8(value).ok()?,
@@ -573,6 +662,7 @@ fn decode_jar(buf: &[u8]) -> Option<Vec<Cookie>> {
             secure,
             http_only,
             same_site,
+            partition_key,
         });
     }
     Some(out)
@@ -818,5 +908,85 @@ mod tests {
                 .unwrap();
         assert_eq!(c.same_site, SameSite::None_);
         assert!(c.secure);
+    }
+
+    #[test]
+    fn partitioned_attribute_requires_samesite_none_and_secure() {
+        // Without SameSite=None+Secure the parser rejects the cookie.
+        assert!(parse_set_cookie_with_top(
+            "p=1; Partitioned",
+            &url("https://tracker.example/"),
+            Some(&url("https://news.example/")),
+        )
+        .is_none());
+        // With both attributes present, the cookie persists with a
+        // partition key derived from the top-level host.
+        let c = parse_set_cookie_with_top(
+            "p=1; SameSite=None; Secure; Partitioned",
+            &url("https://tracker.example/"),
+            Some(&url("https://news.example/")),
+        )
+        .expect("parses");
+        assert_eq!(c.partition_key.as_deref(), Some("news.example"));
+    }
+
+    #[test]
+    fn partitioned_cookie_only_matches_owning_top_level() {
+        let mut jar = CookieJar::new_in_memory();
+        let dest = url("https://tracker.example/");
+        let top_a = url("https://news.example/");
+        let top_b = url("https://blog.example/");
+        let c = parse_set_cookie_with_top(
+            "id=42; SameSite=None; Secure; Partitioned",
+            &dest,
+            Some(&top_a),
+        )
+        .expect("parses");
+        jar.insert(c);
+        // Same destination + same top-level → cookie flows.
+        assert!(
+            jar.header_for_with_top(&dest, Some(&top_a), Some(&top_a), false, true)
+                .is_some()
+        );
+        // Same destination but different top-level → cookie blocked.
+        assert!(
+            jar.header_for_with_top(&dest, Some(&top_b), Some(&top_b), false, true)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn partitioned_cookie_persistence_round_trip() {
+        let cookies = vec![Cookie {
+            name: "id".into(),
+            value: "1".into(),
+            domain: "example.com".into(),
+            path: "/".into(),
+            expires_at: None,
+            secure: true,
+            http_only: false,
+            same_site: SameSite::None_,
+            partition_key: Some("news.example".into()),
+        }];
+        let bytes = encode_jar(&cookies.iter().collect::<Vec<_>>());
+        let round = decode_jar(&bytes).expect("decode");
+        assert_eq!(round.len(), 1);
+        assert_eq!(round[0].partition_key.as_deref(), Some("news.example"));
+    }
+
+    #[test]
+    fn fps_members_collapse_partition_key_to_primary() {
+        // A Partitioned cookie under youtube.com (member) embedded
+        // under google.com (primary) collapses onto the primary, so
+        // a sibling member like blogger.com sees the same cookie.
+        let dest = url("https://tracker.example/");
+        let top_member = url("https://youtube.com/");
+        let c = parse_set_cookie_with_top(
+            "id=42; SameSite=None; Secure; Partitioned",
+            &dest,
+            Some(&top_member),
+        )
+        .expect("parses");
+        assert_eq!(c.partition_key.as_deref(), Some("google.com"));
     }
 }

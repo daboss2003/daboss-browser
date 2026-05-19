@@ -20,6 +20,29 @@ up the work without re-deriving context.
 
 ## Just shipped
 
+- [x] **First-Party Sets + CHIPS** (this session) — new
+      `net::first_party_set` module with a curated `(member,
+      primary)` table covering Google, Microsoft, GitHub, and
+      Wikimedia properties plus a synthetic toy set used in
+      tests. Exports `primary_for(host)` and `same_party(a, b)`
+      (both case-insensitive + `www.`-stripping).
+      `opfs::partitioned_origin_host` now collapses partition
+      keys onto the FPS primary when top and inner belong to the
+      same set, so e.g. github.io storage joins github.com under
+      any github.* embedder. Cookies gain a
+      `partition_key: Option<String>` field; the parser
+      recognises the `Partitioned` attribute and stamps the
+      top-level host (collapsed through FPS) at receive time, but
+      only when SameSite=None + Secure are also present per
+      spec. A new `header_for_with_top(...)` variant filters
+      Partitioned cookies by the request's top-level — legacy
+      unpartitioned cookies still flow as before. Disk jar
+      version bumped to 3 to round-trip the new field. Tests
+      cover FPS member collapse for primary lookup,
+      `www.`/case-insensitivity, partition-collapse storage join,
+      Partitioned attribute requiring SameSite=None+Secure,
+      cross-top filtering, FPS collapse during cookie parse, and
+      a persistence round-trip.
 - [x] `5bddcd7` **Storage partitioning by top-level origin** — disk-backed per-origin stores now key off
       `(top-level-host, inner-host)` pairs instead of the bare
       inner host. New `JS_TOP_LEVEL_BASE_URL` thread-local in
@@ -204,10 +227,6 @@ up the work without re-deriving context.
 
 ## Pending (each is its own session)
 
-- [ ] **First-Party Sets / CHIPS** — parses but doesn't enforce.
-  Tied to storage partitioning. Cookie partitioning lives here:
-  extend `Cookie` with a `partition_key` field + match
-  accordingly.
 - [ ] **CSS Houdini paint/layout/animation worklets actually
   executing** — needs a separate boa Context per worklet,
   custom-paint canvas API, glue to call `paint()` during

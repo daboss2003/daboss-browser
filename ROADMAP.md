@@ -20,8 +20,7 @@ up the work without re-deriving context.
 
 ## Just shipped
 
-- [x] **WebExtensions runtime — real `chrome.*` surface** (this
-      session) — new `js::webextensions` module replaces the
+- [x] `a161a38` **WebExtensions runtime — real `chrome.*` surface** — new `js::webextensions` module replaces the
       feature-detection stub. `load(ctx, manifest_json)` parses
       a manifest, synthesises a stable 32-char extension ID from
       `name + version`, and stamps it as the active extension in

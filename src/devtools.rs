@@ -83,6 +83,7 @@ pub enum Panel {
     Console,
     Dom,
     Network,
+    Storage,
     Picker,
 }
 
@@ -92,6 +93,7 @@ impl Panel {
             Panel::Console => "Console",
             Panel::Dom => "Elements",
             Panel::Network => "Network",
+            Panel::Storage => "Storage",
             Panel::Picker => "Picker",
         }
     }
@@ -101,7 +103,8 @@ impl Panel {
         match self {
             Panel::Console => Panel::Dom,
             Panel::Dom => Panel::Network,
-            Panel::Network => Panel::Picker,
+            Panel::Network => Panel::Storage,
+            Panel::Storage => Panel::Picker,
             Panel::Picker => Panel::Console,
         }
     }

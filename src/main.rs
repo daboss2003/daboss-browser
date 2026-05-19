@@ -3238,6 +3238,20 @@ fn paint_devtools_panel(
             );
             return;
         }
+        devtools::Panel::Storage => {
+            paint_storage_panel(
+                font_system,
+                swash_cache,
+                buffer,
+                width,
+                height,
+                scroll_top,
+                scroll_bottom,
+                line_h,
+                metrics_body,
+            );
+            return;
+        }
         devtools::Panel::Console => {}
     }
 
@@ -3616,6 +3630,76 @@ fn paint_network_panel(
             ));
         }
     }
+    paint_panel_lines(
+        font_system,
+        swash_cache,
+        buffer,
+        width,
+        height,
+        scroll_top,
+        scroll_bottom,
+        line_h,
+        metrics,
+        &lines,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_storage_panel(
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    buffer: &mut [u32],
+    width: u32,
+    height: u32,
+    scroll_top: u32,
+    scroll_bottom: u32,
+    line_h: i32,
+    metrics: Metrics,
+) {
+    let mut lines: Vec<(CtColor, String)> = Vec::new();
+    let header = CtColor::rgb(140, 200, 255);
+    let key = CtColor::rgb(220, 220, 220);
+    let muted = CtColor::rgb(160, 160, 180);
+
+    let local = js::storage::enumerate_local_storage();
+    lines.push((
+        header,
+        format!("localStorage  ({} entries)", local.len()),
+    ));
+    if local.is_empty() {
+        lines.push((muted, "  (empty)".to_string()));
+    }
+    for (k, v) in &local {
+        lines.push((
+            key,
+            format!(
+                "  {} = {}",
+                truncate_chars(k, 40),
+                truncate_chars(v, 80)
+            ),
+        ));
+    }
+    lines.push((header, String::new()));
+
+    let session = js::storage::enumerate_session_storage();
+    lines.push((
+        header,
+        format!("sessionStorage  ({} entries)", session.len()),
+    ));
+    if session.is_empty() {
+        lines.push((muted, "  (empty)".to_string()));
+    }
+    for (k, v) in &session {
+        lines.push((
+            key,
+            format!(
+                "  {} = {}",
+                truncate_chars(k, 40),
+                truncate_chars(v, 80)
+            ),
+        ));
+    }
+
     paint_panel_lines(
         font_system,
         swash_cache,

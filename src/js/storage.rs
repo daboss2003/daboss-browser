@@ -170,6 +170,29 @@ fn local_clear() {
     let _ = fs::create_dir_all(&dir);
 }
 
+/// Public listing for the devtools storage panel: enumerates every
+/// localStorage `(key, value)` pair for the current origin.
+pub fn enumerate_local_storage() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for key in local_keys_sorted() {
+        if let Some(v) = local_get(&key) {
+            out.push((key, v));
+        }
+    }
+    out
+}
+
+/// Same for sessionStorage. Reads the in-memory map directly.
+pub fn enumerate_session_storage() -> Vec<(String, String)> {
+    let Some(area) = session_area() else {
+        return Vec::new();
+    };
+    let mut entries: Vec<(String, String)> =
+        area.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
+}
+
 fn local_keys_sorted() -> Vec<String> {
     let dir = local_storage_dir();
     let mut out = Vec::new();

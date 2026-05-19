@@ -20,7 +20,7 @@ up the work without re-deriving context.
 
 ## Just shipped
 
-- [x] **CSS anchor positioning** (this session) — `ComputedStyle`
+- [x] `1142c8d` **CSS anchor positioning** — `ComputedStyle`
       gains `anchor_name`, `position_anchor`, and per-side
       `anchor_top/right/bottom/left: Option<AnchorRef>`. Cascade
       parses `anchor-name: --foo`, `position-anchor: --foo`, and

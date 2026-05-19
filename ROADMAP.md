@@ -20,6 +20,24 @@ up the work without re-deriving context.
 
 ## Just shipped
 
+- [x] **CSS subgrid (columns)** (this session) — `ComputedStyle`
+      gains `subgrid_columns` / `subgrid_rows` flags. Cascade parses
+      `grid-template-{columns,rows}: subgrid` into the flag and
+      clears the track list. Layout uses a thread-local
+      `SUBGRID_PARENT` that the parent grid populates with the
+      column-width slice + col-gap for each item before recursing.
+      A subgrid child consumes the slice as its own
+      `column_widths` instead of resolving its template, so items
+      align to the parent's column grid lines. Two follow-up fixes
+      fell out: `grid-column: span N` (shorthand with no slash) now
+      parses as a single `Span` value rather than splitting into
+      two lines, and auto-placement reads `Span` from either
+      `column_start` or `column_end`. Tests cover both subgrid
+      inheriting parent widths and falling back when no parent
+      grid is present. Row subgrid still sets the flag but cannot
+      inherit row heights (parent row heights aren't sized until
+      after items lay out); rows behave like auto, which matches
+      the dominant practical use of subgrid.
 - [x] **Real bidi text shaping** (this session) — cosmic-text
       already runs the Unicode bidi algorithm per line during
       shape, so mixed Arabic/Hebrew/Latin runs were already
@@ -53,9 +71,6 @@ up the work without re-deriving context.
 
 ## Pending (each is its own session)
 
-- [ ] **CSS subgrid** — extend `Grid` layout to inherit tracks
-  from the parent when `grid-template-{columns,rows}: subgrid`
-  is set.
 - [ ] **CSS anchor positioning** — `anchor-name` / `position-anchor`
   / `anchor()`. Layout-time bipartite tracking.
 - [ ] **CSS masking** — `mask-image` / `mask-mode`. Paint-side

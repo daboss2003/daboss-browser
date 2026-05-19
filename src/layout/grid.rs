@@ -10,10 +10,19 @@
 //!    free cell in row-major order. `grid-auto-flow: dense` packs items
 //!    back into earlier holes.
 //!  * `row-gap` / `column-gap` between tracks.
+//!  * `subgrid` columns: a child with `grid-template-columns: subgrid`
+//!    inherits the spanned slice of its parent's column widths +
+//!    column-gap. Row subgrid sets the flag but cannot inherit row
+//!    heights (parent row heights aren't known when items lay out);
+//!    subgrid rows therefore behave like the column-subgrid child's
+//!    own auto rows, matching the dominant practical use of subgrid.
 //!
-//! Not implemented: implicit grid track auto-creation (items placed
-//! outside template fall into a single overflow row), `align-self` /
-//! `justify-self` per item, `subgrid`, `minmax()`.
+//! Not implemented: implicit grid track auto-creation past the
+//! template (items placed outside template fall into a single overflow
+//! row) and true row subgrid (rows must inherit, but the parent's
+//! rows aren't sized until after children lay out).
+
+use std::cell::RefCell;
 
 use super::block;
 use super::replaced::ImageCache;
@@ -21,6 +30,27 @@ use super::text::TextLayout;
 use super::{BoxKind, BoxTree, LayoutBox, Rect};
 use crate::css::{ComputedStyle, Dimension, GridAutoFlow, GridLine, GridTrack, StyleTree};
 use crate::dom::{Dom, NodeId, NodeKind};
+
+/// Context a parent grid hands to each direct grid item before laying it
+/// out, so a `grid-template-columns: subgrid` child can read the parent's
+/// resolved column widths + gap.
+#[derive(Clone)]
+struct SubgridContext {
+    columns: Vec<f32>,
+    col_gap: f32,
+}
+
+thread_local! {
+    static SUBGRID_PARENT: RefCell<Option<SubgridContext>> = const { RefCell::new(None) };
+}
+
+fn take_subgrid() -> Option<SubgridContext> {
+    SUBGRID_PARENT.with(|s| s.borrow_mut().take())
+}
+
+fn set_subgrid(ctx: Option<SubgridContext>) {
+    SUBGRID_PARENT.with(|s| *s.borrow_mut() = ctx);
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn layout_grid(
@@ -33,10 +63,24 @@ pub fn layout_grid(
     containing: Rect,
     tree: &mut BoxTree,
 ) -> f32 {
+    // Consume any subgrid context from our parent. If we are a subgrid
+    // child it carries the parent's resolved column widths + gap; we use
+    // those instead of our own template. Taking it (rather than peeking)
+    // also prevents stale context leaking into our own children, which
+    // re-set it explicitly before each item recursion below.
+    let inherited_subgrid = take_subgrid();
+
     let margin = style.margin;
     let border = style.border_width;
     let padding = style.padding;
     let (row_gap, col_gap) = style.gap;
+    let use_subgrid_cols =
+        style.subgrid_columns && inherited_subgrid.is_some();
+    let effective_col_gap = if use_subgrid_cols {
+        inherited_subgrid.as_ref().unwrap().col_gap
+    } else {
+        col_gap
+    };
 
     let cb_width = containing.width;
     let content_width = match style.width {
@@ -78,7 +122,13 @@ pub fn layout_grid(
     // First pass: figure out how many columns we actually need.
     // Templates + areas set a baseline; explicit placements past the
     // template width grow the implicit grid (CSS Grid spec §6.1).
-    let template_cols = style.grid_template_columns.len();
+    // Subgrid columns: column count comes from the inherited slice
+    // (length == this item's parent-grid span).
+    let template_cols = if use_subgrid_cols {
+        inherited_subgrid.as_ref().unwrap().columns.len()
+    } else {
+        style.grid_template_columns.len()
+    };
     let area_cols = style
         .grid_template_areas
         .iter()
@@ -92,12 +142,26 @@ pub fn layout_grid(
     }
 
     // Resolve column widths. Any implicit (extra) tracks beyond the
-    // template inherit `grid-auto-columns`.
-    let mut explicit_tracks: Vec<GridTrack> = style.grid_template_columns.clone();
-    while explicit_tracks.len() < num_cols {
-        explicit_tracks.push(style.grid_auto_columns.clone());
-    }
-    let column_widths = resolve_tracks(&explicit_tracks, content_width, col_gap);
+    // template inherit `grid-auto-columns`. For subgrid columns the
+    // widths come straight from the parent's resolved tracks (sliced
+    // to our column span), so we skip track resolution.
+    let column_widths = if use_subgrid_cols {
+        let mut widths = inherited_subgrid.as_ref().unwrap().columns.clone();
+        // Pad to num_cols if explicit placements reach beyond inherited
+        // tracks (rare; uses grid-auto-columns).
+        while widths.len() < num_cols {
+            let extra =
+                resolve_tracks(&[style.grid_auto_columns.clone()], 0.0, 0.0);
+            widths.extend(extra);
+        }
+        widths
+    } else {
+        let mut explicit_tracks: Vec<GridTrack> = style.grid_template_columns.clone();
+        while explicit_tracks.len() < num_cols {
+            explicit_tracks.push(style.grid_auto_columns.clone());
+        }
+        resolve_tracks(&explicit_tracks, content_width, col_gap)
+    };
 
     // Resolve each item's grid placement to (row_start, col_start, row_span,
     // col_span). Auto-placement is run after explicit placements are claimed.
@@ -112,7 +176,7 @@ pub fn layout_grid(
     // Compute column x positions.
     let mut col_xs = vec![content_x; num_cols];
     for c in 1..num_cols {
-        col_xs[c] = col_xs[c - 1] + column_widths[c - 1] + col_gap;
+        col_xs[c] = col_xs[c - 1] + column_widths[c - 1] + effective_col_gap;
     }
 
     // Group placements by row, then lay each row out. Row heights = max
@@ -153,14 +217,30 @@ pub fn layout_grid(
         let cell_w = (col_start..col_start + col_span)
             .map(|c| column_widths[c])
             .sum::<f32>()
-            + col_gap * (col_span.saturating_sub(1) as f32);
+            + effective_col_gap * (col_span.saturating_sub(1) as f32);
         let cb = Rect {
             x: cell_x,
             y: 0.0, // tentative; fixed up after row heights are known
             width: cell_w,
             height: 0.0,
         };
+
+        // Publish this item's column slice as the subgrid context the
+        // child may consume if it is `grid-template-columns: subgrid`.
+        // Non-subgrid children ignore it; nested grids take() the
+        // context so it never leaks past one level of recursion.
+        let child_columns: Vec<f32> = (col_start..col_start + col_span)
+            .map(|c| column_widths[c])
+            .collect();
+        set_subgrid(Some(SubgridContext {
+            columns: child_columns,
+            col_gap: effective_col_gap,
+        }));
         let h = block::layout(dom, styles, text, images, items[idx], cb, tree);
+        // Clear so sibling items in this grid don't see a stale value
+        // (e.g. if a non-grid sibling layout path leaves it untouched).
+        set_subgrid(None);
+
         item_heights[idx] = h;
         // For single-row items, contribute directly to row height.
         if p.row_span == 1 {
@@ -204,7 +284,7 @@ pub fn layout_grid(
         let cell_w: f32 = (p.col_start..col_end)
             .map(|c| column_widths[c])
             .sum::<f32>()
-            + col_gap * (p.col_span.saturating_sub(1) as f32);
+            + effective_col_gap * (p.col_span.saturating_sub(1) as f32);
 
         let Some(current_box) = tree.boxes[items[idx].index()].as_ref() else {
             continue;
@@ -347,16 +427,20 @@ fn resolve_placements(
         }
         let style = styles.get(node);
         let p = &style.grid_placement;
-        // Span widths from grid-column: span N etc.
-        let col_span = match &p.column_end {
-            Some(GridLine::Span(n)) => (*n as usize).max(1),
-            _ => 1,
-        }
-        .min(num_cols.max(1));
-        let row_span = match &p.row_end {
-            Some(GridLine::Span(n)) => (*n as usize).max(1),
-            _ => 1,
+        // Span widths from `grid-column: span N` — the span may have
+        // landed in either column_start (shorthand `span N`) or
+        // column_end (after a `/` separator like `1 / span N`).
+        let span_of = |l: &Option<GridLine>| match l {
+            Some(GridLine::Span(n)) => Some((*n as usize).max(1)),
+            _ => None,
         };
+        let col_span = span_of(&p.column_end)
+            .or_else(|| span_of(&p.column_start))
+            .unwrap_or(1)
+            .min(num_cols.max(1));
+        let row_span = span_of(&p.row_end)
+            .or_else(|| span_of(&p.row_start))
+            .unwrap_or(1);
 
         // Find the first free cell that fits this span.
         let (r, c) = if dense {
@@ -728,6 +812,73 @@ mod tests {
         for c in &cells {
             assert!((tree.get(*c).unwrap().rect.width - 200.0).abs() < 1.0);
         }
+    }
+
+    #[test]
+    fn subgrid_columns_inherit_parent_track_widths() {
+        // Parent grid has explicit 100/200/300 columns. A direct child
+        // declared `grid-template-columns: subgrid` and spanning all
+        // three columns should hand those exact widths to its own
+        // grid items, not derive its own equal-fr split.
+        let (dom, tree) = run(
+            "<style>body { margin: 0; } \
+             .outer { display: grid; grid-template-columns: 100px 200px 300px; \
+                      margin: 0; padding: 0; gap: 0; } \
+             .sub { display: grid; grid-template-columns: subgrid; \
+                    grid-column: span 3; margin: 0; padding: 0; gap: 0; } \
+             .c { height: 30px; margin: 0; padding: 0; }</style>\
+             <div class=outer>\
+               <div class=sub>\
+                 <div class=c></div><div class=c></div><div class=c></div>\
+               </div>\
+             </div>",
+            900.0,
+        );
+        let cells = find_all(&dom, dom.document(), "div", "c");
+        assert_eq!(cells.len(), 3);
+        let widths: Vec<f32> = cells
+            .iter()
+            .map(|n| tree.get(*n).unwrap().rect.width)
+            .collect();
+        assert!(
+            (widths[0] - 100.0).abs() < 1.0,
+            "expected ~100, got {}",
+            widths[0]
+        );
+        assert!(
+            (widths[1] - 200.0).abs() < 1.0,
+            "expected ~200, got {}",
+            widths[1]
+        );
+        assert!(
+            (widths[2] - 300.0).abs() < 1.0,
+            "expected ~300, got {}",
+            widths[2]
+        );
+    }
+
+    #[test]
+    fn subgrid_only_when_parent_is_grid() {
+        // Without an enclosing grid parent there is no SUBGRID_PARENT
+        // context; the child falls back to a single auto track, so
+        // the lone item should take the full content width.
+        let (dom, tree) = run(
+            "<style>body { margin: 0; } \
+             .sub { display: grid; grid-template-columns: subgrid; \
+                    margin: 0; padding: 0; gap: 0; } \
+             .c { height: 30px; margin: 0; padding: 0; }</style>\
+             <div class=sub>\
+               <div class=c></div>\
+             </div>",
+            500.0,
+        );
+        let cells = find_all(&dom, dom.document(), "div", "c");
+        assert_eq!(cells.len(), 1);
+        let w = tree.get(cells[0]).unwrap().rect.width;
+        assert!(
+            (w - 500.0).abs() < 1.0,
+            "subgrid without parent grid should fall back to full width; got {w}"
+        );
     }
 
     #[test]

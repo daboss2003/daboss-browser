@@ -864,6 +864,12 @@ pub struct ComputedStyle {
     // ----- Grid container properties -----
     pub grid_template_columns: Vec<GridTrack>,
     pub grid_template_rows: Vec<GridTrack>,
+    /// `grid-template-columns: subgrid` — inherit column tracks
+    /// from the nearest ancestor grid container. The layout slices
+    /// the parent's tracks to match this item's column span.
+    pub subgrid_columns: bool,
+    /// `grid-template-rows: subgrid` — same, for rows.
+    pub subgrid_rows: bool,
     /// `grid-template-areas` parsed as a row-of-rows: outer Vec is rows,
     /// inner Vec is the named cells across that row (or `.` for empty).
     pub grid_template_areas: Vec<Vec<String>>,
@@ -964,6 +970,8 @@ impl ComputedStyle {
             order: 0,
             grid_template_columns: Vec::new(),
             grid_template_rows: Vec::new(),
+            subgrid_columns: false,
+            subgrid_rows: false,
             grid_template_areas: Vec::new(),
             grid_auto_flow: GridAutoFlow::Row,
             grid_auto_columns: GridTrack::Auto,

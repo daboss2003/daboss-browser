@@ -1137,10 +1137,22 @@ fn apply_declaration(
             }
         }
         "grid-template-columns" => {
-            style.grid_template_columns = grid_tracks_from(value, style.font_size, parent);
+            if matches!(value, Value::Keyword(k) if k == "subgrid") {
+                style.subgrid_columns = true;
+                style.grid_template_columns = Vec::new();
+            } else {
+                style.subgrid_columns = false;
+                style.grid_template_columns = grid_tracks_from(value, style.font_size, parent);
+            }
         }
         "grid-template-rows" => {
-            style.grid_template_rows = grid_tracks_from(value, style.font_size, parent);
+            if matches!(value, Value::Keyword(k) if k == "subgrid") {
+                style.subgrid_rows = true;
+                style.grid_template_rows = Vec::new();
+            } else {
+                style.subgrid_rows = false;
+                style.grid_template_rows = grid_tracks_from(value, style.font_size, parent);
+            }
         }
         "grid-template-areas" => {
             style.grid_template_areas = grid_template_areas_from(value);
@@ -2218,6 +2230,13 @@ fn apply_grid_axis(value: &Value, style: &mut ComputedStyle, is_column: bool) {
                     Value::List(items[p + 1..].to_vec())
                 };
                 (grid_line_from(&left), grid_line_from(&right))
+            } else if items
+                .iter()
+                .any(|v| matches!(v, Value::Keyword(k) if k == "span"))
+            {
+                // `grid-column: span N` (or `grid-column: span name`) is a
+                // single line value, not two — keep the list intact.
+                (grid_line_from(value), None)
             } else if items.len() == 2 {
                 (grid_line_from(&items[0]), grid_line_from(&items[1]))
             } else {
